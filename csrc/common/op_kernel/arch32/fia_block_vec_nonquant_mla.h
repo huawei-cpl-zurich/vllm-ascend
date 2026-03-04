@@ -287,7 +287,7 @@ template <typename FIAT> __aicore__ inline void FiaBlockVecNonQuantMla<FIAT>::In
     softmaxSumDefaultUb = softmaxSumDefaultBuff.Get<T>();
 
     Duplicate(softmaxMaxDefaultUb, SOFTMAX_MIN_NUM, SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T));
-    Duplicate(softmaxSumDefaultUb, FLOAT_ZERO, SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T));
+    Duplicate(softmaxSumDefaultUb, ConstInfo::FLOAT_ZERO, SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T));
 }
 
 template <typename FIAT>
@@ -488,13 +488,13 @@ __aicore__ inline void FiaBlockVecNonQuantMla<FIAT>::AmlaVecCompute(
     uint32_t PreSoftmaxOutOffset = prOutIdx * SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T) + baseOffset;
     // n(i) - n(i-1)
     if (info.isFirstSInnerLoop) {
-        Duplicate(nUpdateTmp, FLOAT_ZERO, calCount); // n1=n0
+        Duplicate(nUpdateTmp, ConstInfo::FLOAT_ZERO, calCount); // n1=n0
     } else {
         Sub(nUpdateTmp, nTmp, nValueUb[PreSoftmaxOutOffset], calCount);
     }
     AscendC::PipeBarrier<PIPE_V>();
     // update n(i), DataCopy not support when calCount is not align 32B, so use Adds
-    Adds(nValueUb[softmaxOutOffset], nTmp, FLOAT_ZERO, calCount);
+    Adds(nValueUb[softmaxOutOffset], nTmp, ConstInfo::FLOAT_ZERO, calCount);
     AscendC::PipeBarrier<PIPE_V>();
 
     // update softmax res
@@ -534,7 +534,7 @@ __aicore__ inline void FiaBlockVecNonQuantMla<FIAT>::AmlaVecCompute(
     }
     AscendC::PipeBarrier<PIPE_V>();
 
-    Adds(cofValueUb[softmaxOutOffset], tmpCofUb, FLOAT_ZERO, calCount); // store cof(i)
+    Adds(cofValueUb[softmaxOutOffset], tmpCofUb, ConstInfo::FLOAT_ZERO, calCount); // store cof(i)
     Adds(epsUb, epsUb, (T)(-1.0), calCount); // cof(i - 1) / cof(i) - 1
     AscendC::PipeBarrier<PIPE_V>();
     Muls(epsUb, epsUb, (T)1.5, calCount); // (cof(i - 1) - cof(i)) / cof(i) * 1.5
@@ -1128,7 +1128,7 @@ FiaBlockVecNonQuantMla<FIAT>::DealBmm2ResBaseBlock(const AttentionCommon::RunInf
     LocalTensor<uint8_t> cmpMaskUb = absBmm2ResUb.template ReinterpretCast<uint8_t>();
     CompareScalar(cmpMaskUb, absBmm2ResUb, (T)1e10, CMPMODE::LE, vec2ComputeSize);
     AscendC::PipeBarrier<PIPE_V>();
-    Select(tmpBmm2ResUb, cmpMaskUb, tmpBmm2ResUb, FLOAT_ZERO, SELMODE::VSEL_TENSOR_SCALAR_MODE, vec2ComputeSize);
+    Select(tmpBmm2ResUb, cmpMaskUb, tmpBmm2ResUb, ConstInfo::FLOAT_ZERO, SELMODE::VSEL_TENSOR_SCALAR_MODE, vec2ComputeSize);
     AscendC::PipeBarrier<PIPE_V>();
 
     uint32_t baseOffset = mSplitInfo.nBufferStartM / 2 + startRow;

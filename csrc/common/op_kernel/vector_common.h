@@ -41,6 +41,16 @@ enum SparseMode : uint8_t {
     RIGHT_DOWN_CAUSAL,
     BAND,
 };
+
+__aicore__ inline int64_t Int64Max(int64_t lhs, int64_t rhs)
+{
+    return (lhs > rhs) ? lhs : rhs;
+}
+
+__aicore__ inline int64_t Int64Min(int64_t lhs, int64_t rhs)
+{
+    return (lhs < rhs) ? lhs : rhs;
+}
  
 __aicore__ inline bool IsExistInvalidRows(int64_t nextTokensPerBatch, int64_t preTokensPerBatch, uint32_t mode,
                                           bool attenMaskFlag, bool isRowInvalid)
@@ -63,15 +73,15 @@ __aicore__ inline void GetSafeActToken(int64_t actSeqLensQ, int64_t actSeqLensKv
                                               int64_t &safePreToken, int64_t &safeNextToken, uint32_t mode)
 {
     if (mode == DEFAULT_MASK) {
-        safePreToken = Max(-actSeqLensKv, safePreToken);
-        safePreToken = Min(safePreToken, actSeqLensQ);
-        safeNextToken = Max(-actSeqLensQ, safeNextToken);
-        safeNextToken = Min(safeNextToken, actSeqLensKv);
+        safePreToken = Int64Max(-actSeqLensKv, safePreToken);
+        safePreToken = Int64Min(safePreToken, actSeqLensQ);
+        safeNextToken = Int64Max(-actSeqLensQ, safeNextToken);
+        safeNextToken = Int64Min(safeNextToken, actSeqLensKv);
     } else if (mode == BAND) {
-        safePreToken = Max(-actSeqLensQ, safePreToken);
-        safePreToken = Min(safePreToken, actSeqLensKv);
-        safeNextToken = Max(-actSeqLensKv, safeNextToken);
-        safeNextToken = Min(safeNextToken, actSeqLensQ);
+        safePreToken = Int64Max(-actSeqLensQ, safePreToken);
+        safePreToken = Int64Min(safePreToken, actSeqLensKv);
+        safeNextToken = Int64Max(-actSeqLensKv, safeNextToken);
+        safeNextToken = Int64Min(safeNextToken, actSeqLensQ);
     }
 }
 
@@ -1137,7 +1147,9 @@ __aicore__ inline void InvalidRows<T, UB_INPUTFORMAT>::DealInvalidRowsBelow(Loca
                     s1Num = s1RealEnd + 1;
                 }
                 int32_t s1RealStart = s1RealEnd - s1Num + 1;
-                Duplicate(attenOutUb[s1RealStart * params.columnCount], static_cast<T>(FLOAT_ZERO), params.columnCount * s1Num);
+                Duplicate(attenOutUb[s1RealStart * params.columnCount],
+                    static_cast<T>(AttentionCommon::ConstInfo::FLOAT_ZERO),
+                    params.columnCount * s1Num);
                 AscendC::PipeBarrier<PIPE_V>();
             }
             s1RealEnd -= s1End + 1;
@@ -1165,7 +1177,9 @@ __aicore__ inline void InvalidRows<T, UB_INPUTFORMAT>::DealInvalidRowsBelow(Loca
                 if (i + gNum > params.dealRowCount) {
                     gNum = params.dealRowCount - i;
                 }
-                Duplicate(attenOutUb[i * params.columnCount], static_cast<T>(FLOAT_ZERO), params.columnCount * gNum);
+                Duplicate(attenOutUb[i * params.columnCount],
+                    static_cast<T>(AttentionCommon::ConstInfo::FLOAT_ZERO),
+                    params.columnCount * gNum);
                 AscendC::PipeBarrier<PIPE_V>();
                 i += gNum;
                 s1++;
@@ -1190,7 +1204,9 @@ __aicore__ inline void InvalidRows<T, UB_INPUTFORMAT>::DealInvalidRowsAbove(Loca
                 if (i + s1Num > params.dealRowCount) {
                     s1Num = params.dealRowCount - i;
                 }
-                Duplicate(attenOutUb[i * params.columnCount], static_cast<T>(FLOAT_ZERO), params.columnCount * s1Num);
+                Duplicate(attenOutUb[i * params.columnCount],
+                    static_cast<T>(AttentionCommon::ConstInfo::FLOAT_ZERO),
+                    params.columnCount * s1Num);
                 AscendC::PipeBarrier<PIPE_V>();
             }
             i += params.actS1Size - s1;
@@ -1205,7 +1221,9 @@ __aicore__ inline void InvalidRows<T, UB_INPUTFORMAT>::DealInvalidRowsAbove(Loca
                 if (i + gNum > params.dealRowCount) {
                     gNum = params.dealRowCount - i;
                 }
-                Duplicate(attenOutUb[i * params.columnCount], static_cast<T>(FLOAT_ZERO), params.columnCount * gNum);
+                Duplicate(attenOutUb[i * params.columnCount],
+                    static_cast<T>(AttentionCommon::ConstInfo::FLOAT_ZERO),
+                    params.columnCount * gNum);
                 AscendC::PipeBarrier<PIPE_V>();
                 i += gNum;
                 s1++;
@@ -1228,10 +1246,12 @@ __aicore__ inline void InvalidMaskRows(uint32_t softmaxOutOffset, uint32_t dealR
     AscendC::PipeBarrier<PIPE_V>();
     if constexpr (SOFTMAX_WITH_BRC) {
         AdjustSoftMaxRes<OUT_T, SOFTMAX_T>(bmm2ResUb, softmaxMaxUb[softmaxOutOffset], softmaxMinSaclar,
-                                               (OUT_T)FLOAT_ZERO, softmaxShapeInfo);
+                                               static_cast<OUT_T>(AttentionCommon::ConstInfo::FLOAT_ZERO),
+                                               softmaxShapeInfo);
     } else {
         AdjustSoftMaxRes<OUT_T, SOFTMAX_T, false, 1>(bmm2ResUb, softmaxMaxUb[softmaxOutOffset], softmaxMinSaclar,
-                                                         (OUT_T)FLOAT_ZERO, softmaxShapeInfo);
+                                                         static_cast<OUT_T>(AttentionCommon::ConstInfo::FLOAT_ZERO),
+                                                         softmaxShapeInfo);
     }
 }
 
