@@ -171,10 +171,10 @@ struct CostInfo {
 
 // 分核功能模块内部使用：分核过程中，case基本信息的上下文信息，组合以减少接口传参数量
 struct SplitContext {
-    const BaseInfo &baseInfo { 0U };
-    const SplitParam &splitParam {};
-    SplitInfo splitInfo { 0U };
-    CostInfo costInfo { 0U };
+    const BaseInfo &baseInfo;
+    const SplitParam &splitParam;
+    SplitInfo splitInfo;
+    CostInfo costInfo;
 
     explicit SplitContext(const BaseInfo &info, const SplitParam &param) :
         baseInfo(info),
