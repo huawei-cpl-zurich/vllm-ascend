@@ -22,7 +22,6 @@ using std::map;
 using std::string;
 using std::pair;
 using namespace ge;
-using namespace AscendC;
 namespace optiling {
 constexpr int64_t ANTI_QUANT_MODE_DEFAULT_VALUE = 0;
 constexpr int64_t KEY_ANTI_QUANT_MODE_DEFAULT_VALUE = 0;

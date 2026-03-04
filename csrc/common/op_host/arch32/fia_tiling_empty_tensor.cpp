@@ -19,7 +19,6 @@
 #include "../fia_tiling_templates_registry.h"
 
 using namespace ge;
-using namespace AscendC;
 namespace optiling {
 constexpr uint64_t FIA_TILINGKEYOFFSET = uint64_t(100000000000000000UL);          
 constexpr uint64_t FIA_PERF_MODE_TILINGKEYOFFSET = uint64_t(1000000000000000UL); 

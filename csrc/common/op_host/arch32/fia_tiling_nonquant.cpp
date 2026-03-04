@@ -24,7 +24,6 @@
 #include "../split_core.h"
 
 using namespace ge;
-using namespace AscendC;
 namespace optiling {
 
 constexpr uint64_t PRE_LOAD_NUM_MLA = 2;

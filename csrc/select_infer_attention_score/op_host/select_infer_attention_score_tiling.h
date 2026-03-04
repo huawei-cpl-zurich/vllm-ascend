@@ -15,6 +15,10 @@
 
 #ifndef AIR_CXX_RUNTIME_V2_OP_IMPL_FUSEDINFERATTENTIONSCORE_H_
 #define AIR_CXX_RUNTIME_V2_OP_IMPL_FUSEDINFERATTENTIONSCORE_H_
+#include <cstddef>
+#include <exe_graph/runtime/tiling_context.h>
+#include <graph/utils/type_utils.h>
+#include <tiling/platform/platform_ascendc.h>
 #include "register/tilingdata_base.h"
 #include "select_infer_attention_score_tiling_compile_info.h"
 #include "select_infer_attention_score_tiling_index.h"
@@ -26,6 +30,19 @@
 #endif
 
 namespace optiling {
+// Decode-only constants kept local to avoid pulling prefill dependencies.
+constexpr uint32_t BNSD_D_IDX = 3;
+constexpr uint32_t BSH_H_IDX = 2;
+constexpr uint32_t BYTE_BLOCK = 32;
+constexpr uint32_t MAX_SPLIT_SIZE = 8192;
+constexpr uint32_t DIM_BNSD_OR_BSND = 4;
+constexpr uint32_t DIM_BSH = 3;
+constexpr uint32_t DIM_TND = 3;
+constexpr uint32_t DIM_1 = 1;
+constexpr uint32_t DIM_2 = 2;
+constexpr size_t DIM_NUM_3 = 3;
+constexpr size_t DIM_NUM_4 = 4;
+
 const uint32_t FIA_MAX_AIC_CORE_NUM = 26; // 25 + 1 保证数组8字节对齐
 // 基础参数
 BEGIN_TILING_DATA_DEF(FusedInferAttentionBaseParams)

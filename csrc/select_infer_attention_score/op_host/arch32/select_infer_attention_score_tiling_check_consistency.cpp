@@ -22,7 +22,6 @@ using std::map;
 using std::string;
 using std::pair;
 using namespace ge;
-using namespace AscendC;
 namespace optiling {
 void FiaTilingCheck::SetFiaShapeCompare()
 {

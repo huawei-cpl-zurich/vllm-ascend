@@ -21,7 +21,6 @@
 using std::string;
 using std::pair;
 using namespace ge;
-using namespace AscendC;
 namespace optiling {
 const std::map<std::string, std::vector<ge::DataType>> DTYPE_SUPPORT_MAP = {
     {QUERY_NAME,                  {ge::DT_FLOAT16, ge::DT_BF16, ge::DT_INT8}},

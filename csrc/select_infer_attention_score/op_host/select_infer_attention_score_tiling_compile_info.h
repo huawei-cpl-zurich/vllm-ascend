@@ -15,8 +15,10 @@
 
 #ifndef FUSED_INFER_ATTENTION_SCORE_TILING_COMPILE_INFO_H
 #define FUSED_INFER_ATTENTION_SCORE_TILING_COMPILE_INFO_H
+#include <cstddef>
 #include "register/tilingdata_base.h"
 #include "platform/platform_info.h"
+#include "tiling/platform/platform_ascendc.h"
 
 namespace optiling {
 struct SelectInferAttentionScoreCompileInfo {

@@ -28,7 +28,6 @@ using std::map;
 using std::string;
 using std::pair;
 using namespace ge;
-using namespace AscendC;
 namespace optiling {
 
 std::string RopeModeToSerialString(const RopeMode &ropeMode)
@@ -46,13 +45,12 @@ std::string RopeModeToSerialString(const RopeMode &ropeMode)
 
 std::string FusedDataTypeToSerialString(ge::DataType type)
 {
-    const auto it = DATATYPE_TO_STRING_MAP.find(type);
-    if (it != DATATYPE_TO_STRING_MAP.end()) {
-        return it->second;
-    } else {
+    const auto dtype = ge::TypeUtils::DataTypeToSerialString(type);
+    if (dtype.empty() || dtype == "UNDEFINED") {
         OP_LOGE("SelectInferAttentionScore", "datatype %d not support", type);
         return "UNDEFINED";
     }
+    return dtype;
 }
 
 void FiaTilingCheck::Init()
