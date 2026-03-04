@@ -249,6 +249,27 @@ at::Tensor npu_sparse_flash_attention_meta(
     at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
     return output;
 }
+
+std::tuple<at::Tensor, at::Tensor> select_infer_attention_score_meta(
+    const at::Tensor &query,
+    const at::TensorList &key,
+    const at::TensorList &value,
+    const c10::optional<at::Tensor> &atten_mask,
+    const c10::optional<at::Tensor> &block_table,
+    c10::string_view input_layout,
+    int64_t block_size,
+    at::IntArrayRef actual_seq_lengths,
+    at::IntArrayRef actual_seq_lengths_kv,
+    int64_t num_key_value_heads,
+    int64_t num_heads,
+    double scale,
+    int64_t sparse_mode)
+{
+    at::Tensor attention_out = at::empty_like(query);
+    at::Tensor softmax_lse = at::empty({0}, query.options().dtype(at::kFloat));
+    return {attention_out, softmax_lse};
+}
+
 std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_meta(
     const at::Tensor &x1,
     const at::Tensor &x2,
@@ -459,6 +480,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
+    // Select infer attention score
+    ops.impl("select_infer_attention_score", &vllm_ascend::meta::select_infer_attention_score_meta);
     // MoE dispatch-ffn-combine
     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
     // matmul allreduce add rmsnorm

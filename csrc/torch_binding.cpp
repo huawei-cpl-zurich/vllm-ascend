@@ -41,6 +41,7 @@
 #include "moe_combine_normal/moe_combine_normal_torch_adpt.h"
 #include "moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
+#include "select_infer_attention_score/select_infer_attention_score_torch_adpt.h"
 #include "sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/util/Exception.h>
@@ -669,6 +670,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                           int sparse_mode=3) -> Tensor"
     );
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
+
+    ops.def(
+        "select_infer_attention_score(Tensor query, Tensor[] key, Tensor[] value, *,"
+        "                             Tensor? atten_mask=None, Tensor? block_table=None,"
+        "                             str input_layout='TND', int block_size=0,"
+        "                             int[] actual_seq_lengths=[], int[] actual_seq_lengths_kv=[],"
+        "                             int num_key_value_heads=0, int num_heads=0,"
+        "                             float scale=1.0, int sparse_mode=3)"
+        "                             -> (Tensor attention_out, Tensor softmax_lse)"
+    );
+    ops.impl("select_infer_attention_score", torch::kPrivateUse1, &vllm_ascend::select_infer_attention_score);
 
     ops.def(
         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"
