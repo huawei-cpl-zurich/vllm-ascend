@@ -174,6 +174,17 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # Metadata for Prefill Context Parallelism (PCP) operations.
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
 
+    # Active-row QUEST metadata block mapping used by the optional sparse
+    # decode path.
+    quest_metadata_block_tables: torch.Tensor | None = None
+
+    # Per-row sequence lengths to refresh in the metadata kernel. Rows with
+    # zero length are skipped and retain their existing metadata.
+    quest_refresh_seq_lens: torch.Tensor | None = None
+
+    # Model/batch-level gate for the optional QUEST sparse decode path.
+    quest_ready: bool = False
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
@@ -201,6 +212,17 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
+            quest_metadata_block_tables=(
+                self.quest_metadata_block_tables[:num_actual_reqs]
+                if self.quest_metadata_block_tables is not None
+                else None
+            ),
+            quest_refresh_seq_lens=(
+                self.quest_refresh_seq_lens[:num_actual_reqs]
+                if self.quest_refresh_seq_lens is not None
+                else None
+            ),
+            quest_ready=self.quest_ready,
             max_seq_len=self.max_seq_len,
         )
 
