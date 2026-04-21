@@ -15,11 +15,12 @@
 #include "kernel_operator.h"
 #include "quest_prefill_metadata_tilingkey.h"
 
-#define DOUBLEBUFFER 2
-#define SINGLEBUFFER 1
-
+constexpr int32_t SINGLEBUFFER = 1;
+constexpr int32_t DOUBLEBUFFER = 2;
 constexpr int32_t BYTES_UB_BLOCK = 32;
 constexpr int32_t BYTES_DATA_BLOCK = 32;
+constexpr int32_t BF16_METADATA_REDUCE_CHUNK_TOKENS = 64;
+constexpr uint64_t FP32_VECTOR_MASK = 64;
 
 inline __aicore__ int32_t ceilDiv(int32_t x, int32_t d) { return (x + d - 1) / d; }
 inline __aicore__ int32_t ceilDivMul(int32_t x, int32_t d) { return d * ((x + d - 1) / d); }
@@ -39,7 +40,7 @@ struct quest_is_same<A, A> {
     static constexpr bool value = true;
 };
 
-template <typename T>
+template <typename StorageT, typename ComputeT>
 class KernelQuestMetadata {
 public:
     __aicore__ inline KernelQuestMetadata() {}
@@ -65,25 +66,26 @@ public:
         max_kv_blocks_per_request_ = max_kv_blocks_per_request;
         max_metadata_blocks_per_request_ = max_metadata_blocks_per_request;
 
-        k_cache_gm_.SetGlobalBuffer((__gm__ T *)k_cache);
+        k_cache_gm_.SetGlobalBuffer((__gm__ StorageT *)k_cache);
         block_tables_gm_.SetGlobalBuffer((__gm__ int32_t *)block_tables);
         seq_lens_gm_.SetGlobalBuffer((__gm__ int32_t *)seq_lens);
         metadata_block_tables_gm_.SetGlobalBuffer((__gm__ int32_t *)metadata_block_tables);
-        maxblocks_gm_.SetGlobalBuffer((__gm__ T *)maxblocks);
-        minblocks_gm_.SetGlobalBuffer((__gm__ T *)minblocks);
+        maxblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)maxblocks);
+        minblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)minblocks);
 
-        int32_t tile_bytes =
-            ceilDivMul(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(T)), BYTES_UB_BLOCK);
-        pipe_.InitBuffer(k_block_in_q_, DOUBLEBUFFER, tile_bytes);
-        if constexpr (quest_is_same<T, bfloat16_t>::value) {
-            int32_t work_tile_bytes =
-                ceilDivMul(3 * head_dim_ * static_cast<int32_t>(sizeof(float)), BYTES_UB_BLOCK);
-            pipe_.InitBuffer(work_calc_buf_, work_tile_bytes);
-        } else {
-            pipe_.InitBuffer(work_calc_q_, SINGLEBUFFER, tile_bytes);
+        int32_t storage_tile_bytes =
+            ceilDivMul(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_UB_BLOCK);
+        int32_t compute_rows = block_size_;
+        if constexpr (!quest_is_same<StorageT, ComputeT>::value) {
+            // Keep the BF16 FP32 scratch tile the same size as a full FP16 tile.
+            compute_rows = BF16_METADATA_REDUCE_CHUNK_TOKENS + 2;
         }
-        pipe_.InitBuffer(max_out_q_, SINGLEBUFFER, tile_bytes);
-        pipe_.InitBuffer(min_out_q_, SINGLEBUFFER, tile_bytes);
+        int32_t work_tile_bytes =
+            ceilDivMul(compute_rows * head_dim_ * static_cast<int32_t>(sizeof(ComputeT)), BYTES_UB_BLOCK);
+        pipe_.InitBuffer(k_block_in_q_, DOUBLEBUFFER, storage_tile_bytes);
+        pipe_.InitBuffer(work_calc_buf_, work_tile_bytes);
+        pipe_.InitBuffer(max_out_q_, SINGLEBUFFER, storage_tile_bytes);
+        pipe_.InitBuffer(min_out_q_, SINGLEBUFFER, storage_tile_bytes);
     }
 
     __aicore__ void Process()
@@ -101,8 +103,8 @@ public:
             int32_t num_meta_blocks_in_request = ceilDiv(num_kv_blocks_in_request, block_size_);
 
             for (int32_t meta_block = 0; meta_block < num_meta_blocks_in_request; meta_block++) {
-                LocalTensor<T> max_lt = max_out_q_.AllocTensor<T>();
-                LocalTensor<T> min_lt = min_out_q_.AllocTensor<T>();
+                LocalTensor<StorageT> max_lt = max_out_q_.AllocTensor<StorageT>();
+                LocalTensor<StorageT> min_lt = min_out_q_.AllocTensor<StorageT>();
 
                 int32_t completed_kv_blocks = meta_block * block_size_;
                 int32_t kv_blocks_this_iter = num_kv_blocks_in_request - completed_kv_blocks;
@@ -126,77 +128,39 @@ public:
                     int32_t kv_block_offset_gm =
                         (kv_block_id * block_size_ * num_kv_heads_ * head_dim_) + head_idx * head_dim_;
 
-                    LocalTensor<T> k_block_lt = k_block_in_q_.AllocTensor<T>();
+                    LocalTensor<StorageT> k_block_lt = k_block_in_q_.AllocTensor<StorageT>();
                     DataCopyParams gm_ub_cp;
                     gm_ub_cp.blockCount = tokens_to_reduce;
                     gm_ub_cp.blockLen =
-                        ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(T)), BYTES_DATA_BLOCK);
+                        ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_DATA_BLOCK);
                     gm_ub_cp.srcStride = ceilDiv(
-                        (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(T)),
+                        (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
                         BYTES_DATA_BLOCK);
                     gm_ub_cp.dstStride = 0;
                     DataCopy(k_block_lt, k_cache_gm_[kv_block_offset_gm], gm_ub_cp);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
 
-                    if constexpr (quest_is_same<T, bfloat16_t>::value) {
-                        LocalTensor<float> work_fp32_lt = work_calc_buf_.Get<float>();
-                        LocalTensor<float> max_acc_lt = work_fp32_lt;
-                        LocalTensor<float> min_acc_lt = work_fp32_lt[head_dim_];
-                        LocalTensor<float> row_fp32_lt = work_fp32_lt[2 * head_dim_];
-
-                        Cast(max_acc_lt, k_block_lt, RoundMode::CAST_NONE, head_dim_);
-                        Cast(min_acc_lt, k_block_lt, RoundMode::CAST_NONE, head_dim_);
-                        AscendC::PipeBarrier<PIPE_V>();
-
-                        for (int32_t token_idx = 1; token_idx < tokens_to_reduce; ++token_idx) {
-                            Cast(
-                                row_fp32_lt,
-                                k_block_lt[token_idx * head_dim_],
-                                RoundMode::CAST_NONE,
-                                head_dim_);
-                            AscendC::PipeBarrier<PIPE_V>();
-                            Max(max_acc_lt, max_acc_lt, row_fp32_lt, head_dim_);
-                            Min(min_acc_lt, min_acc_lt, row_fp32_lt, head_dim_);
-                            AscendC::PipeBarrier<PIPE_V>();
-                        }
-
-                        Cast(
-                            max_lt[kv_block_offset * head_dim_],
-                            max_acc_lt,
-                            RoundMode::CAST_RINT,
-                            head_dim_);
-                        Cast(
-                            min_lt[kv_block_offset * head_dim_],
-                            min_acc_lt,
-                            RoundMode::CAST_RINT,
-                            head_dim_);
-                        AscendC::PipeBarrier<PIPE_V>();
-                    } else {
-                        uint64_t mask = head_dim_;
-                        CopyRepeatParams ub_ub_cp = {1, 1, 8, 8};
-                        LocalTensor<T> work_lt = work_calc_q_.AllocTensor<T>();
-                        Copy(work_lt, k_block_lt, mask, tokens_to_reduce, ub_ub_cp);
-                        ReduceTokenDim<T, true>(work_lt, tokens_to_reduce * head_dim_);
-                        Copy(max_lt[kv_block_offset * head_dim_], work_lt, mask, 1, ub_ub_cp);
-
-                        Copy(work_lt, k_block_lt, mask, tokens_to_reduce, ub_ub_cp);
-                        ReduceTokenDim<T, false>(work_lt, tokens_to_reduce * head_dim_);
-                        Copy(min_lt[kv_block_offset * head_dim_], work_lt, mask, 1, ub_ub_cp);
-                        work_calc_q_.FreeTensor(work_lt);
-                    }
+                    ReduceBlockToOutput<true>(
+                        max_lt[kv_block_offset * head_dim_],
+                        k_block_lt,
+                        tokens_to_reduce);
+                    ReduceBlockToOutput<false>(
+                        min_lt[kv_block_offset * head_dim_],
+                        k_block_lt,
+                        tokens_to_reduce);
                     k_block_in_q_.FreeTensor(k_block_lt);
                 }
 
                 int32_t unused_metadata_rows = block_size_ - kv_blocks_this_iter;
                 if (unused_metadata_rows > 0) {
-                    Duplicate<T>(
+                    Duplicate<StorageT>(
                         max_lt[kv_blocks_this_iter * head_dim_],
-                        static_cast<T>(0),
+                        static_cast<StorageT>(0),
                         unused_metadata_rows * head_dim_);
-                    Duplicate<T>(
+                    Duplicate<StorageT>(
                         min_lt[kv_blocks_this_iter * head_dim_],
-                        static_cast<T>(0),
+                        static_cast<StorageT>(0),
                         unused_metadata_rows * head_dim_);
                 }
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
@@ -210,10 +174,10 @@ public:
                 DataCopyParams ub_gm_cp;
                 ub_gm_cp.blockCount = block_size_;
                 ub_gm_cp.blockLen =
-                    ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(T)), BYTES_UB_BLOCK);
+                    ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_UB_BLOCK);
                 ub_gm_cp.srcStride = 0;
                 ub_gm_cp.dstStride = ceilDiv(
-                    (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(T)),
+                    (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
                     BYTES_UB_BLOCK);
                 DataCopy(maxblocks_gm_[meta_offset], max_lt, ub_gm_cp);
                 DataCopy(minblocks_gm_[meta_offset], min_lt, ub_gm_cp);
@@ -225,8 +189,78 @@ public:
     }
 
 private:
+    template <bool isMax>
+    __aicore__ inline void ReduceBlockToOutput(
+        LocalTensor<StorageT> out_lt,
+        LocalTensor<StorageT> k_block_lt,
+        int32_t tokens_to_reduce)
+    {
+        if constexpr (quest_is_same<StorageT, ComputeT>::value) {
+            uint64_t mask = head_dim_;
+            CopyRepeatParams ub_ub_cp = {1, 1, 8, 8};
+            LocalTensor<ComputeT> work_lt = work_calc_buf_.Get<ComputeT>();
+            Copy(work_lt, k_block_lt, mask, tokens_to_reduce, ub_ub_cp);
+            ReduceTokenDim<ComputeT, isMax>(work_lt, tokens_to_reduce * head_dim_);
+            Copy(out_lt, work_lt, mask, 1, ub_ub_cp);
+        } else {
+            ReduceCastBlockToOutput<isMax>(out_lt, k_block_lt, tokens_to_reduce);
+        }
+    }
+
+    template <bool isMax>
+    __aicore__ inline void ReduceCastBlockToOutput(
+        LocalTensor<StorageT> out_lt,
+        LocalTensor<StorageT> k_block_lt,
+        int32_t tokens_to_reduce)
+    {
+        LocalTensor<ComputeT> work_lt = work_calc_buf_.Get<ComputeT>();
+        LocalTensor<ComputeT> acc_lt = work_lt[isMax ? 0 : head_dim_];
+        LocalTensor<ComputeT> chunk_lt = work_lt[2 * head_dim_];
+
+        // BF16 chunks are reduced in FP32 and cast back to BF16 metadata rows.
+        for (int32_t token_offset = 0; token_offset < tokens_to_reduce;
+             token_offset += BF16_METADATA_REDUCE_CHUNK_TOKENS) {
+            int32_t chunk_tokens = tokens_to_reduce - token_offset;
+            if (chunk_tokens > BF16_METADATA_REDUCE_CHUNK_TOKENS) {
+                chunk_tokens = BF16_METADATA_REDUCE_CHUNK_TOKENS;
+            }
+
+            Cast(
+                chunk_lt,
+                k_block_lt[token_offset * head_dim_],
+                RoundMode::CAST_NONE,
+                chunk_tokens * head_dim_);
+            AscendC::PipeBarrier<PIPE_V>();
+            ReduceTokenDim<ComputeT, isMax>(chunk_lt, chunk_tokens * head_dim_);
+
+            if (token_offset == 0) {
+                CopyRow<ComputeT>(acc_lt, chunk_lt);
+            } else if (isMax) {
+                Max(acc_lt, acc_lt, chunk_lt, head_dim_);
+            } else {
+                Min(acc_lt, acc_lt, chunk_lt, head_dim_);
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
+        Cast(out_lt, acc_lt, RoundMode::CAST_RINT, head_dim_);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    template <typename ElementT>
+    __aicore__ inline void CopyRow(LocalTensor<ElementT> dst_lt, LocalTensor<ElementT> src_lt)
+    {
+        if constexpr (quest_is_same<ElementT, float>::value) {
+            uint64_t mask = FP32_VECTOR_MASK;
+            uint8_t repeats = static_cast<uint8_t>(head_dim_ / FP32_VECTOR_MASK);
+            Copy(dst_lt, src_lt, mask, repeats, {1, 1, 8, 8});
+        } else {
+            Copy(dst_lt, src_lt, head_dim_, 1, {1, 1, 8, 8});
+        }
+    }
+
     template <typename ElementT, bool isMax>
-    __aicore__ void ReduceTokenDim(LocalTensor<ElementT> vec_lt, int32_t initial_length)
+    __aicore__ inline void ReduceTokenDim(LocalTensor<ElementT> vec_lt, int32_t initial_length)
     {
         if (initial_length != block_size_ * head_dim_) {
             AscendC::PipeBarrier<PIPE_V>();
@@ -248,12 +282,7 @@ private:
             }
 
             if (has_tail) {
-                Copy(
-                    vec_lt[reduce_len],
-                    vec_lt[(num_vec - 1) * head_dim_],
-                    head_dim_,
-                    1,
-                    {1, 1, 8, 8});
+                CopyRow<ElementT>(vec_lt[reduce_len], vec_lt[(num_vec - 1) * head_dim_]);
                 reduce_len += head_dim_;
             }
 
@@ -265,13 +294,12 @@ private:
     TPipe pipe_;
     TQue<TPosition::VECIN, DOUBLEBUFFER> k_block_in_q_;
     TBuf<TPosition::VECCALC> work_calc_buf_;
-    TQue<TPosition::VECCALC, SINGLEBUFFER> work_calc_q_;
     TQue<TPosition::VECOUT, SINGLEBUFFER> max_out_q_;
     TQue<TPosition::VECOUT, SINGLEBUFFER> min_out_q_;
 
-    GlobalTensor<T> k_cache_gm_;
-    GlobalTensor<T> maxblocks_gm_;
-    GlobalTensor<T> minblocks_gm_;
+    GlobalTensor<StorageT> k_cache_gm_;
+    GlobalTensor<StorageT> maxblocks_gm_;
+    GlobalTensor<StorageT> minblocks_gm_;
     GlobalTensor<int32_t> block_tables_gm_;
     GlobalTensor<int32_t> seq_lens_gm_;
     GlobalTensor<int32_t> metadata_block_tables_gm_;
@@ -284,7 +312,7 @@ private:
     int32_t max_metadata_blocks_per_request_;
 };
 
-template <typename T>
+template <typename StorageT, typename ComputeT>
 __aicore__ inline void RunQuestPrefillMetadata(
     GM_ADDR k_cache,
     GM_ADDR block_tables,
@@ -294,7 +322,7 @@ __aicore__ inline void RunQuestPrefillMetadata(
     GM_ADDR minblocks,
     const QuestPrefillMetadataTilingData *tiling_data)
 {
-    KernelQuestMetadata<T> op;
+    KernelQuestMetadata<StorageT, ComputeT> op;
     op.Init(
         k_cache,
         block_tables,
@@ -324,30 +352,8 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
     (void)workspace;
     QUEST_PREFILL_METADATA_COPY_TILING_DATA(QuestPrefillMetadataTilingData, tiling);
 
-    #define QUEST_SKIP_BF16_PATH
-    // Reduction operators for MIN and MAX currently do not support BF16
-    // As a result, the BF16 execution path is 5x-10x slower than the fp16 counterpart
-    // However, given that these kernels only use MIN and MAX operators, we can
-    // simply reinterpret the bit representation of BF16 as fp16 and call the kernel
-    // for the wrong type, while still getting the correct results.
-    // This is a HACK and should be fixed once a better solution is found.
-
-    #if defined(QUEST_SKIP_BF16_PATH)
-    if (TILING_KEY_IS(QUEST_PREFILL_METADATA_TILING_FP16) ||
-        TILING_KEY_IS(QUEST_PREFILL_METADATA_TILING_BF16)) {
-        RunQuestPrefillMetadata<half>(
-            k_cache,
-            block_tables,
-            seq_lens,
-            metadata_block_tables,
-            maxblocks,
-            minblocks,
-            tiling_data);
-        return;
-    }
-    #else
     if (TILING_KEY_IS(QUEST_PREFILL_METADATA_TILING_FP16)) {
-        RunQuestPrefillMetadata<half>(
+        RunQuestPrefillMetadata<half, half>(
             k_cache,
             block_tables,
             seq_lens,
@@ -357,10 +363,9 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
             tiling_data);
         return;
     }
-
 
     if (TILING_KEY_IS(QUEST_PREFILL_METADATA_TILING_BF16)) {
-        RunQuestPrefillMetadata<bfloat16_t>(
+        RunQuestPrefillMetadata<bfloat16_t, float>(
             k_cache,
             block_tables,
             seq_lens,
@@ -370,7 +375,6 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
             tiling_data);
         return;
     }
-    #endif
 
     ASSERT(false && "Unsupported quest_prefill_metadata tiling key.");
 }
