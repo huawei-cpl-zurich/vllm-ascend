@@ -15,12 +15,12 @@
 #include "kernel_operator.h"
 #include "quest_prefill_metadata_tilingkey.h"
 
-#define DOUBLEBUFFER 2
-#define SINGLEBUFFER 1
-
+constexpr int32_t SINGLEBUFFER = 1;
+constexpr int32_t DOUBLEBUFFER = 2;
 constexpr int32_t BYTES_UB_BLOCK = 32;
 constexpr int32_t BYTES_DATA_BLOCK = 32;
-constexpr int32_t BF16_FP32_CHUNK_TOKENS = 64;
+constexpr int32_t BF16_METADATA_REDUCE_CHUNK_TOKENS = 64;
+constexpr uint64_t FP32_VECTOR_MASK = 64;
 
 inline __aicore__ int32_t ceilDiv(int32_t x, int32_t d) { return (x + d - 1) / d; }
 inline __aicore__ int32_t ceilDivMul(int32_t x, int32_t d) { return d * ((x + d - 1) / d); }
@@ -77,7 +77,8 @@ public:
             ceilDivMul(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_UB_BLOCK);
         int32_t compute_rows = block_size_;
         if constexpr (!quest_is_same<StorageT, ComputeT>::value) {
-            compute_rows = BF16_FP32_CHUNK_TOKENS + 2;
+            // Keep the BF16 FP32 scratch tile the same size as a full FP16 tile.
+            compute_rows = BF16_METADATA_REDUCE_CHUNK_TOKENS + 2;
         }
         int32_t work_tile_bytes =
             ceilDivMul(compute_rows * head_dim_ * static_cast<int32_t>(sizeof(ComputeT)), BYTES_UB_BLOCK);
@@ -189,7 +190,7 @@ public:
 
 private:
     template <bool isMax>
-    __aicore__ void ReduceBlockToOutput(
+    __aicore__ inline void ReduceBlockToOutput(
         LocalTensor<StorageT> out_lt,
         LocalTensor<StorageT> k_block_lt,
         int32_t tokens_to_reduce)
@@ -207,7 +208,7 @@ private:
     }
 
     template <bool isMax>
-    __aicore__ void ReduceCastBlockToOutput(
+    __aicore__ inline void ReduceCastBlockToOutput(
         LocalTensor<StorageT> out_lt,
         LocalTensor<StorageT> k_block_lt,
         int32_t tokens_to_reduce)
@@ -218,10 +219,10 @@ private:
 
         // BF16 chunks are reduced in FP32 and cast back to BF16 metadata rows.
         for (int32_t token_offset = 0; token_offset < tokens_to_reduce;
-             token_offset += BF16_FP32_CHUNK_TOKENS) {
+             token_offset += BF16_METADATA_REDUCE_CHUNK_TOKENS) {
             int32_t chunk_tokens = tokens_to_reduce - token_offset;
-            if (chunk_tokens > BF16_FP32_CHUNK_TOKENS) {
-                chunk_tokens = BF16_FP32_CHUNK_TOKENS;
+            if (chunk_tokens > BF16_METADATA_REDUCE_CHUNK_TOKENS) {
+                chunk_tokens = BF16_METADATA_REDUCE_CHUNK_TOKENS;
             }
 
             Cast(
@@ -247,11 +248,11 @@ private:
     }
 
     template <typename ElementT>
-    __aicore__ void CopyRow(LocalTensor<ElementT> dst_lt, LocalTensor<ElementT> src_lt)
+    __aicore__ inline void CopyRow(LocalTensor<ElementT> dst_lt, LocalTensor<ElementT> src_lt)
     {
         if constexpr (quest_is_same<ElementT, float>::value) {
-            uint64_t mask = 64;
-            uint8_t repeats = static_cast<uint8_t>(head_dim_ / 64);
+            uint64_t mask = FP32_VECTOR_MASK;
+            uint8_t repeats = static_cast<uint8_t>(head_dim_ / FP32_VECTOR_MASK);
             Copy(dst_lt, src_lt, mask, repeats, {1, 1, 8, 8});
         } else {
             Copy(dst_lt, src_lt, head_dim_, 1, {1, 1, 8, 8});
@@ -259,7 +260,7 @@ private:
     }
 
     template <typename ElementT, bool isMax>
-    __aicore__ void ReduceTokenDim(LocalTensor<ElementT> vec_lt, int32_t initial_length)
+    __aicore__ inline void ReduceTokenDim(LocalTensor<ElementT> vec_lt, int32_t initial_length)
     {
         if (initial_length != block_size_ * head_dim_) {
             AscendC::PipeBarrier<PIPE_V>();
@@ -362,7 +363,6 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
             tiling_data);
         return;
     }
-
 
     if (TILING_KEY_IS(QUEST_PREFILL_METADATA_TILING_BF16)) {
         RunQuestPrefillMetadata<bfloat16_t, float>(
