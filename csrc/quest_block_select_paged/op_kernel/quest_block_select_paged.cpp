@@ -504,8 +504,7 @@ private:
     }
 
     __aicore__ inline void CopyScoresToAccumulated(
-        AscendC::LocalTensor<ComputeT> accumulated_scores_lt,
-        AscendC::LocalTensor<ComputeT> block_scores_lt,
+        LocalTensors &tensors,
         int32_t seq_len,
         int32_t num_tokens_per_meta_block,
         int32_t meta_block,
@@ -513,11 +512,11 @@ private:
     {
         uint64_t seq_len_curr_meta_block =
             MIN(seq_len - (meta_block * num_tokens_per_meta_block), block_size_);
-        if constexpr (quest_is_same<StorageT, ComputeT>::value) {
+        if constexpr (!Traits::need_cast) {
             int32_t accumulated_offset = meta_block * block_size_;
             AscendC::Copy(
-                accumulated_scores_lt[accumulated_offset],
-                block_scores_lt,
+                tensors.accumulated_scores[accumulated_offset],
+                tensors.block_scores,
                 seq_len_curr_meta_block,
                 1,
                 {1, 1, 8, 8});
@@ -533,8 +532,8 @@ private:
                 int32_t block_scores_offset = sub_meta_block_id * NUM_FLOAT_ELEMS_PER_VECTOR;
                 int32_t accumulated_offset = meta_block * block_size_ + block_scores_offset;
                 AscendC::Copy(
-                    accumulated_scores_lt[accumulated_offset],
-                    block_scores_lt[block_scores_offset],
+                    tensors.accumulated_scores[accumulated_offset],
+                    tensors.block_scores[block_scores_offset],
                     seq_len_curr_meta_block - sub_meta_block_id * NUM_FLOAT_ELEMS_PER_VECTOR,
                     1,
                     {1, 1, 8, 8});
@@ -547,14 +546,7 @@ private:
     }
 
     __aicore__ inline void SortAndExtract(
-        AscendC::LocalTensor<ComputeT> sort_output_lt,
-        AscendC::LocalTensor<ComputeT> accumulated_scores_lt,
-        AscendC::LocalTensor<ComputeT> selected_values_lt,
-        AscendC::LocalTensor<uint32_t> selected_indices_lt,
-        AscendC::LocalTensor<ComputeT> tmp_concat_lt,
-        AscendC::LocalTensor<ComputeT> concat_lt,
-        AscendC::LocalTensor<uint32_t> index_local_lt,
-        AscendC::LocalTensor<ComputeT> sort_tmp_lt,
+        LocalTensors &tensors,
         int32_t num_meta_blocks_in_request)
     {
         uint32_t total_elements = num_meta_blocks_in_request * block_size_;
@@ -563,26 +555,32 @@ private:
         uint32_t extract_repeat_times = DIV_ROUNDUP(total_elements, 32);
 
         for (uint32_t idx = 0; idx < total_elements; idx++) {
-            index_local_lt.SetValue(idx, idx);
+            tensors.index_local.SetValue(idx, idx);
         }
 
-        if constexpr (quest_is_same<StorageT, ComputeT>::value) {
+        if constexpr (!Traits::need_cast) {
             AscendC::PipeBarrier<PIPE_V>();
         }
-        AscendC::Concat(concat_lt, accumulated_scores_lt, tmp_concat_lt, concat_repeat_times);
-        if constexpr (!quest_is_same<StorageT, ComputeT>::value) {
+        AscendC::Concat(
+            tensors.concat,
+            tensors.accumulated_scores,
+            tensors.tmp_concat,
+            concat_repeat_times);
+        if constexpr (Traits::need_cast) {
             AscendC::PipeBarrier<PIPE_V>();
         }
         AscendC::Sort<ComputeT, true>(
-            sort_output_lt,
-            concat_lt,
-            index_local_lt,
-            sort_tmp_lt,
+            tensors.maxblock,
+            tensors.concat,
+            tensors.index_local,
+            tensors.sort_tmp,
             sort_repeat_times);
-        AscendC::Extract(selected_values_lt, selected_indices_lt, sort_output_lt, extract_repeat_times);
+        AscendC::Extract(
+            tensors.selected_values,
+            tensors.selected_indices,
+            tensors.maxblock,
+            extract_repeat_times);
     }
-
-    using VecBufT = AscendC::TBuf<AscendC::QuePosition::VECCALC>;
 
     AscendC::TPipe pipe_;
     VecBufT input_storage_buf_;
