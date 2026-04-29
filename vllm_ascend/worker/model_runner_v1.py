@@ -97,8 +97,10 @@ from vllm_ascend.attention.attention_v1 import (
     QUEST_HEAD_SIZE,
     QUEST_MAX_METADATA_BLOCKS_PER_REQ,
     QUEST_PAGE_SIZE,
+    AscendAttentionBackend,
     AscendAttentionState,
 )
+from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, enable_cp, using_paged_attention
 
 # yapf conflicts with isort for this block
