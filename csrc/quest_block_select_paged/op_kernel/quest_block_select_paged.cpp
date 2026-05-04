@@ -80,7 +80,6 @@ public:
         int32_t block_size,
         int32_t head_dim,
         int32_t max_metadata_blocks_per_request,
-        int32_t tokens_since_metadata_update,
         int32_t k)
     {
         AscendC::SetAtomicNone();
@@ -91,7 +90,6 @@ public:
         block_size_ = block_size;
         head_dim_ = head_dim;
         max_metadata_blocks_per_request_ = max_metadata_blocks_per_request;
-        (void)tokens_since_metadata_update;
         k_ = k;
         masks_per_head_dim_ = head_dim_ / NUM_FLOAT_ELEMS_PER_VECTOR;
         score_mul_repeat_params_ = AscendC::BinaryRepeatParams(
@@ -515,7 +513,6 @@ __aicore__ inline void RunQuestBlockSelectPaged(
         static_cast<int32_t>(tiling_data->blockSize),
         static_cast<int32_t>(tiling_data->headDim),
         static_cast<int32_t>(tiling_data->maxMetadataBlocksPerRequest),
-        tiling_data->tokensSinceMetadataUpdate,
         static_cast<int32_t>(tiling_data->k));
     op.Process();
 }
