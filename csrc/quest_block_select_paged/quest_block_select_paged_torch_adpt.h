@@ -39,7 +39,6 @@ inline void check_quest_block_select_paged_common(
     const at::Tensor &metadata_block_tables,
     const at::Tensor &seq_lens,
     const at::Tensor &output,
-    int64_t tokens_since_metadata_update,
     bool require_aligned_output)
 {
     TORCH_CHECK(query.dim() == 3, "query must be 3D.");
@@ -87,10 +86,6 @@ inline void check_quest_block_select_paged_common(
     TORCH_CHECK(metadata_block_tables.size(1) <= QUEST_BLOCK_SELECT_MAX_MMBPR,
                 "metadata_block_tables.size(1) cannot exceed ",
                 QUEST_BLOCK_SELECT_MAX_MMBPR, ".");
-    TORCH_CHECK(tokens_since_metadata_update == -1 ||
-                    (tokens_since_metadata_update >= 0 &&
-                     tokens_since_metadata_update <= block_size),
-                "tokens_since_metadata_update must be -1 or in [0, block_size].");
     if (require_aligned_output) {
         TORCH_CHECK(output_k == round_k_for_quest(output_k),
                     "The last dimension of the output tensor must be aligned to 8 int32 values.");
@@ -104,8 +99,7 @@ inline at::Tensor npu_quest_block_select_paged(
     const at::Tensor &minblocks,
     const at::Tensor &metadata_block_tables,
     const at::Tensor &seq_lens,
-    int64_t k,
-    int64_t tokens_since_metadata_update)
+    int64_t k)
 {
     TORCH_CHECK(k > 0, "k must be positive.");
     const int64_t rounded_k = round_k_for_quest(k);
@@ -119,7 +113,6 @@ inline at::Tensor npu_quest_block_select_paged(
         metadata_block_tables,
         seq_lens,
         output,
-        tokens_since_metadata_update,
         false);
 
     EXEC_NPU_CMD(
@@ -129,7 +122,6 @@ inline at::Tensor npu_quest_block_select_paged(
         minblocks,
         metadata_block_tables,
         seq_lens,
-        tokens_since_metadata_update,
         output);
 
     if (rounded_k != k) {
@@ -144,8 +136,7 @@ inline at::Tensor &npu_quest_block_select_paged_out(
     const at::Tensor &minblocks,
     const at::Tensor &metadata_block_tables,
     const at::Tensor &seq_lens,
-    at::Tensor &output,
-    int64_t tokens_since_metadata_update)
+    at::Tensor &output)
 {
     check_quest_block_select_paged_common(
         query,
@@ -154,7 +145,6 @@ inline at::Tensor &npu_quest_block_select_paged_out(
         metadata_block_tables,
         seq_lens,
         output,
-        tokens_since_metadata_update,
         true);
 
     EXEC_NPU_CMD(
@@ -164,7 +154,6 @@ inline at::Tensor &npu_quest_block_select_paged_out(
         minblocks,
         metadata_block_tables,
         seq_lens,
-        tokens_since_metadata_update,
         output);
     return output;
 }
