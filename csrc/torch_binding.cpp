@@ -1198,14 +1198,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "npu_quest_block_select_paged(Tensor query, Tensor maxblocks, Tensor minblocks,"
         "                             Tensor metadata_block_tables, Tensor seq_lens,"
-        "                             int k) -> Tensor"
+        "                             int k, int tokens_since_metadata_update=-1) -> Tensor"
     );
     ops.impl("npu_quest_block_select_paged", torch::kPrivateUse1, &vllm_ascend::npu_quest_block_select_paged);
 
     ops.def(
         "npu_quest_block_select_paged_out(Tensor query, Tensor maxblocks, Tensor minblocks,"
         "                                 Tensor metadata_block_tables, Tensor seq_lens,"
-        "                                 Tensor! out) -> Tensor"
+        "                                 Tensor! out, int tokens_since_metadata_update=-1) -> Tensor"
     );
     ops.impl("npu_quest_block_select_paged_out", torch::kPrivateUse1, &vllm_ascend::npu_quest_block_select_paged_out);
 
