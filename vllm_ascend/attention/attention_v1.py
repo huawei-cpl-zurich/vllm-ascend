@@ -510,7 +510,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             metadata_block_tables=attn_metadata.quest_metadata_block_tables,
             seq_lens=attn_metadata.quest_seq_lens,
             k=k,
-            tokens_since_metadata_update=0,
         )
         attn_output = paged_select_attention(
             query,
@@ -615,7 +614,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             metadata_block_tables=attn_metadata.quest_metadata_block_tables,
             seq_lens=attn_metadata.quest_seq_lens,
             out=selected_q_indices_buffer,
-            tokens_since_metadata_update=0,
         )
         paged_select_attention_graph_out(
             query=query,
@@ -701,7 +699,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         metadata_block_tables=quest_metadata_block_tables,
                         seq_lens=seq_lens,
                         out=selected_q_indices_buffer,
-                        tokens_since_metadata_update=0,
                     )
                     paged_select_attention_graph_out(
                         query=query,

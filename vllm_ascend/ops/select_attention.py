@@ -45,7 +45,6 @@ def quest_block_select_paged(
     metadata_block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     k: int,
-    tokens_since_metadata_update: int = -1,
 ) -> torch.Tensor:
     enable_custom_op()
     return torch.ops._C_ascend.npu_quest_block_select_paged(
@@ -55,7 +54,7 @@ def quest_block_select_paged(
         metadata_block_tables,
         seq_lens,
         k,
-        tokens_since_metadata_update,
+        0,
     )
 
 
@@ -66,7 +65,6 @@ def quest_block_select_paged_out(
     metadata_block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     out: torch.Tensor,
-    tokens_since_metadata_update: int = -1,
 ) -> torch.Tensor:
     enable_custom_op()
     return torch.ops._C_ascend.npu_quest_block_select_paged_out(
@@ -76,7 +74,7 @@ def quest_block_select_paged_out(
         metadata_block_tables,
         seq_lens,
         out,
-        tokens_since_metadata_update,
+        0,
     )
 
 
