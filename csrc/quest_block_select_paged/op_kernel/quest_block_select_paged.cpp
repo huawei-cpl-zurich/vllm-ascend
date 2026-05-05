@@ -13,7 +13,6 @@
 
 #define BYTES_UB_BLOCK 32
 #define BYTES_DATA_BLOCK 32
-#define NUM_HALF_ELEMS_PER_VECTOR 128
 #define NUM_FLOAT_ELEMS_PER_VECTOR 64
 #define DIV_ROUNDUP(x, y) (((x) + (y)-1) / (y))
 #define DIV_ROUNDUP_MUL(bytes, bytes_per_block) (DIV_ROUNDUP(bytes, bytes_per_block) * (bytes_per_block))
@@ -29,19 +28,6 @@ using namespace AscendC;
 // QuestBlockSelectPagedTilingData is generated from the op_host tiling
 // definition. The kernel must not redeclare it locally.
 
-__aicore__ inline bool quest_has_selected_index(
-    LocalTensor<uint32_t> &selected_indices_lt,
-    int32_t selection_limit,
-    uint32_t candidate)
-{
-    for (int32_t idx = 0; idx < selection_limit; ++idx) {
-        if (selected_indices_lt.GetValue(idx) == candidate) {
-            return true;
-        }
-    }
-    return false;
-}
-
 __aicore__ inline void quest_apply_anchor_selection(
     LocalTensor<uint32_t> &selected_indices_lt,
     int32_t seq_len,
@@ -52,34 +38,42 @@ __aicore__ inline void quest_apply_anchor_selection(
         return;
     }
 
-    int32_t valid_page_count = DIV_ROUNDUP(seq_len, block_size);
-    int32_t selection_limit = MIN(k, valid_page_count);
-    if (selection_limit <= 0) {
+    int32_t num_valid_pages = DIV_ROUNDUP(seq_len, block_size);
+    int32_t num_selected_pages = MIN(k, num_valid_pages);
+    if (num_selected_pages <= 0) {
         return;
     }
 
-    if (unlikely(selection_limit == 1)) {
-        selected_indices_lt.SetValue(0, static_cast<uint32_t>(valid_page_count - 1));
+    if (unlikely(num_selected_pages == 1)) {
+        selected_indices_lt.SetValue(0, static_cast<uint32_t>(num_valid_pages - 1));
         for (int32_t idx = 1; idx < k; ++idx) {
             selected_indices_lt.SetValue(idx, 0U);
         }
         return;
     }
 
-    uint32_t last_anchor = static_cast<uint32_t>(valid_page_count - 1);
-    bool has_first_anchor = quest_has_selected_index(selected_indices_lt, selection_limit, 0U);
-    bool has_last_anchor = quest_has_selected_index(selected_indices_lt, selection_limit, last_anchor);
-    int32_t replacement_slot = selection_limit - 1;
-
-    if (!has_last_anchor) {
-        selected_indices_lt.SetValue(replacement_slot, last_anchor);
-        --replacement_slot;
+    uint32_t last_anchor = static_cast<uint32_t>(num_valid_pages - 1);
+    bool has_first_anchor = false;
+    bool has_last_anchor = false;
+    for (int32_t idx = 0; idx < num_selected_pages; ++idx) {
+        uint32_t selected_page = selected_indices_lt.GetValue(idx);
+        has_first_anchor = has_first_anchor || selected_page == 0U;
+        has_last_anchor = has_last_anchor || selected_page == last_anchor;
+        if (has_first_anchor && has_last_anchor) {
+            break;
+        }
     }
+
     if (!has_first_anchor) {
-        selected_indices_lt.SetValue(replacement_slot, 0U);
+        selected_indices_lt.SetValue(num_selected_pages - 1, 0U);
+    }
+    if (!has_last_anchor) {
+        selected_indices_lt.SetValue(
+            num_selected_pages - 1 - static_cast<int32_t>(!has_first_anchor),
+            last_anchor);
     }
 
-    for (int32_t idx = selection_limit; idx < k; ++idx) {
+    for (int32_t idx = num_selected_pages; idx < k; ++idx) {
         selected_indices_lt.SetValue(idx, 0U);
     }
 }
@@ -88,8 +82,7 @@ template <typename StorageT>
 class KernelQuestBlockSelectPaged {
     using VecBufT = AscendC::TBuf<AscendC::QuePosition::VECCALC>;
     using ComputeT = float;
-    static constexpr uint32_t CONCAT_REGION_SIZE = REGION_PROPOSAL_DATA_SIZE_FLOAT_V220;
-    static constexpr uint32_t SORT_REGION_SIZE = REGION_PROPOSAL_DATA_SIZE_FLOAT_V220;
+    static constexpr uint32_t REGION_SIZE = REGION_PROPOSAL_DATA_SIZE_FLOAT_V220;
 
     struct LocalTensors {
         AscendC::LocalTensor<ComputeT> query;
@@ -158,17 +151,17 @@ public:
         uint32_t selected_values_buf_size =
             NUM_UB_BYTES(k_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t tmp_concat_buf_size = NUM_UB_BYTES(
-            max_metadata_blocks_per_request_ * block_size_ * CONCAT_REGION_SIZE *
+            max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
             static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t concat_buf_size = NUM_UB_BYTES(
             (max_metadata_blocks_per_request_ * block_size_ +
-             max_metadata_blocks_per_request_ * block_size_ * CONCAT_REGION_SIZE) *
+             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE) *
             static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t index_local_buf_size =
             NUM_UB_BYTES(max_metadata_blocks_per_request_ * block_size_ *
                          static_cast<int32_t>(sizeof(uint32_t)));
         uint32_t sort_tmp_buf_size = NUM_UB_BYTES(
-            max_metadata_blocks_per_request_ * block_size_ * SORT_REGION_SIZE *
+            max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
             static_cast<int32_t>(sizeof(ComputeT)));
 
         pipe_.InitBuffer(query_buf_, query_buf_size);
@@ -454,9 +447,7 @@ private:
         int32_t num_meta_blocks_in_request)
     {
         uint32_t total_elements = num_meta_blocks_in_request * block_size_;
-        uint32_t concat_repeat_times = DIV_ROUNDUP(total_elements, 32);
-        uint32_t sort_repeat_times = DIV_ROUNDUP(total_elements, 32);
-        uint32_t extract_repeat_times = DIV_ROUNDUP(total_elements, 32);
+        uint32_t repeat_times = DIV_ROUNDUP(total_elements, 32);
 
         for (uint32_t idx = 0; idx < total_elements; idx++) {
             tensors.index_local.SetValue(idx, idx);
@@ -466,19 +457,19 @@ private:
             tensors.concat,
             tensors.accumulated_scores,
             tensors.tmp_concat,
-            concat_repeat_times);
+            repeat_times);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Sort<ComputeT, true>(
             tensors.maxblock,
             tensors.concat,
             tensors.index_local,
             tensors.sort_tmp,
-            sort_repeat_times);
+            repeat_times);
         AscendC::Extract(
             tensors.selected_values,
             tensors.selected_indices,
             tensors.maxblock,
-            extract_repeat_times);
+            repeat_times);
     }
 
     AscendC::TPipe pipe_;
