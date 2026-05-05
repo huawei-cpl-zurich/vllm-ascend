@@ -220,9 +220,8 @@ public:
             int32_t valid_page_count = DIV_ROUNDUP(seq_len, block_size_);
             int32_t num_tokens_per_meta_block = block_size_ * block_size_;
             int32_t num_meta_blocks_in_request = DIV_ROUNDUP(seq_len, num_tokens_per_meta_block);
-            if (ShouldUseAnchorOnlySelection(valid_page_count)) {
+            if (unlikely(TryFillAnchorOnlySelection(tensors.selected_indices, valid_page_count))) {
                 // Catch sequences that are too short for sparsity
-                FillAnchorOnlySelection(tensors.selected_indices, valid_page_count);
             } else {
                 LoadQuery(tensors, query_offset);
                 DuplicateAccumulatedScores(tensors, num_meta_blocks_in_request);
@@ -263,28 +262,25 @@ public:
     }
 
 private:
-    __aicore__ inline bool ShouldUseAnchorOnlySelection(int32_t valid_page_count) const
-    {
-        return tokens_since_metadata_update_ >= 0 &&
-               valid_page_count > 0 &&
-               valid_page_count <= 2 &&
-               k_ >= valid_page_count;
-    }
-
-    __aicore__ inline void FillAnchorOnlySelection(
+    __aicore__ inline bool TryFillAnchorOnlySelection(
         AscendC::LocalTensor<uint32_t> selected_indices_lt,
-        int32_t valid_page_count)
+        int32_t valid_page_count) const
     {
+        if (likely(tokens_since_metadata_update_ < 0 ||
+                   valid_page_count <= 0 ||
+                   valid_page_count > 2 ||
+                   k_ < valid_page_count)) {
+            return false;
+        }
+
         for (int32_t idx = 0; idx < k_; ++idx) {
             selected_indices_lt.SetValue(idx, 0U);
         }
-        if (valid_page_count <= 0) {
-            return;
-        }
         selected_indices_lt.SetValue(0, 0U);
-        if (valid_page_count > 1) {
+        if (unlikely(valid_page_count > 1)) {
             selected_indices_lt.SetValue(1, static_cast<uint32_t>(valid_page_count - 1));
         }
+        return true;
     }
 
     __aicore__ inline LocalTensors GetLocalTensors()
@@ -337,8 +333,12 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline AscendC::DataCopyParams MetadataCopyParams()
+    __aicore__ inline void ScoreMetadataBlock(
+        LocalTensors &tensors,
+        int32_t meta_block_offset)
     {
+        AscendC::LocalTensor<StorageT> input_storage_lt =
+            input_storage_buf_.Get<StorageT>(block_size_ * head_dim_);
         AscendC::DataCopyParams gm_ub_cp;
         gm_ub_cp.blockCount = block_size_;
         gm_ub_cp.blockLen =
@@ -347,45 +347,16 @@ private:
             (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
             BYTES_DATA_BLOCK);
         gm_ub_cp.dstStride = 0;
-        return gm_ub_cp;
-    }
 
-    __aicore__ inline void ScoreMetadataBlock(
-        LocalTensors &tensors,
-        int32_t meta_block_offset)
-    {
-        AscendC::DataCopyParams gm_ub_cp = MetadataCopyParams();
-        ScoreMetadataBlockFp32(tensors, gm_ub_cp, meta_block_offset);
-    }
-
-    __aicore__ inline void MulFloatBlock(
-        AscendC::LocalTensor<ComputeT> block_lt,
-        AscendC::LocalTensor<ComputeT> query_lt,
-        AscendC::BinaryRepeatParams mul_repeat_params)
-    {
-        AscendC::Mul(
-            block_lt,
-            query_lt,
-            block_lt,
-            NUM_FLOAT_ELEMS_PER_VECTOR,
-            block_size_,
-            mul_repeat_params);
-        AscendC::Mul(
-            block_lt[NUM_FLOAT_ELEMS_PER_VECTOR],
-            query_lt[NUM_FLOAT_ELEMS_PER_VECTOR],
-            block_lt[NUM_FLOAT_ELEMS_PER_VECTOR],
-            NUM_FLOAT_ELEMS_PER_VECTOR,
-            block_size_,
-            mul_repeat_params);
-    }
-
-    __aicore__ inline void ScoreMetadataBlockFp32(
-        LocalTensors &tensors,
-        AscendC::DataCopyParams gm_ub_cp,
-        int32_t meta_block_offset)
-    {
-        AscendC::LocalTensor<StorageT> input_storage_lt =
-            input_storage_buf_.Get<StorageT>(block_size_ * head_dim_);
+        uint64_t mask = NUM_FLOAT_ELEMS_PER_VECTOR;
+        uint64_t masks_per_head_dim = head_dim_ / mask;
+        AscendC::BinaryRepeatParams mul_repeat_params = AscendC::BinaryRepeatParams(
+            1,
+            1,
+            1,
+            8 * masks_per_head_dim,
+            0,
+            8 * masks_per_head_dim);
 
         AscendC::DataCopy(input_storage_lt, maxblocks_gm_[meta_block_offset], gm_ub_cp);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
@@ -397,17 +368,20 @@ private:
             block_size_ * head_dim_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
-
-        uint64_t mask = NUM_FLOAT_ELEMS_PER_VECTOR;
-        uint64_t masks_per_head_dim = head_dim_ / mask;
-        AscendC::BinaryRepeatParams mul_repeat_params = AscendC::BinaryRepeatParams(
-            1,
-            1,
-            1,
-            8 * masks_per_head_dim,
-            0,
-            8 * masks_per_head_dim);
-        MulFloatBlock(tensors.maxblock, tensors.query, mul_repeat_params);
+        AscendC::Mul(
+            tensors.maxblock,
+            tensors.query,
+            tensors.maxblock,
+            NUM_FLOAT_ELEMS_PER_VECTOR,
+            block_size_,
+            mul_repeat_params);
+        AscendC::Mul(
+            tensors.maxblock[NUM_FLOAT_ELEMS_PER_VECTOR],
+            tensors.query[NUM_FLOAT_ELEMS_PER_VECTOR],
+            tensors.maxblock[NUM_FLOAT_ELEMS_PER_VECTOR],
+            NUM_FLOAT_ELEMS_PER_VECTOR,
+            block_size_,
+            mul_repeat_params);
 
         AscendC::DataCopy(input_storage_lt, minblocks_gm_[meta_block_offset], gm_ub_cp);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
@@ -417,7 +391,20 @@ private:
             input_storage_lt,
             AscendC::RoundMode::CAST_NONE,
             block_size_ * head_dim_);
-        MulFloatBlock(tensors.minblock, tensors.query, mul_repeat_params);
+        AscendC::Mul(
+            tensors.minblock,
+            tensors.query,
+            tensors.minblock,
+            NUM_FLOAT_ELEMS_PER_VECTOR,
+            block_size_,
+            mul_repeat_params);
+        AscendC::Mul(
+            tensors.minblock[NUM_FLOAT_ELEMS_PER_VECTOR],
+            tensors.query[NUM_FLOAT_ELEMS_PER_VECTOR],
+            tensors.minblock[NUM_FLOAT_ELEMS_PER_VECTOR],
+            NUM_FLOAT_ELEMS_PER_VECTOR,
+            block_size_,
+            mul_repeat_params);
 
         AscendC::Max(tensors.maxblock, tensors.maxblock, tensors.minblock, block_size_ * head_dim_);
 
