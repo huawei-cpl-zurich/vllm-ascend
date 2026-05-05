@@ -40,19 +40,23 @@ __aicore__ inline void quest_apply_anchor_selection(
 
     int32_t num_valid_pages = DIV_ROUNDUP(seq_len, block_size);
     int32_t num_selected_pages = MIN(k, num_valid_pages);
+    // Case 1: Nothing selected
     if (num_selected_pages <= 0) {
         return;
     }
 
-    if (unlikely(num_selected_pages == 1)) {
-        selected_indices_lt.SetValue(0, static_cast<uint32_t>(num_valid_pages - 1));
-        for (int32_t idx = 1; idx < k; ++idx) {
+    // Case 2: <= 2 blocks selected
+    uint32_t last_anchor = static_cast<uint32_t>(num_valid_pages - 1);
+    if (unlikely(num_selected_pages <= 2)) {
+        for (int32_t idx = 0; idx < k; ++idx) {
             selected_indices_lt.SetValue(idx, 0U);
         }
+        // If only one page is selected, last_anchor should win
+        selected_indices_lt.SetValue(num_selected_pages - 1, last_anchor);
         return;
     }
 
-    uint32_t last_anchor = static_cast<uint32_t>(num_valid_pages - 1);
+    // Case 3: > 2 blocks selected
     bool has_first_anchor = false;
     bool has_last_anchor = false;
     for (int32_t idx = 0; idx < num_selected_pages; ++idx) {
@@ -198,8 +202,17 @@ public:
             int32_t valid_page_count = DIV_ROUNDUP(seq_len, block_size_);
             int32_t num_tokens_per_meta_block = block_size_ * block_size_;
             int32_t num_meta_blocks_in_request = DIV_ROUNDUP(seq_len, num_tokens_per_meta_block);
-            if (unlikely(TryFillAnchorOnlySelection(tensors.selected_indices, valid_page_count))) {
-                // Catch sequences that are too short for sparsity
+            bool use_fixed_anchors = tokens_since_metadata_update_ >= 0;
+            if (unlikely(use_fixed_anchors &&
+                         valid_page_count > 0 &&
+                         valid_page_count <= 2 &&
+                         k_ >= valid_page_count)) {
+                // Catch case where number of selected blocks <= 2
+                quest_apply_anchor_selection(
+                    tensors.selected_indices,
+                    seq_len,
+                    block_size_,
+                    k_);
             } else {
                 LoadQuery(tensors, query_offset);
                 DuplicateAccumulatedScores(tensors, num_meta_blocks_in_request);
@@ -221,7 +234,7 @@ public:
 
                 SortAndExtract(tensors, num_meta_blocks_in_request);
 
-                if (tokens_since_metadata_update_ >= 0) {
+                if (likely(use_fixed_anchors)) {
                     quest_apply_anchor_selection(
                         tensors.selected_indices,
                         seq_len,
@@ -239,26 +252,6 @@ public:
     }
 
 private:
-    __aicore__ inline bool TryFillAnchorOnlySelection(
-        AscendC::LocalTensor<uint32_t> selected_indices_lt,
-        int32_t valid_page_count) const
-    {
-        if (likely(valid_page_count <= 0 ||
-                   valid_page_count > 2 ||
-                   k_ < valid_page_count)) {
-            return false;
-        }
-
-        for (int32_t idx = 0; idx < k_; ++idx) {
-            selected_indices_lt.SetValue(idx, 0U);
-        }
-        selected_indices_lt.SetValue(0, 0U);
-        if (valid_page_count > 1) {
-            selected_indices_lt.SetValue(1, static_cast<uint32_t>(valid_page_count - 1));
-        }
-        return true;
-    }
-
     __aicore__ inline LocalTensors GetLocalTensors()
     {
         return {
