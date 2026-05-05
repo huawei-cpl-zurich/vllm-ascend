@@ -29,27 +29,21 @@ using namespace AscendC;
 // QuestBlockSelectPagedTilingData is generated from the op_host tiling
 // definition. The kernel must not redeclare it locally.
 
-__aicore__ inline void quest_emit_unique_index(
+__aicore__ inline bool quest_has_selected_index(
     LocalTensor<uint32_t> &selected_indices_lt,
     int32_t selection_limit,
-    int32_t &write_idx,
     uint32_t candidate)
 {
-    if (write_idx >= selection_limit) {
-        return;
-    }
-    for (int32_t idx = 0; idx < write_idx; ++idx) {
+    for (int32_t idx = 0; idx < selection_limit; ++idx) {
         if (selected_indices_lt.GetValue(idx) == candidate) {
-            return;
+            return true;
         }
     }
-    selected_indices_lt.SetValue(write_idx, candidate);
-    ++write_idx;
+    return false;
 }
 
 __aicore__ inline void quest_apply_anchor_selection(
     LocalTensor<uint32_t> &selected_indices_lt,
-    LocalTensor<uint32_t> &scratch_indices_lt,
     int32_t seq_len,
     int32_t block_size,
     int32_t k)
@@ -64,11 +58,7 @@ __aicore__ inline void quest_apply_anchor_selection(
         return;
     }
 
-    for (int32_t idx = 0; idx < selection_limit; ++idx) {
-        scratch_indices_lt.SetValue(idx, selected_indices_lt.GetValue(idx));
-    }
-
-    if (selection_limit == 1) {
+    if (unlikely(selection_limit == 1)) {
         selected_indices_lt.SetValue(0, static_cast<uint32_t>(valid_page_count - 1));
         for (int32_t idx = 1; idx < k; ++idx) {
             selected_indices_lt.SetValue(idx, 0U);
@@ -76,25 +66,20 @@ __aicore__ inline void quest_apply_anchor_selection(
         return;
     }
 
-    int32_t write_idx = 0;
-    quest_emit_unique_index(selected_indices_lt, selection_limit, write_idx, 0U);
-    if (valid_page_count >= 2) {
-        quest_emit_unique_index(
-            selected_indices_lt,
-            selection_limit,
-            write_idx,
-            static_cast<uint32_t>(valid_page_count - 1));
+    uint32_t last_anchor = static_cast<uint32_t>(valid_page_count - 1);
+    bool has_first_anchor = quest_has_selected_index(selected_indices_lt, selection_limit, 0U);
+    bool has_last_anchor = quest_has_selected_index(selected_indices_lt, selection_limit, last_anchor);
+    int32_t replacement_slot = selection_limit - 1;
+
+    if (!has_last_anchor) {
+        selected_indices_lt.SetValue(replacement_slot, last_anchor);
+        --replacement_slot;
+    }
+    if (!has_first_anchor) {
+        selected_indices_lt.SetValue(replacement_slot, 0U);
     }
 
-    for (int32_t idx = 0; idx < selection_limit && write_idx < selection_limit; ++idx) {
-        uint32_t candidate = scratch_indices_lt.GetValue(idx);
-        if (candidate >= static_cast<uint32_t>(valid_page_count)) {
-            continue;
-        }
-        quest_emit_unique_index(selected_indices_lt, selection_limit, write_idx, candidate);
-    }
-
-    for (int32_t idx = write_idx; idx < k; ++idx) {
+    for (int32_t idx = selection_limit; idx < k; ++idx) {
         selected_indices_lt.SetValue(idx, 0U);
     }
 }
@@ -246,7 +231,6 @@ public:
                 if (tokens_since_metadata_update_ >= 0) {
                     quest_apply_anchor_selection(
                         tensors.selected_indices,
-                        tensors.index_local,
                         seq_len,
                         block_size_,
                         k_);
@@ -266,8 +250,7 @@ private:
         AscendC::LocalTensor<uint32_t> selected_indices_lt,
         int32_t valid_page_count) const
     {
-        if (likely(tokens_since_metadata_update_ < 0 ||
-                   valid_page_count <= 0 ||
+        if (likely(valid_page_count <= 0 ||
                    valid_page_count > 2 ||
                    k_ < valid_page_count)) {
             return false;
@@ -277,7 +260,7 @@ private:
             selected_indices_lt.SetValue(idx, 0U);
         }
         selected_indices_lt.SetValue(0, 0U);
-        if (unlikely(valid_page_count > 1)) {
+        if (valid_page_count > 1) {
             selected_indices_lt.SetValue(1, static_cast<uint32_t>(valid_page_count - 1));
         }
         return true;
