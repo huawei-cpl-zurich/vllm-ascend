@@ -538,7 +538,12 @@ extern "C" __global__ __aicore__ void quest_block_select_paged(
     (void)workspace;
     QUEST_BLOCK_SELECT_PAGED_COPY_TILING_DATA(QuestBlockSelectPagedTilingData, tiling);
 
-    if (TILING_KEY_IS(QUEST_BLOCK_SELECT_PAGED_TILING_FP16)) {
+    if (!TILING_KEY_IS(QUEST_BLOCK_SELECT_PAGED_TILING)) {
+        ASSERT(false && "Unsupported quest_block_select_paged tiling key.");
+        return;
+    }
+
+    if (tiling_data->dataType == QUEST_BLOCK_SELECT_PAGED_DTYPE_FP16) {
         RunQuestBlockSelectPaged<half>(
             query,
             maxblocks,
@@ -550,7 +555,7 @@ extern "C" __global__ __aicore__ void quest_block_select_paged(
         return;
     }
 
-    if (TILING_KEY_IS(QUEST_BLOCK_SELECT_PAGED_TILING_BF16)) {
+    if (tiling_data->dataType == QUEST_BLOCK_SELECT_PAGED_DTYPE_BF16) {
         RunQuestBlockSelectPaged<bfloat16_t>(
             query,
             maxblocks,
@@ -562,5 +567,5 @@ extern "C" __global__ __aicore__ void quest_block_select_paged(
         return;
     }
 
-    ASSERT(false && "Unsupported quest_block_select_paged tiling key.");
+    ASSERT(false && "Unsupported quest_block_select_paged dtype.");
 }
