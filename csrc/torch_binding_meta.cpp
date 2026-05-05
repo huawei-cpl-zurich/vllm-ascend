@@ -377,11 +377,13 @@ at::Tensor npu_quest_block_select_paged_meta(
     const at::Tensor &minblocks,
     const at::Tensor &metadata_block_tables,
     const at::Tensor &seq_lens,
-    int64_t k)
+    int64_t k,
+    int64_t tokens_since_metadata_update)
 {
     (void)minblocks;
     (void)metadata_block_tables;
     (void)seq_lens;
+    (void)tokens_since_metadata_update;
     TORCH_CHECK(k > 0, "k must be positive.");
     return at::empty(
         {query.size(0), query.size(1), k},
@@ -394,13 +396,15 @@ at::Tensor &npu_quest_block_select_paged_out_meta(
     const at::Tensor &minblocks,
     const at::Tensor &metadata_block_tables,
     const at::Tensor &seq_lens,
-    at::Tensor &out)
+    at::Tensor &out,
+    int64_t tokens_since_metadata_update)
 {
     (void)query;
     (void)maxblocks;
     (void)minblocks;
     (void)metadata_block_tables;
     (void)seq_lens;
+    (void)tokens_since_metadata_update;
     return out;
 }
 

@@ -22,6 +22,7 @@ constexpr uint32_t MAXBLOCKS_INDEX = 1;
 constexpr uint32_t MINBLOCKS_INDEX = 2;
 constexpr uint32_t METADATA_BLOCK_TABLES_INDEX = 3;
 constexpr uint32_t SEQ_LENS_INDEX = 4;
+constexpr uint32_t ATTR_TOKENS_SINCE_METADATA_UPDATE_INDEX = 0;
 constexpr uint32_t QUERY_DIM_NUM = 3;
 constexpr uint32_t BLOCKS_DIM_NUM = 4;
 constexpr uint32_t TABLE_DIM_NUM = 2;
@@ -84,6 +85,12 @@ static ge::graphStatus QuestBlockSelectPagedTilingFunc(gert::TilingContext *cont
                OPS_LOG_E(context->GetNodeName(), "selected_indices must be 3D."),
                return ge::GRAPH_FAILED);
 
+    const auto attrs = context->GetAttrs();
+    OPS_LOG_E_IF_NULL(context, attrs, return ge::GRAPH_FAILED);
+    const int64_t *tokens_since_metadata_update =
+        attrs->GetInt(ATTR_TOKENS_SINCE_METADATA_UPDATE_INDEX);
+    OPS_LOG_E_IF_NULL(context, tokens_since_metadata_update, return ge::GRAPH_FAILED);
+
     QuestBlockSelectPagedTilingData tiling;
     tiling.set_batchSize(static_cast<uint32_t>(query_storage.GetDim(DIM_0)));
     tiling.set_numKvHeads(static_cast<uint32_t>(maxblocks_storage.GetDim(DIM_2)));
@@ -93,22 +100,17 @@ static ge::graphStatus QuestBlockSelectPagedTilingFunc(gert::TilingContext *cont
     tiling.set_maxMetadataBlocksPerRequest(
         static_cast<uint32_t>(metadata_block_tables_storage.GetDim(DIM_1)));
     tiling.set_k(static_cast<uint32_t>(selected_indices_storage.GetDim(DIM_2)));
+    tiling.set_tokensSinceMetadataUpdate(
+        static_cast<int32_t>(*tokens_since_metadata_update));
 
     const uint32_t batch_heads = tiling.get_batchSize() * tiling.get_numHeads();
     context->SetBlockDim(batch_heads == 0 ? 1 : std::min(batch_heads, aiv_num));
 
     const auto query_desc = context->GetInputDesc(QUERY_INDEX);
     OPS_LOG_E_IF_NULL(context, query_desc, return ge::GRAPH_FAILED);
-    const auto query_dtype = query_desc->GetDataType();
-    OPS_ERR_IF(query_dtype != ge::DT_FLOAT16 && query_dtype != ge::DT_BF16,
-               OPS_LOG_E(context->GetNodeName(),
-                         "query dtype must be float16 or bfloat16, but got %d.",
-                         static_cast<int32_t>(query_dtype)),
-               return ge::GRAPH_FAILED);
-    tiling.set_storageDtype(
-        query_dtype == ge::DT_BF16 ? QUEST_BLOCK_SELECT_PAGED_STORAGE_BF16
-                                   : QUEST_BLOCK_SELECT_PAGED_STORAGE_FP16);
-    context->SetTilingKey(QUEST_BLOCK_SELECT_PAGED_TILING_COMMON);
+    context->SetTilingKey(
+        query_desc->GetDataType() == ge::DT_BF16 ? QUEST_BLOCK_SELECT_PAGED_TILING_BF16
+                                                 : QUEST_BLOCK_SELECT_PAGED_TILING_FP16);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
