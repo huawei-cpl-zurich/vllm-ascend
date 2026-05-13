@@ -43,6 +43,7 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.vpp_trace import get_trace_writer, trace_instant, trace_span
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -73,6 +74,16 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+
+
+def _tensor_dict_nbytes(tensor_dict: dict[str, torch.Tensor] | None) -> int:
+    if tensor_dict is None:
+        return 0
+    total = 0
+    for tensor in tensor_dict.values():
+        if hasattr(tensor, "numel") and hasattr(tensor, "element_size"):
+            total += int(tensor.numel()) * int(tensor.element_size())
+    return total
 
 
 class NPUWorker(WorkerBase):
@@ -116,6 +127,7 @@ class NPUWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        get_trace_writer(vllm_config)
 
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
@@ -395,13 +407,24 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        trace_common: dict[str, object] = {}
+        if get_trace_writer() is not None:
+            trace_common = {
+                "trace_batch_id": getattr(scheduler_output, "trace_batch_id", -1),
+                "rank": self.rank,
+                "local_rank": self.local_rank,
+                "pp_rank": get_pp_group().rank_in_group,
+                "tp_rank": get_tp_group().rank_in_group,
+                "total_tokens": scheduler_output.total_num_scheduled_tokens,
+            }
         # enable msMonitor to monitor the performance of vllm-ascend
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
 
         if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
+            with trace_span("pp_prev_send_wait", "pp", **trace_common):
+                for handle in self._pp_send_work:
+                    handle.wait()
             self._pp_send_work = []
 
         intermediate_tensors = None
@@ -413,18 +436,31 @@ class NPUWorker(WorkerBase):
                 all_gather_group = None
             else:
                 all_gather_group = get_tp_group()
-            tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
+            with trace_span("pp_irecv_post", "pp", **trace_common):
+                tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
+                    all_gather_group=all_gather_group
+                )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
+                trace_metadata=(
+                    {**trace_common, "tensor_bytes": _tensor_dict_nbytes(tensor_dict)}
+                    if trace_common
+                    else None
+                ),
             )
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        with trace_span("model_runner_execute", "worker", **trace_common):
+            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+            trace_instant(
+                "worker_execute_output",
+                "worker",
+                **trace_common,
+                output_type=type(output).__name__ if output is not None else "None",
+            )
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -436,26 +472,63 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=all_gather_group,
-        )
+        tensor_bytes = _tensor_dict_nbytes(output.tensors) if trace_common else 0
+        with trace_span(
+            "pp_isend_post",
+            "pp",
+            **trace_common,
+            tensor_bytes=tensor_bytes,
+        ):
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=all_gather_group,
+            )
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
+            trace_instant(
+                "worker_execute_output",
+                "worker",
+                **trace_common,
+                output_type="IntermediateTensors",
+                tensor_bytes=tensor_bytes,
+            )
             return None
 
         # In case of PP with kv transfer, we need to pass through the
         # kv_connector_output
         if not kv_connector_output.finished_sending and not kv_connector_output.finished_recving:
+            trace_instant(
+                "worker_execute_output",
+                "worker",
+                **trace_common,
+                output_type="EMPTY_MODEL_RUNNER_OUTPUT",
+                tensor_bytes=tensor_bytes,
+            )
             return EMPTY_MODEL_RUNNER_OUTPUT
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
+        trace_instant(
+            "worker_execute_output",
+            "worker",
+            **trace_common,
+            output_type="EMPTY_MODEL_RUNNER_OUTPUT_WITH_KV",
+            tensor_bytes=tensor_bytes,
+        )
         return output
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        trace_common: dict[str, object] = {}
+        if get_trace_writer() is not None:
+            trace_common = {
+                "rank": self.rank,
+                "local_rank": self.local_rank,
+                "pp_rank": get_pp_group().rank_in_group,
+                "tp_rank": get_tp_group().rank_in_group,
+            }
+        with trace_span("worker_sample_tokens", "worker", **trace_common):
+            return self.model_runner.sample_tokens(grammar_output)
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
