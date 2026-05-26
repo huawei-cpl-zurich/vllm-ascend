@@ -100,12 +100,12 @@ from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention import quest_decode
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionState,
 )
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.attention.quest_decode import QuestDecodeMetadataManager
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
 # yapf conflicts with isort for this block
@@ -411,15 +411,6 @@ class NPUModelRunner(GPUModelRunner):
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
 
         self.use_aclgraph = self._use_aclgraph()
-        self.quest_decode_metadata = QuestDecodeMetadataManager(
-            vllm_config=self.vllm_config,
-            ascend_config=self.ascend_config,
-            model_config=self.model_config,
-            max_encoder_len=self.max_encoder_len,
-            max_num_reqs=self.max_num_reqs,
-            device=self.device,
-            use_sparse=self.use_sparse,
-        )
 
         eplb_config = self.ascend_config.eplb_config
         self.dynamic_eplb = eplb_config.dynamic_eplb
@@ -467,7 +458,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config.speculative_config.num_speculative_tokens if self.vllm_config.speculative_config else 0
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-            quest_max_num_metadata_blocks_per_req=self.quest_decode_metadata.max_num_metadata_blocks_per_req,
         )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
@@ -1916,10 +1906,7 @@ class NPUModelRunner(GPUModelRunner):
                         for aux_hidden_states_pcp in aux_hidden_states
                     ]
 
-            self.quest_decode_metadata.commit_batch_metadata(
-                self.input_batch,
-                self.input_batch.num_reqs,
-            )
+            quest_decode.commit_batch_metadata(self.input_batch, self.input_batch.num_reqs)
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -2693,14 +2680,6 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
-        quest_metadata = self.quest_decode_metadata.prepare_common_metadata(
-            input_batch=self.input_batch,
-            num_reqs=num_reqs,
-            seq_lens_cpu=self.optimistic_seq_lens_cpu[:num_reqs],
-            attn_state=self.attn_state,
-            max_query_len=max_query_len,
-        )
-
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2729,9 +2708,8 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
-            quest_metadata_block_tables=quest_metadata.metadata_block_tables,
-            quest_refresh_seq_lens=quest_metadata.refresh_seq_lens,
-            quest_ready=quest_metadata.ready,
+            quest_batch_metadata=self.input_batch.quest_metadata,
+            quest_req_ids=self.input_batch.req_ids[:num_reqs],
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -2783,10 +2761,7 @@ class NPUModelRunner(GPUModelRunner):
                 attn_metadata_dict = attn_metadata[ubid]
 
             for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = self.quest_decode_metadata.with_layer_tensors(
-                    attn_metadata_i,
-                    layer_name,
-                )
+                attn_metadata_dict[layer_name] = attn_metadata_i
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -3268,9 +3243,17 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-        self.quest_decode_metadata.initialize_layer_tensors(
-            kv_caches,
-            self.shared_kv_cache_layers,
+        quest_decode.initialize_metadata(
+            vllm_config=self.vllm_config,
+            ascend_config=self.ascend_config,
+            model_config=self.model_config,
+            max_encoder_len=self.max_encoder_len,
+            max_num_reqs=self.max_num_reqs,
+            device=self.device,
+            use_sparse=self.use_sparse,
+            input_batch=self.input_batch,
+            kv_caches=kv_caches,
+            shared_kv_cache_layers=self.shared_kv_cache_layers,
         )
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
@@ -3852,7 +3835,6 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 kernel_block_sizes=self.kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
-                quest_max_num_metadata_blocks_per_req=self.quest_decode_metadata.max_num_metadata_blocks_per_req,
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:

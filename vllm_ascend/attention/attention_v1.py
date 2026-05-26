@@ -50,6 +50,7 @@ from vllm_ascend.attention.kvcomp_attn.attention_utils import (
 from vllm_ascend.attention.quest_decode import (
     QUEST_HEAD_SIZE,
     QUEST_INDEX_ALIGNMENT,
+    attach_layer_tensors,
     get_quest_decode_config,
 )
 from vllm_ascend.attention.utils import (
@@ -431,6 +432,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and self.sliding_window is None
             and sinks is None
         )
+        self.quest_layer_tensors = None
         self.is_kv_producer = (
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
@@ -1443,6 +1445,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)
+        attn_metadata = attach_layer_tensors(attn_metadata, self)
 
         # Initialize key_cache and value_cache from kv_cache if not already set.
         # This is needed for DecodeOnly mode where key/value are None but we still
@@ -1505,6 +1508,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)
+        attn_metadata = attach_layer_tensors(attn_metadata, self)
 
         self._prepare_c8_scales(layer, query.device)
         float_key, float_value = None, None

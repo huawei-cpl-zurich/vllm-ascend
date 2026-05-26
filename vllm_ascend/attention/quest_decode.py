@@ -51,6 +51,12 @@ class QuestPreparedMetadata:
     ready: bool = False
 
 
+@dataclass(frozen=True)
+class QuestLayerTensors:
+    maxblocks: torch.Tensor
+    minblocks: torch.Tensor
+
+
 class QuestBatchMetadataState:
     """Batch/request-row QUEST metadata state owned by NPUInputBatch."""
 
@@ -128,172 +134,203 @@ class QuestBatchMetadataState:
             self.valid_tokens[row_idx] = refreshed_seq_len
 
 
-class QuestDecodeMetadataManager:
-    """Model-level QUEST metadata policy and per-layer state."""
+def _clear_layer_tensors(attn_layers: Mapping[str, AttentionLayerBase]) -> None:
+    for attn_layer in attn_layers.values():
+        impl = getattr(attn_layer, "impl", None)
+        if hasattr(impl, "quest_layer_tensors"):
+            impl.quest_layer_tensors = None
 
-    def __init__(
-        self,
-        *,
-        vllm_config: VllmConfig,
-        ascend_config: AscendConfig,
-        model_config: Any,
-        max_encoder_len: int | None,
-        max_num_reqs: int,
-        device: torch.device,
-        use_sparse: bool,
-    ) -> None:
-        self.vllm_config = vllm_config
-        self.ascend_config = ascend_config
-        self.model_config = model_config
-        self.max_encoder_len = max_encoder_len
-        self.max_num_reqs = max_num_reqs
-        self.device = device
-        self.use_sparse = use_sparse
 
-        self.enabled = ascend_config.quest_decode_config.enable
-        self.topk_pages = ascend_config.quest_decode_config.topk_pages
-        self.model_supported = self.enabled
-        self.max_num_metadata_blocks_per_req = 0
-        self.layer_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-        self._configure()
+def _clear_metadata(input_batch: Any, attn_layers: Mapping[str, AttentionLayerBase]) -> None:
+    clear_quest_metadata = getattr(input_batch, "clear_quest_metadata", None)
+    if clear_quest_metadata is not None:
+        clear_quest_metadata()
+    _clear_layer_tensors(attn_layers)
 
-    def _disable(self, reason: str) -> None:
-        if self.enabled:
-            logger.warning_once(f"QUEST decode is disabled: {reason}")
-        self.model_supported = False
-        self.max_num_metadata_blocks_per_req = 0
-        self.layer_tensors.clear()
 
-    def _configure(self) -> None:
-        if not self.enabled:
-            self.model_supported = False
-            return
+def _disable(
+    reason: str,
+    input_batch: Any,
+    attn_layers: Mapping[str, AttentionLayerBase],
+) -> None:
+    logger.warning_once(f"QUEST decode is disabled: {reason}")
+    _clear_metadata(input_batch, attn_layers)
 
-        if get_ascend_device_type() not in {AscendDeviceType.A2, AscendDeviceType.A3}:
-            self._disable(
-                "current hardware is unsupported, QUEST decode currently supports only "
-                "Ascend A2/A3 (ascend910b/ascend910_93)."
+
+def _get_max_num_metadata_blocks_per_req(model_config: Any, max_encoder_len: int | None) -> int:
+    quest_max_model_len = max(model_config.max_model_len, max_encoder_len or 0)
+    return cdiv(cdiv(quest_max_model_len, QUEST_PAGE_SIZE), QUEST_PAGE_SIZE)
+
+
+def initialize_metadata(
+    *,
+    vllm_config: VllmConfig,
+    ascend_config: AscendConfig,
+    model_config: Any,
+    max_encoder_len: int | None,
+    max_num_reqs: int,
+    device: torch.device,
+    use_sparse: bool,
+    input_batch: Any,
+    kv_caches: dict[str, Any],
+    shared_kv_cache_layers: dict[str, str],
+) -> None:
+    """Validate and allocate all QUEST metadata for a loaded model."""
+    attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+    _clear_metadata(input_batch, attn_layers)
+
+    if not ascend_config.quest_decode_config.enable:
+        return
+
+    if get_ascend_device_type() not in {AscendDeviceType.A2, AscendDeviceType.A3}:
+        _disable(
+            "current hardware is unsupported, QUEST decode currently supports only "
+            "Ascend A2/A3 (ascend910b/ascend910_93).",
+            input_batch,
+            attn_layers,
+        )
+        return
+
+    if vllm_config.kv_transfer_config is not None:
+        _disable(
+            "kv_transfer_config is set, but QUEST decode requires a local KV cache.",
+            input_batch,
+            attn_layers,
+        )
+        return
+    if enable_cp():
+        _disable(
+            "context parallel is enabled, but QUEST decode requires unsharded request metadata.",
+            input_batch,
+            attn_layers,
+        )
+        return
+    if ascend_config.xlite_graph_config.enabled:
+        _disable(
+            "xLite graph execution is enabled, but QUEST decode only supports the standard v1 decode path.",
+            input_batch,
+            attn_layers,
+        )
+        return
+    if model_config.use_mla:
+        _disable(
+            "MLA attention is enabled, but QUEST decode only supports standard v1 attention.",
+            input_batch,
+            attn_layers,
+        )
+        return
+    if use_sparse:
+        _disable(
+            "sparse attention is enabled, but QUEST decode only supports standard v1 attention.",
+            input_batch,
+            attn_layers,
+        )
+        return
+
+    max_num_metadata_blocks_per_req = _get_max_num_metadata_blocks_per_req(model_config, max_encoder_len)
+    if max_num_metadata_blocks_per_req > QUEST_MAX_METADATA_BLOCKS_PER_REQ:
+        _disable(
+            "the configured max_model_len requires more metadata blocks per request "
+            f"({max_num_metadata_blocks_per_req}) than the kernel limit "
+            f"({QUEST_MAX_METADATA_BLOCKS_PER_REQ}).",
+            input_batch,
+            attn_layers,
+        )
+        return
+
+    base_layer_k_caches: dict[str, torch.Tensor] = {}
+    for layer_name, attn_layer in attn_layers.items():
+        if layer_name in shared_kv_cache_layers:
+            continue
+        if layer_name not in kv_caches:
+            _disable(
+                f"attention layer {layer_name} does not have a local KV cache.",
+                input_batch,
+                attn_layers,
             )
             return
 
-        if self.vllm_config.kv_transfer_config is not None:
-            self._disable("kv_transfer_config is set, but QUEST decode requires a local KV cache.")
+        impl = getattr(attn_layer, "impl", None)
+        if not getattr(impl, "quest_layer_supported", False):
+            _disable(f"attention layer {layer_name} is not QUEST-compatible.", input_batch, attn_layers)
             return
-        if enable_cp():
-            self._disable("context parallel is enabled, but QUEST decode requires unsharded request metadata.")
-            return
-        if self.ascend_config.xlite_graph_config.enabled:
-            self._disable(
-                "xLite graph execution is enabled, but QUEST decode only supports the standard v1 decode path."
+
+        kv_cache = kv_caches[layer_name]
+        if not isinstance(kv_cache, tuple) or len(kv_cache) < 2:
+            _disable(
+                f"attention layer {layer_name} does not expose a standard KV cache tuple.",
+                input_batch,
+                attn_layers,
             )
             return
-        if self.model_config.use_mla:
-            self._disable("MLA attention is enabled, but QUEST decode only supports standard v1 attention.")
-            return
-        if self.use_sparse:
-            self._disable("sparse attention is enabled, but QUEST decode only supports standard v1 attention.")
-            return
 
-        quest_max_model_len = max(self.model_config.max_model_len, self.max_encoder_len or 0)
-        self.max_num_metadata_blocks_per_req = cdiv(cdiv(quest_max_model_len, QUEST_PAGE_SIZE), QUEST_PAGE_SIZE)
-        if self.max_num_metadata_blocks_per_req > QUEST_MAX_METADATA_BLOCKS_PER_REQ:
-            self._disable(
-                "the configured max_model_len requires more metadata blocks per request "
-                f"({self.max_num_metadata_blocks_per_req}) than the kernel limit "
-                f"({QUEST_MAX_METADATA_BLOCKS_PER_REQ})."
+        k_cache = kv_cache[0]
+        if not isinstance(k_cache, torch.Tensor) or k_cache.ndim != 4:
+            _disable(f"attention layer {layer_name} has an unsupported key-cache layout.", input_batch, attn_layers)
+            return
+        if k_cache.shape[1] != QUEST_PAGE_SIZE or k_cache.shape[-1] != QUEST_HEAD_SIZE:
+            _disable(
+                f"attention layer {layer_name} has block_size={k_cache.shape[1]} and "
+                f"head_size={k_cache.shape[-1]}, but QUEST requires block_size={QUEST_PAGE_SIZE} "
+                f"and head_size={QUEST_HEAD_SIZE}.",
+                input_batch,
+                attn_layers,
             )
-
-    def initialize_layer_tensors(
-        self,
-        kv_caches: dict[str, Any],
-        shared_kv_cache_layers: dict[str, str],
-    ) -> None:
-        self.layer_tensors.clear()
-        if not self.model_supported or self.max_num_metadata_blocks_per_req == 0:
             return
 
-        attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
-        num_metadata_blocks = self.max_num_reqs * self.max_num_metadata_blocks_per_req
-        for layer_name, attn_layer in attn_layers.items():
-            if layer_name in shared_kv_cache_layers:
-                continue
-            if layer_name not in kv_caches:
-                self._disable(f"attention layer {layer_name} does not have a local KV cache.")
-                return
+        base_layer_k_caches[layer_name] = k_cache
 
-            impl = getattr(attn_layer, "impl", None)
-            if not getattr(impl, "quest_layer_supported", False):
-                self._disable(f"attention layer {layer_name} is not QUEST-compatible.")
-                return
-
-            kv_cache = kv_caches[layer_name]
-            if not isinstance(kv_cache, tuple) or len(kv_cache) < 2:
-                self._disable(f"attention layer {layer_name} does not expose a standard KV cache tuple.")
-                return
-
-            k_cache = kv_cache[0]
-            if not isinstance(k_cache, torch.Tensor) or k_cache.ndim != 4:
-                self._disable(f"attention layer {layer_name} has an unsupported key-cache layout.")
-                return
-            if k_cache.shape[1] != QUEST_PAGE_SIZE or k_cache.shape[-1] != QUEST_HEAD_SIZE:
-                self._disable(
-                    f"attention layer {layer_name} has block_size={k_cache.shape[1]} and "
-                    f"head_size={k_cache.shape[-1]}, but QUEST requires block_size={QUEST_PAGE_SIZE} "
-                    f"and head_size={QUEST_HEAD_SIZE}."
-                )
-                return
-
-            metadata_shape = (num_metadata_blocks, QUEST_PAGE_SIZE, k_cache.shape[2], QUEST_HEAD_SIZE)
-            maxblocks = torch.zeros(metadata_shape, dtype=k_cache.dtype, device=self.device)
-            minblocks = torch.zeros_like(maxblocks)
-            self.layer_tensors[layer_name] = (maxblocks, minblocks)
-
-        for layer_name, target_layer_name in shared_kv_cache_layers.items():
-            if layer_name not in attn_layers:
-                continue
-            if target_layer_name in self.layer_tensors:
-                self.layer_tensors[layer_name] = self.layer_tensors[target_layer_name]
-            else:
-                self._disable(
-                    f"attention layer {layer_name} shares KV cache with {target_layer_name}, "
-                    "but the target layer is not QUEST-compatible."
-                )
-                return
-
-        if not self.layer_tensors:
-            self._disable("no compatible v1 attention layers were found with block_size 128 and head_size 128.")
-
-    def prepare_common_metadata(
-        self,
-        *,
-        input_batch: Any,
-        num_reqs: int,
-        seq_lens_cpu: torch.Tensor,
-        attn_state: Any,
-        max_query_len: int,
-    ) -> QuestPreparedMetadata:
-        quest_batch_metadata = getattr(input_batch, "quest_metadata", None)
-        if (
-            not self.model_supported
-            or getattr(attn_state, "name", None) != "DecodeOnly"
-            or max_query_len != 1
-            or quest_batch_metadata is None
-        ):
-            return QuestPreparedMetadata()
-        return quest_batch_metadata.prepare(num_reqs, input_batch.req_ids, seq_lens_cpu)
-
-    def with_layer_tensors(self, attn_metadata: Any, layer_name: str) -> Any:
-        layer_tensors = self.layer_tensors.get(layer_name)
-        if layer_tensors is None:
-            return attn_metadata
-
-        attn_metadata_layer = copy(attn_metadata)
-        attn_metadata_layer.quest_maxblocks = layer_tensors[0]
-        attn_metadata_layer.quest_minblocks = layer_tensors[1]
-        return attn_metadata_layer
-
-    def commit_batch_metadata(self, input_batch: Any, num_reqs: int) -> None:
-        quest_batch_metadata = getattr(input_batch, "quest_metadata", None)
-        if not self.model_supported or quest_batch_metadata is None:
+    for layer_name, target_layer_name in shared_kv_cache_layers.items():
+        if layer_name not in attn_layers:
+            continue
+        if target_layer_name not in base_layer_k_caches:
+            _disable(
+                f"attention layer {layer_name} shares KV cache with {target_layer_name}, "
+                "but the target layer is not QUEST-compatible.",
+                input_batch,
+                attn_layers,
+            )
             return
-        quest_batch_metadata.commit(num_reqs, input_batch.req_ids)
+
+    if not base_layer_k_caches:
+        _disable(
+            "no compatible v1 attention layers were found with block_size 128 and head_size 128.",
+            input_batch,
+            attn_layers,
+        )
+        return
+
+    input_batch.init_quest_metadata(max_num_metadata_blocks_per_req)
+    num_metadata_blocks = max_num_reqs * max_num_metadata_blocks_per_req
+    layer_tensors: dict[str, QuestLayerTensors] = {}
+    for layer_name, k_cache in base_layer_k_caches.items():
+        metadata_shape = (num_metadata_blocks, QUEST_PAGE_SIZE, k_cache.shape[2], QUEST_HEAD_SIZE)
+        maxblocks = torch.zeros(metadata_shape, dtype=k_cache.dtype, device=device)
+        layer_tensors[layer_name] = QuestLayerTensors(
+            maxblocks=maxblocks,
+            minblocks=torch.zeros_like(maxblocks),
+        )
+        attn_layers[layer_name].impl.quest_layer_tensors = layer_tensors[layer_name]
+
+    for layer_name, target_layer_name in shared_kv_cache_layers.items():
+        if layer_name not in attn_layers:
+            continue
+        attn_layers[layer_name].impl.quest_layer_tensors = layer_tensors[target_layer_name]
+
+
+def attach_layer_tensors(attn_metadata: Any, impl: Any) -> Any:
+    layer_tensors = getattr(impl, "quest_layer_tensors", None)
+    if layer_tensors is None:
+        return attn_metadata
+
+    attn_metadata_layer = copy(attn_metadata)
+    attn_metadata_layer.quest_maxblocks = layer_tensors.maxblocks
+    attn_metadata_layer.quest_minblocks = layer_tensors.minblocks
+    return attn_metadata_layer
+
+
+def commit_batch_metadata(input_batch: Any, num_reqs: int) -> None:
+    quest_batch_metadata = getattr(input_batch, "quest_metadata", None)
+    if quest_batch_metadata is None:
+        return
+    quest_batch_metadata.commit(num_reqs, input_batch.req_ids)

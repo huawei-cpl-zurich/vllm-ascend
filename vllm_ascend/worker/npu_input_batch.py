@@ -42,7 +42,6 @@ class NPUInputBatch(InputBatch):
         block_sizes: list[int],  # The block_size of each kv cache group
         kernel_block_sizes: list[list[int]],
         max_num_blocks_per_req: list[int] | None = None,
-        quest_max_num_metadata_blocks_per_req: int = 0,
         logitsprocs: LogitsProcessors | None = None,
         logitsprocs_need_output_token_ids: bool = False,
         is_spec_decode: bool = False,
@@ -124,13 +123,6 @@ class NPUInputBatch(InputBatch):
         )
 
         self.quest_metadata: QuestBatchMetadataState | None = None
-        if quest_max_num_metadata_blocks_per_req > 0:
-            self.quest_metadata = QuestBatchMetadataState(
-                max_num_reqs=max_num_reqs,
-                max_num_metadata_blocks_per_req=quest_max_num_metadata_blocks_per_req,
-                device=device,
-                pin_memory=pin_memory,
-            )
 
         # Sampling-related.
         self.temperature = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
@@ -245,6 +237,20 @@ class NPUInputBatch(InputBatch):
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+    def init_quest_metadata(self, max_num_metadata_blocks_per_req: int) -> None:
+        if max_num_metadata_blocks_per_req <= 0:
+            self.clear_quest_metadata()
+            return
+        self.quest_metadata = QuestBatchMetadataState(
+            max_num_reqs=self.max_num_reqs,
+            max_num_metadata_blocks_per_req=max_num_metadata_blocks_per_req,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    def clear_quest_metadata(self) -> None:
+        self.quest_metadata = None
 
     @property
     def quest_metadata_block_tables(self) -> torch.Tensor | None:
