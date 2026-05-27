@@ -226,6 +226,7 @@ class AscendMetadata:
     # Optional QUEST sparse-decode metadata carried alongside the standard
     # attention metadata.
     quest_metadata_block_tables: torch.Tensor | None = None
+    quest_refresh_start_seq_lens: torch.Tensor | None = None
     quest_refresh_seq_lens: torch.Tensor | None = None
     quest_ready: bool = False
     quest_seq_lens: torch.Tensor | None = None
@@ -354,6 +355,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             model_runner_type=self.model_config.runner_type,
             kvcomp_metadata=common_attn_metadata.kvcomp_metadata,
             quest_metadata_block_tables=quest_metadata_block_tables,
+            quest_refresh_start_seq_lens=(
+                common_attn_metadata.quest_refresh_start_seq_lens[:quest_batch_size]
+                if common_attn_metadata.quest_refresh_start_seq_lens is not None and quest_batch_size > 0
+                else None
+            ),
             quest_refresh_seq_lens=(
                 common_attn_metadata.quest_refresh_seq_lens[:quest_batch_size]
                 if common_attn_metadata.quest_refresh_seq_lens is not None and quest_batch_size > 0
@@ -451,6 +457,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and self.key_cache is not None
             and attn_metadata.block_tables is not None
             and attn_metadata.quest_metadata_block_tables is not None
+            and attn_metadata.quest_refresh_start_seq_lens is not None
             and attn_metadata.quest_refresh_seq_lens is not None
             and attn_metadata.quest_seq_lens is not None
             and attn_metadata.quest_maxblocks is not None
@@ -1376,7 +1383,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 quest_prefill_metadata(
                     k_cache=self.key_cache,
                     block_tables=attn_metadata.block_tables[:batch_size],
-                    seq_lens=attn_metadata.quest_refresh_seq_lens,
+                    refresh_start_seq_lens=attn_metadata.quest_refresh_start_seq_lens,
+                    refresh_seq_lens=attn_metadata.quest_refresh_seq_lens,
                     metadata_block_tables=attn_metadata.quest_metadata_block_tables,
                     maxblocks=attn_metadata.quest_maxblocks,
                     minblocks=attn_metadata.quest_minblocks,

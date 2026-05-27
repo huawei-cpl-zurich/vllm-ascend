@@ -22,7 +22,8 @@ from vllm_ascend.utils import enable_custom_op
 def quest_prefill_metadata(
     k_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
+    refresh_start_seq_lens: torch.Tensor,
+    refresh_seq_lens: torch.Tensor,
     metadata_block_tables: torch.Tensor,
     maxblocks: torch.Tensor,
     minblocks: torch.Tensor,
@@ -31,7 +32,8 @@ def quest_prefill_metadata(
     torch.ops._C_ascend.npu_quest_prefill_metadata(
         k_cache,
         block_tables,
-        seq_lens,
+        refresh_start_seq_lens,
+        refresh_seq_lens,
         metadata_block_tables,
         maxblocks,
         minblocks,

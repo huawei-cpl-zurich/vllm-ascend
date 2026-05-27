@@ -190,8 +190,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # decode path.
     quest_metadata_block_tables: torch.Tensor | None = None
 
-    # Per-row sequence lengths to refresh in the metadata kernel. Rows with
-    # zero length are skipped and retain their existing metadata.
+    # Per-row refresh ranges for the metadata kernel. Rows with empty ranges
+    # are skipped and retain their existing metadata.
+    quest_refresh_start_seq_lens: torch.Tensor | None = None
     quest_refresh_seq_lens: torch.Tensor | None = None
 
     # Model/batch-level gate for the optional QUEST sparse decode path.
@@ -225,6 +226,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             seq_lens_cpu,
         )
         self.quest_metadata_block_tables = prepared_metadata.metadata_block_tables
+        self.quest_refresh_start_seq_lens = prepared_metadata.refresh_start_seq_lens
         self.quest_refresh_seq_lens = prepared_metadata.refresh_seq_lens
         self.quest_ready = prepared_metadata.ready
 
@@ -263,6 +265,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             quest_metadata_block_tables=(
                 self.quest_metadata_block_tables[:num_actual_reqs]
                 if self.quest_metadata_block_tables is not None
+                else None
+            ),
+            quest_refresh_start_seq_lens=(
+                self.quest_refresh_start_seq_lens[:num_actual_reqs]
+                if self.quest_refresh_start_seq_lens is not None
                 else None
             ),
             quest_refresh_seq_lens=(

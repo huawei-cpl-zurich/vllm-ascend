@@ -48,7 +48,8 @@ public:
     __aicore__ void Init(
         GM_ADDR k_cache,
         GM_ADDR block_tables,
-        GM_ADDR seq_lens,
+        GM_ADDR refresh_start_seq_lens,
+        GM_ADDR refresh_seq_lens,
         GM_ADDR metadata_block_tables,
         GM_ADDR maxblocks,
         GM_ADDR minblocks,
@@ -68,7 +69,8 @@ public:
 
         k_cache_gm_.SetGlobalBuffer((__gm__ StorageT *)k_cache);
         block_tables_gm_.SetGlobalBuffer((__gm__ int32_t *)block_tables);
-        seq_lens_gm_.SetGlobalBuffer((__gm__ int32_t *)seq_lens);
+        refresh_start_seq_lens_gm_.SetGlobalBuffer((__gm__ int32_t *)refresh_start_seq_lens);
+        refresh_seq_lens_gm_.SetGlobalBuffer((__gm__ int32_t *)refresh_seq_lens);
         metadata_block_tables_gm_.SetGlobalBuffer((__gm__ int32_t *)metadata_block_tables);
         maxblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)maxblocks);
         minblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)minblocks);
@@ -98,33 +100,48 @@ public:
             int32_t request_idx = batch_head_idx / num_kv_heads_;
             int32_t head_idx = batch_head_idx % num_kv_heads_;
 
-            int32_t seq_len = seq_lens_gm_.GetValue(request_idx);
-            int32_t num_kv_blocks_in_request = ceilDiv(seq_len, block_size_);
-            int32_t num_meta_blocks_in_request = ceilDiv(num_kv_blocks_in_request, block_size_);
+            int32_t start_len = refresh_start_seq_lens_gm_.GetValue(request_idx);
+            int32_t end_len = refresh_seq_lens_gm_.GetValue(request_idx);
+            if (end_len <= start_len) {
+                continue;
+            }
+            ASSERT(start_len >= 0 && "refresh_start_seq_lens must be non-negative.");
 
-            for (int32_t meta_block = 0; meta_block < num_meta_blocks_in_request; meta_block++) {
+            int32_t start_page = start_len / block_size_;
+            int32_t end_page = ceilDiv(end_len, block_size_);
+            int32_t start_meta_block = start_page / block_size_;
+            int32_t end_meta_block = ceilDiv(end_page, block_size_);
+
+            for (int32_t meta_block = start_meta_block; meta_block < end_meta_block; meta_block++) {
+                int32_t meta_block_start_page = meta_block * block_size_;
+                int32_t first_page = start_page - meta_block_start_page;
+                if (first_page < 0) {
+                    first_page = 0;
+                }
+                int32_t last_page = end_page - meta_block_start_page;
+                if (last_page > block_size_) {
+                    last_page = block_size_;
+                }
+                int32_t pages_to_refresh = last_page - first_page;
+                if (pages_to_refresh <= 0) {
+                    continue;
+                }
+
                 LocalTensor<StorageT> max_lt = max_out_q_.AllocTensor<StorageT>();
                 LocalTensor<StorageT> min_lt = min_out_q_.AllocTensor<StorageT>();
 
-                int32_t completed_kv_blocks = meta_block * block_size_;
-                int32_t kv_blocks_this_iter = num_kv_blocks_in_request - completed_kv_blocks;
-                if (kv_blocks_this_iter > block_size_) {
-                    kv_blocks_this_iter = block_size_;
-                }
-                for (int32_t kv_block_offset = 0; kv_block_offset < kv_blocks_this_iter;
-                     ++kv_block_offset) {
-                    int32_t tokens_to_reduce;
-                    if ((kv_block_offset == kv_blocks_this_iter - 1) &&
-                        (meta_block == num_meta_blocks_in_request - 1)) {
-                        int32_t reduced_tokens_so_far =
-                            (meta_block * block_size_ + kv_block_offset) * block_size_;
-                        tokens_to_reduce = seq_len - reduced_tokens_so_far;
-                    } else {
-                        tokens_to_reduce = block_size_;
+                for (int32_t page_offset = first_page; page_offset < last_page; ++page_offset) {
+                    int32_t logical_page = meta_block_start_page + page_offset;
+                    int32_t tokens_to_reduce = block_size_;
+                    if (logical_page == end_page - 1) {
+                        int32_t tail_tokens = end_len - logical_page * block_size_;
+                        if (tail_tokens > 0 && tail_tokens < block_size_) {
+                            tokens_to_reduce = tail_tokens;
+                        }
                     }
 
                     int32_t kv_block_id = block_tables_gm_.GetValue(
-                        request_idx * max_kv_blocks_per_request_ + completed_kv_blocks + kv_block_offset);
+                        request_idx * max_kv_blocks_per_request_ + logical_page);
                     int32_t kv_block_offset_gm =
                         (kv_block_id * block_size_ * num_kv_heads_ * head_dim_) + head_idx * head_dim_;
 
@@ -142,26 +159,29 @@ public:
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
 
                     ReduceBlockToOutput<true>(
-                        max_lt[kv_block_offset * head_dim_],
+                        max_lt[(page_offset - first_page) * head_dim_],
                         k_block_lt,
                         tokens_to_reduce);
                     ReduceBlockToOutput<false>(
-                        min_lt[kv_block_offset * head_dim_],
+                        min_lt[(page_offset - first_page) * head_dim_],
                         k_block_lt,
                         tokens_to_reduce);
                     k_block_in_q_.FreeTensor(k_block_lt);
                 }
 
-                int32_t unused_metadata_rows = block_size_ - kv_blocks_this_iter;
-                if (unused_metadata_rows > 0) {
+                int32_t rows_to_write = pages_to_refresh;
+                int32_t zero_rows = 0;
+                if (first_page == 0 && last_page < block_size_) {
+                    zero_rows = block_size_ - last_page;
                     Duplicate<StorageT>(
-                        max_lt[kv_blocks_this_iter * head_dim_],
+                        max_lt[pages_to_refresh * head_dim_],
                         static_cast<StorageT>(0),
-                        unused_metadata_rows * head_dim_);
+                        zero_rows * head_dim_);
                     Duplicate<StorageT>(
-                        min_lt[kv_blocks_this_iter * head_dim_],
+                        min_lt[pages_to_refresh * head_dim_],
                         static_cast<StorageT>(0),
-                        unused_metadata_rows * head_dim_);
+                        zero_rows * head_dim_);
+                    rows_to_write += zero_rows;
                 }
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
@@ -169,10 +189,11 @@ public:
                 int32_t meta_block_id = metadata_block_tables_gm_.GetValue(
                     request_idx * max_metadata_blocks_per_request_ + meta_block);
                 int32_t meta_offset =
-                    (meta_block_id * block_size_ * num_kv_heads_ * head_dim_) + head_idx * head_dim_;
+                    (meta_block_id * block_size_ * num_kv_heads_ * head_dim_) +
+                    first_page * num_kv_heads_ * head_dim_ + head_idx * head_dim_;
 
                 DataCopyParams ub_gm_cp;
-                ub_gm_cp.blockCount = block_size_;
+                ub_gm_cp.blockCount = rows_to_write;
                 ub_gm_cp.blockLen =
                     ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_UB_BLOCK);
                 ub_gm_cp.srcStride = 0;
@@ -301,7 +322,8 @@ private:
     GlobalTensor<StorageT> maxblocks_gm_;
     GlobalTensor<StorageT> minblocks_gm_;
     GlobalTensor<int32_t> block_tables_gm_;
-    GlobalTensor<int32_t> seq_lens_gm_;
+    GlobalTensor<int32_t> refresh_start_seq_lens_gm_;
+    GlobalTensor<int32_t> refresh_seq_lens_gm_;
     GlobalTensor<int32_t> metadata_block_tables_gm_;
 
     int32_t batch_size_;
@@ -316,7 +338,8 @@ template <typename StorageT, typename ComputeT>
 __aicore__ inline void RunQuestPrefillMetadata(
     GM_ADDR k_cache,
     GM_ADDR block_tables,
-    GM_ADDR seq_lens,
+    GM_ADDR refresh_start_seq_lens,
+    GM_ADDR refresh_seq_lens,
     GM_ADDR metadata_block_tables,
     GM_ADDR maxblocks,
     GM_ADDR minblocks,
@@ -326,7 +349,8 @@ __aicore__ inline void RunQuestPrefillMetadata(
     op.Init(
         k_cache,
         block_tables,
-        seq_lens,
+        refresh_start_seq_lens,
+        refresh_seq_lens,
         metadata_block_tables,
         maxblocks,
         minblocks,
@@ -342,7 +366,8 @@ __aicore__ inline void RunQuestPrefillMetadata(
 extern "C" __global__ __aicore__ void quest_prefill_metadata(
     GM_ADDR k_cache,
     GM_ADDR block_tables,
-    GM_ADDR seq_lens,
+    GM_ADDR refresh_start_seq_lens,
+    GM_ADDR refresh_seq_lens,
     GM_ADDR metadata_block_tables,
     GM_ADDR maxblocks,
     GM_ADDR minblocks,
@@ -361,7 +386,8 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
         RunQuestPrefillMetadata<half, half>(
             k_cache,
             block_tables,
-            seq_lens,
+            refresh_start_seq_lens,
+            refresh_seq_lens,
             metadata_block_tables,
             maxblocks,
             minblocks,
@@ -373,7 +399,8 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
         RunQuestPrefillMetadata<bfloat16_t, float>(
             k_cache,
             block_tables,
-            seq_lens,
+            refresh_start_seq_lens,
+            refresh_seq_lens,
             metadata_block_tables,
             maxblocks,
             minblocks,

@@ -47,6 +47,7 @@ def get_quest_decode_config(vllm_config: VllmConfig) -> QuestDecodeConfig:
 @dataclass
 class QuestPreparedMetadata:
     metadata_block_tables: torch.Tensor | None = None
+    refresh_start_seq_lens: torch.Tensor | None = None
     refresh_seq_lens: torch.Tensor | None = None
     ready: bool = False
 
@@ -81,6 +82,14 @@ class QuestBatchMetadataState:
             pin_memory=False,
         )
         self.valid_tokens = self.valid_tokens_cpu_tensor.numpy()
+        self.refresh_start_seq_lens = torch.zeros((max_num_reqs,), dtype=torch.int32, device=device)
+        self.refresh_start_seq_lens_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
+        self.refresh_start_seq_lens_cpu = self.refresh_start_seq_lens_cpu_tensor.numpy()
         self.refresh_seq_lens = torch.zeros((max_num_reqs,), dtype=torch.int32, device=device)
         self.refresh_seq_lens_cpu_tensor = torch.zeros(
             (max_num_reqs,),
@@ -102,22 +111,29 @@ class QuestBatchMetadataState:
                 ready=True,
             )
 
+        self.refresh_start_seq_lens_cpu[:num_reqs].fill(0)
         self.refresh_seq_lens_cpu[:num_reqs].fill(0)
         for row_idx, req_id in enumerate(req_ids[:num_reqs]):
             seq_len = int(seq_lens_cpu[row_idx])
-            if (
-                self.owner_req_ids[row_idx] != req_id
-                or self.valid_tokens[row_idx] > seq_len
-                or seq_len // QUEST_PAGE_SIZE > self.valid_tokens[row_idx] // QUEST_PAGE_SIZE
-            ):
+            valid_tokens = int(self.valid_tokens[row_idx])
+            new_owner_or_shrunk = self.owner_req_ids[row_idx] != req_id or valid_tokens > seq_len
+            crossed_page_boundary = seq_len // QUEST_PAGE_SIZE > valid_tokens // QUEST_PAGE_SIZE
+            if new_owner_or_shrunk or crossed_page_boundary:
+                if not new_owner_or_shrunk:
+                    self.refresh_start_seq_lens_cpu[row_idx] = (valid_tokens // QUEST_PAGE_SIZE) * QUEST_PAGE_SIZE
                 self.refresh_seq_lens_cpu[row_idx] = seq_len
 
+        self.refresh_start_seq_lens[:num_reqs].copy_(
+            self.refresh_start_seq_lens_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
         self.refresh_seq_lens[:num_reqs].copy_(
             self.refresh_seq_lens_cpu_tensor[:num_reqs],
             non_blocking=True,
         )
         return QuestPreparedMetadata(
             metadata_block_tables=self.metadata_block_tables[:num_reqs],
+            refresh_start_seq_lens=self.refresh_start_seq_lens[:num_reqs],
             refresh_seq_lens=self.refresh_seq_lens[:num_reqs],
             ready=True,
         )
