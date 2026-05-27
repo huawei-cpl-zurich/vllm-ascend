@@ -26,6 +26,7 @@ from vllm.v1.pool.metadata import PoolingStates
 from vllm.v1.sample.logits_processor import BatchUpdateBuilder, LogitsProcessors
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
+from vllm_ascend.attention.quest_decode import QuestBatchMetadataState
 from vllm_ascend.worker.block_table import MultiGroupBlockTable
 
 
@@ -41,7 +42,6 @@ class NPUInputBatch(InputBatch):
         block_sizes: list[int],  # The block_size of each kv cache group
         kernel_block_sizes: list[list[int]],
         max_num_blocks_per_req: list[int] | None = None,
-        quest_max_num_metadata_blocks_per_req: int = 0,
         logitsprocs: LogitsProcessors | None = None,
         logitsprocs_need_output_token_ids: bool = False,
         is_spec_decode: bool = False,
@@ -122,36 +122,7 @@ class NPUInputBatch(InputBatch):
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
 
-        self.quest_metadata_block_tables: torch.Tensor | None = None
-        self.quest_metadata_owner_req_ids: list[str | None] = []
-        self.quest_metadata_valid_tokens_cpu_tensor: torch.Tensor | None = None
-        self.quest_metadata_valid_tokens: np.ndarray | None = None
-        self.quest_refresh_seq_lens: torch.Tensor | None = None
-        self.quest_refresh_seq_lens_cpu_tensor: torch.Tensor | None = None
-        self.quest_refresh_seq_lens_cpu: np.ndarray | None = None
-        if quest_max_num_metadata_blocks_per_req > 0:
-            total_metadata_blocks = max_num_reqs * quest_max_num_metadata_blocks_per_req
-            self.quest_metadata_block_tables = torch.arange(
-                total_metadata_blocks,
-                dtype=torch.int32,
-                device=device,
-            ).view(max_num_reqs, quest_max_num_metadata_blocks_per_req)
-            self.quest_metadata_owner_req_ids = [None] * max_num_reqs
-            self.quest_metadata_valid_tokens_cpu_tensor = torch.zeros(
-                (max_num_reqs,),
-                device="cpu",
-                dtype=torch.int32,
-                pin_memory=False,
-            )
-            self.quest_metadata_valid_tokens = self.quest_metadata_valid_tokens_cpu_tensor.numpy()
-            self.quest_refresh_seq_lens = torch.zeros((max_num_reqs,), dtype=torch.int32, device=device)
-            self.quest_refresh_seq_lens_cpu_tensor = torch.zeros(
-                (max_num_reqs,),
-                device="cpu",
-                dtype=torch.int32,
-                pin_memory=pin_memory,
-            )
-            self.quest_refresh_seq_lens_cpu = self.quest_refresh_seq_lens_cpu_tensor.numpy()
+        self.quest_metadata: QuestBatchMetadataState | None = None
 
         # Sampling-related.
         self.temperature = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
@@ -266,3 +237,45 @@ class NPUInputBatch(InputBatch):
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+    def init_quest_metadata(self, max_num_metadata_blocks_per_req: int) -> None:
+        if max_num_metadata_blocks_per_req <= 0:
+            self.clear_quest_metadata()
+            return
+        self.quest_metadata = QuestBatchMetadataState(
+            max_num_reqs=self.max_num_reqs,
+            max_num_metadata_blocks_per_req=max_num_metadata_blocks_per_req,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    def clear_quest_metadata(self) -> None:
+        self.quest_metadata = None
+
+    @property
+    def quest_metadata_block_tables(self) -> torch.Tensor | None:
+        return None if self.quest_metadata is None else self.quest_metadata.metadata_block_tables
+
+    @property
+    def quest_metadata_owner_req_ids(self) -> list[str | None]:
+        return [] if self.quest_metadata is None else self.quest_metadata.owner_req_ids
+
+    @property
+    def quest_metadata_valid_tokens_cpu_tensor(self) -> torch.Tensor | None:
+        return None if self.quest_metadata is None else self.quest_metadata.valid_tokens_cpu_tensor
+
+    @property
+    def quest_metadata_valid_tokens(self) -> np.ndarray | None:
+        return None if self.quest_metadata is None else self.quest_metadata.valid_tokens
+
+    @property
+    def quest_refresh_seq_lens(self) -> torch.Tensor | None:
+        return None if self.quest_metadata is None else self.quest_metadata.refresh_seq_lens
+
+    @property
+    def quest_refresh_seq_lens_cpu_tensor(self) -> torch.Tensor | None:
+        return None if self.quest_metadata is None else self.quest_metadata.refresh_seq_lens_cpu_tensor
+
+    @property
+    def quest_refresh_seq_lens_cpu(self) -> np.ndarray | None:
+        return None if self.quest_metadata is None else self.quest_metadata.refresh_seq_lens_cpu
