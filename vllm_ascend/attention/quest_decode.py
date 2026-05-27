@@ -182,6 +182,16 @@ def initialize_metadata(
     if not ascend_config.quest_decode_config.enable:
         return
 
+    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+    if cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs():
+        _disable(
+            "full graph execution is enabled, but QUEST decode currently requires "
+            "runtime switching between dense and sparse attention paths.",
+            input_batch,
+            attn_layers,
+        )
+        return
+
     if get_ascend_device_type() not in {AscendDeviceType.A2, AscendDeviceType.A3}:
         _disable(
             "current hardware is unsupported, QUEST decode currently supports only "
