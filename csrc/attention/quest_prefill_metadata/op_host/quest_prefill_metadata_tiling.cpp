@@ -19,8 +19,9 @@ namespace optiling {
 namespace {
 constexpr uint32_t K_CACHE_INDEX = 0;
 constexpr uint32_t BLOCK_TABLES_INDEX = 1;
-constexpr uint32_t SEQ_LENS_INDEX = 2;
-constexpr uint32_t METADATA_BLOCK_TABLES_INDEX = 3;
+constexpr uint32_t REFRESH_START_SEQ_LENS_INDEX = 2;
+constexpr uint32_t REFRESH_SEQ_LENS_INDEX = 3;
+constexpr uint32_t METADATA_BLOCK_TABLES_INDEX = 4;
 constexpr uint32_t K_CACHE_DIM_NUM = 4;
 constexpr uint32_t TABLE_DIM_NUM = 2;
 constexpr uint32_t SEQ_LEN_DIM_NUM = 1;
@@ -46,16 +47,20 @@ static ge::graphStatus QuestPrefillMetadataTilingFunc(gert::TilingContext *conte
 
     const gert::StorageShape *k_cache_shape = context->GetInputShape(K_CACHE_INDEX);
     const gert::StorageShape *block_tables_shape = context->GetInputShape(BLOCK_TABLES_INDEX);
-    const gert::StorageShape *seq_lens_shape = context->GetInputShape(SEQ_LENS_INDEX);
+    const gert::StorageShape *refresh_start_seq_lens_shape =
+        context->GetInputShape(REFRESH_START_SEQ_LENS_INDEX);
+    const gert::StorageShape *refresh_seq_lens_shape = context->GetInputShape(REFRESH_SEQ_LENS_INDEX);
     const gert::StorageShape *metadata_block_tables_shape = context->GetInputShape(METADATA_BLOCK_TABLES_INDEX);
-    OPS_ERR_IF(k_cache_shape == nullptr || block_tables_shape == nullptr || seq_lens_shape == nullptr ||
+    OPS_ERR_IF(k_cache_shape == nullptr || block_tables_shape == nullptr ||
+                   refresh_start_seq_lens_shape == nullptr || refresh_seq_lens_shape == nullptr ||
                    metadata_block_tables_shape == nullptr,
                OPS_LOG_E(context->GetNodeName(), "Required input shape is null."),
                return ge::GRAPH_FAILED);
 
     const auto &k_cache_storage = k_cache_shape->GetStorageShape();
     const auto &block_tables_storage = block_tables_shape->GetStorageShape();
-    const auto &seq_lens_storage = seq_lens_shape->GetStorageShape();
+    const auto &refresh_start_seq_lens_storage = refresh_start_seq_lens_shape->GetStorageShape();
+    const auto &refresh_seq_lens_storage = refresh_seq_lens_shape->GetStorageShape();
     const auto &metadata_block_tables_storage =
         metadata_block_tables_shape->GetStorageShape();
 
@@ -66,11 +71,16 @@ static ge::graphStatus QuestPrefillMetadataTilingFunc(gert::TilingContext *conte
                    metadata_block_tables_storage.GetDimNum() != TABLE_DIM_NUM,
                OPS_LOG_E(context->GetNodeName(), "block tables must be 2D."),
                return ge::GRAPH_FAILED);
-    OPS_ERR_IF(seq_lens_storage.GetDimNum() != SEQ_LEN_DIM_NUM,
-               OPS_LOG_E(context->GetNodeName(), "seq_lens must be 1D."),
+    OPS_ERR_IF(refresh_start_seq_lens_storage.GetDimNum() != SEQ_LEN_DIM_NUM ||
+                   refresh_seq_lens_storage.GetDimNum() != SEQ_LEN_DIM_NUM,
+               OPS_LOG_E(context->GetNodeName(), "refresh seq lens must be 1D."),
                return ge::GRAPH_FAILED);
 
-    const uint32_t batch_size = static_cast<uint32_t>(seq_lens_storage.GetDim(DIM_0));
+    OPS_ERR_IF(refresh_start_seq_lens_storage.GetDim(DIM_0) != refresh_seq_lens_storage.GetDim(DIM_0),
+               OPS_LOG_E(context->GetNodeName(), "refresh seq lens batch sizes must match."),
+               return ge::GRAPH_FAILED);
+
+    const uint32_t batch_size = static_cast<uint32_t>(refresh_seq_lens_storage.GetDim(DIM_0));
     const uint32_t num_kv_heads = static_cast<uint32_t>(k_cache_storage.GetDim(DIM_2));
     const uint32_t block_size = static_cast<uint32_t>(k_cache_storage.GetDim(DIM_1));
     const uint32_t head_dim = static_cast<uint32_t>(k_cache_storage.GetDim(DIM_3));

@@ -82,6 +82,20 @@ __aicore__ inline void quest_apply_anchor_selection(
     }
 }
 
+__aicore__ inline void quest_apply_sequential_selection(
+    LocalTensor<uint32_t> &selected_indices_lt,
+    int32_t valid_page_count,
+    int32_t k)
+{
+    int32_t num_selected_pages = valid_page_count > 0 ? MIN(k, valid_page_count) : 0;
+    for (int32_t idx = 0; idx < num_selected_pages; ++idx) {
+        selected_indices_lt.SetValue(idx, static_cast<uint32_t>(idx));
+    }
+    for (int32_t idx = num_selected_pages; idx < k; ++idx) {
+        selected_indices_lt.SetValue(idx, 0U);
+    }
+}
+
 template <typename StorageT>
 class KernelQuestBlockSelectPaged {
     using VecBufT = AscendC::TBuf<AscendC::QuePosition::VECCALC>;
@@ -199,23 +213,19 @@ public:
             int32_t output_offset = batch_head_idx * k_;
 
             int32_t seq_len = seq_lens_gm_.GetValue(batch_idx);
-            int32_t valid_page_count = DIV_ROUNDUP(seq_len, block_size_);
-            int32_t num_tokens_per_meta_block = block_size_ * block_size_;
-            int32_t num_meta_blocks_in_request = DIV_ROUNDUP(seq_len, num_tokens_per_meta_block);
+            int32_t valid_page_count = seq_len > 0 ? DIV_ROUNDUP(seq_len, block_size_) : 0;
             bool use_fixed_anchors = tokens_since_metadata_update_ >= 0;
-            if (unlikely(use_fixed_anchors &&
-                         valid_page_count > 0 &&
-                         valid_page_count <= 2 &&
-                         k_ >= valid_page_count)) {
-                // Catch case where number of selected blocks <= 2
-                quest_apply_anchor_selection(
+            if (unlikely(valid_page_count <= 0 || k_ >= valid_page_count)) {
+                quest_apply_sequential_selection(
                     tensors.selected_indices,
-                    seq_len,
-                    block_size_,
+                    valid_page_count,
                     k_);
             } else {
+                int32_t num_meta_blocks_in_request = DIV_ROUNDUP(valid_page_count, block_size_);
+                int32_t sort_element_count = DIV_ROUNDUP(valid_page_count, 32) * 32;
+
                 LoadQuery(tensors, query_offset);
-                DuplicateAccumulatedScores(tensors, num_meta_blocks_in_request);
+                DuplicateAccumulatedScores(tensors, sort_element_count);
 
                 for (int32_t meta_block = 0; meta_block < num_meta_blocks_in_request; meta_block++) {
                     int32_t meta_block_id = metadata_block_tables_gm_.GetValue(
@@ -226,13 +236,12 @@ public:
                     ScoreMetadataBlock(tensors, meta_block_offset);
                     CopyScoresToAccumulated(
                         tensors,
-                        seq_len,
-                        num_tokens_per_meta_block,
+                        valid_page_count,
                         meta_block,
                         num_meta_blocks_in_request);
                 }
 
-                SortAndExtract(tensors, num_meta_blocks_in_request);
+                SortAndExtract(tensors, sort_element_count);
 
                 if (likely(use_fixed_anchors)) {
                     quest_apply_anchor_selection(
@@ -293,12 +302,12 @@ private:
 
     __aicore__ inline void DuplicateAccumulatedScores(
         LocalTensors &tensors,
-        int32_t num_meta_blocks_in_request)
+        int32_t sort_element_count)
     {
         AscendC::Duplicate(
             tensors.accumulated_scores,
             static_cast<ComputeT>(MINFLOAT),
-            max_metadata_blocks_per_request_ * num_meta_blocks_in_request);
+            sort_element_count);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -409,23 +418,31 @@ private:
 
     __aicore__ inline void CopyScoresToAccumulated(
         LocalTensors &tensors,
-        int32_t seq_len,
-        int32_t num_tokens_per_meta_block,
+        int32_t valid_page_count,
         int32_t meta_block,
         int32_t num_meta_blocks_in_request)
     {
-        uint64_t seq_len_curr_meta_block =
-            MIN(seq_len - (meta_block * num_tokens_per_meta_block), block_size_);
+        int32_t start_page = meta_block * block_size_;
+        int32_t pages_in_meta_block = MIN(valid_page_count - start_page, block_size_);
+        if (pages_in_meta_block <= 0) {
+            return;
+        }
+
         uint64_t mask = NUM_FLOAT_ELEMS_PER_VECTOR;
         uint64_t masks_per_head_dim = head_dim_ / mask;
         for (int32_t sub_meta_block_id = 0; sub_meta_block_id < static_cast<int32_t>(masks_per_head_dim);
              sub_meta_block_id++) {
             int32_t block_scores_offset = sub_meta_block_id * NUM_FLOAT_ELEMS_PER_VECTOR;
+            int32_t pages_remaining = pages_in_meta_block - block_scores_offset;
+            if (pages_remaining <= 0) {
+                break;
+            }
+
             int32_t accumulated_offset = meta_block * block_size_ + block_scores_offset;
             AscendC::Copy(
                 tensors.accumulated_scores[accumulated_offset],
                 tensors.block_scores[block_scores_offset],
-                seq_len_curr_meta_block - sub_meta_block_id * NUM_FLOAT_ELEMS_PER_VECTOR,
+                static_cast<uint64_t>(MIN(pages_remaining, NUM_FLOAT_ELEMS_PER_VECTOR)),
                 1,
                 {1, 1, 8, 8});
             if (meta_block < num_meta_blocks_in_request - 1) {
@@ -437,12 +454,11 @@ private:
 
     __aicore__ inline void SortAndExtract(
         LocalTensors &tensors,
-        int32_t num_meta_blocks_in_request)
+        int32_t sort_element_count)
     {
-        uint32_t total_elements = num_meta_blocks_in_request * block_size_;
-        uint32_t repeat_times = DIV_ROUNDUP(total_elements, 32);
+        uint32_t repeat_times = sort_element_count / 32;
 
-        for (uint32_t idx = 0; idx < total_elements; idx++) {
+        for (uint32_t idx = 0; idx < static_cast<uint32_t>(sort_element_count); idx++) {
             tensors.index_local.SetValue(idx, idx);
         }
 
