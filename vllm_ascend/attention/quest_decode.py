@@ -127,18 +127,24 @@ class QuestBatchMetadataState:
                 if self.refresh_seq_lens_cpu[row_idx] > self.refresh_start_seq_lens_cpu[row_idx]:
                     refresh_required = True
 
-        self.refresh_start_seq_lens[:num_reqs].copy_(
-            self.refresh_start_seq_lens_cpu_tensor[:num_reqs],
-            non_blocking=True,
-        )
-        self.refresh_seq_lens[:num_reqs].copy_(
-            self.refresh_seq_lens_cpu_tensor[:num_reqs],
-            non_blocking=True,
-        )
+        refresh_start_seq_lens = None
+        refresh_seq_lens = None
+        if refresh_required:
+            self.refresh_start_seq_lens[:num_reqs].copy_(
+                self.refresh_start_seq_lens_cpu_tensor[:num_reqs],
+                non_blocking=True,
+            )
+            self.refresh_seq_lens[:num_reqs].copy_(
+                self.refresh_seq_lens_cpu_tensor[:num_reqs],
+                non_blocking=True,
+            )
+            refresh_start_seq_lens = self.refresh_start_seq_lens[:num_reqs]
+            refresh_seq_lens = self.refresh_seq_lens[:num_reqs]
+
         return QuestPreparedMetadata(
             metadata_block_tables=self.metadata_block_tables[:num_reqs],
-            refresh_start_seq_lens=self.refresh_start_seq_lens[:num_reqs],
-            refresh_seq_lens=self.refresh_seq_lens[:num_reqs],
+            refresh_start_seq_lens=refresh_start_seq_lens,
+            refresh_seq_lens=refresh_seq_lens,
             ready=True,
             refresh_required=refresh_required,
         )
