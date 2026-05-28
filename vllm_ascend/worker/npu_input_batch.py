@@ -17,13 +17,15 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_input_batch.py
 #
 
+from typing import Any
+
 import numpy as np
 import torch
 from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingStates
-from vllm.v1.sample.logits_processor import BatchUpdateBuilder, LogitsProcessors
+from vllm.v1.sample.logits_processor import BatchUpdateBuilder, LogitsProcessors, MoveDirectionality
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_ascend.attention.quest_decode import QuestBatchMetadataState
@@ -251,6 +253,39 @@ class NPUInputBatch(InputBatch):
 
     def clear_quest_metadata(self) -> None:
         self.quest_metadata = None
+
+    def add_request(self, request: Any) -> int:
+        req_index = super().add_request(request)
+        if self.quest_metadata is not None:
+            self.quest_metadata.clear_row(req_index)
+        return req_index
+
+    def remove_request(self, req_id: str) -> int | None:
+        req_index = super().remove_request(req_id)
+        if req_index is not None and self.quest_metadata is not None:
+            self.quest_metadata.clear_row(req_index)
+        return req_index
+
+    def swap_states(self, i1: int, i2: int) -> None:
+        super().swap_states(i1, i2)
+        if self.quest_metadata is not None:
+            self.quest_metadata.swap_rows(i1, i2)
+
+    def condense(self) -> None:
+        moved_start = len(self.batch_update_builder.moved)
+        super().condense()
+
+        if self.quest_metadata is None:
+            return
+        if self.num_reqs == 0:
+            self.quest_metadata.reset_all()
+            return
+
+        for src_idx, dst_idx, direction in self.batch_update_builder.moved[moved_start:]:
+            if direction == MoveDirectionality.UNIDIRECTIONAL:
+                self.quest_metadata.move_row(src_idx, dst_idx)
+            elif direction == MoveDirectionality.SWAP:
+                self.quest_metadata.swap_rows(src_idx, dst_idx)
 
     @property
     def quest_metadata_block_tables(self) -> torch.Tensor | None:
