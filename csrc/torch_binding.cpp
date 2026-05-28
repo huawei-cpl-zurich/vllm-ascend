@@ -2505,7 +2505,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         &vllm_ascend::npu_paged_select_attention_graph_out);
 
     ops.def(
-        "npu_quest_prefill_metadata(Tensor k_cache, Tensor block_tables, Tensor seq_lens,"
+        "npu_quest_prefill_metadata(Tensor k_cache, Tensor block_tables,"
+        "                           Tensor refresh_start_seq_lens, Tensor refresh_seq_lens,"
         "                           Tensor metadata_block_tables, Tensor! maxblocks, Tensor! minblocks) -> ()"
     );
     ops.impl("npu_quest_prefill_metadata", torch::kPrivateUse1, &vllm_ascend::npu_quest_prefill_metadata);

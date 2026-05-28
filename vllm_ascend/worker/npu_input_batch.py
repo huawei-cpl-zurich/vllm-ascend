@@ -272,6 +272,18 @@ class NPUInputBatch(InputBatch):
         return None if self.quest_metadata is None else self.quest_metadata.valid_tokens
 
     @property
+    def quest_refresh_start_seq_lens(self) -> torch.Tensor | None:
+        return None if self.quest_metadata is None else self.quest_metadata.refresh_start_seq_lens
+
+    @property
+    def quest_refresh_start_seq_lens_cpu_tensor(self) -> torch.Tensor | None:
+        return None if self.quest_metadata is None else self.quest_metadata.refresh_start_seq_lens_cpu_tensor
+
+    @property
+    def quest_refresh_start_seq_lens_cpu(self) -> np.ndarray | None:
+        return None if self.quest_metadata is None else self.quest_metadata.refresh_start_seq_lens_cpu
+
+    @property
     def quest_refresh_seq_lens(self) -> torch.Tensor | None:
         return None if self.quest_metadata is None else self.quest_metadata.refresh_seq_lens
 
