@@ -228,6 +228,7 @@ class AscendMetadata:
     quest_metadata_block_tables: torch.Tensor | None = None
     quest_refresh_start_seq_lens: torch.Tensor | None = None
     quest_refresh_seq_lens: torch.Tensor | None = None
+    quest_refresh_required: bool = False
     quest_ready: bool = False
     quest_seq_lens: torch.Tensor | None = None
     quest_maxblocks: torch.Tensor | None = None
@@ -365,6 +366,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 if common_attn_metadata.quest_refresh_seq_lens is not None and quest_batch_size > 0
                 else None
             ),
+            quest_refresh_required=common_attn_metadata.quest_refresh_required,
             quest_ready=common_attn_metadata.quest_ready,
             quest_seq_lens=common_attn_metadata.seq_lens[:quest_batch_size] if quest_batch_size > 0 else None,
         )
@@ -454,6 +456,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             self.quest_enabled
             and self.quest_layer_supported
             and attn_metadata.quest_ready
+            and attn_metadata.quest_refresh_required
             and self.key_cache is not None
             and attn_metadata.block_tables is not None
             and attn_metadata.quest_metadata_block_tables is not None

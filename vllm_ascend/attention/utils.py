@@ -194,6 +194,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # are skipped and retain their existing metadata.
     quest_refresh_start_seq_lens: torch.Tensor | None = None
     quest_refresh_seq_lens: torch.Tensor | None = None
+    quest_refresh_required: bool = False
 
     # Model/batch-level gate for the optional QUEST sparse decode path.
     quest_ready: bool = False
@@ -228,6 +229,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
         self.quest_metadata_block_tables = prepared_metadata.metadata_block_tables
         self.quest_refresh_start_seq_lens = prepared_metadata.refresh_start_seq_lens
         self.quest_refresh_seq_lens = prepared_metadata.refresh_seq_lens
+        self.quest_refresh_required = prepared_metadata.refresh_required
         self.quest_ready = prepared_metadata.ready
 
     # TODO: Remove it when vLLM no longer uses this function.
@@ -275,6 +277,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             quest_refresh_seq_lens=(
                 self.quest_refresh_seq_lens[:num_actual_reqs] if self.quest_refresh_seq_lens is not None else None
             ),
+            quest_refresh_required=self.quest_refresh_required,
             quest_ready=self.quest_ready,
             max_seq_len=self.max_seq_len,
             # Propagate parent-class fields so the unpadded view is a

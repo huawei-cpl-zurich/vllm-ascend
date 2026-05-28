@@ -50,6 +50,7 @@ class QuestPreparedMetadata:
     refresh_start_seq_lens: torch.Tensor | None = None
     refresh_seq_lens: torch.Tensor | None = None
     ready: bool = False
+    refresh_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,7 @@ class QuestBatchMetadataState:
 
         self.refresh_start_seq_lens_cpu[:num_reqs].fill(0)
         self.refresh_seq_lens_cpu[:num_reqs].fill(0)
+        refresh_required = False
         for row_idx, req_id in enumerate(req_ids[:num_reqs]):
             seq_len = int(seq_lens_cpu[row_idx])
             valid_tokens = int(self.valid_tokens[row_idx])
@@ -122,6 +124,8 @@ class QuestBatchMetadataState:
                 if not new_owner_or_shrunk:
                     self.refresh_start_seq_lens_cpu[row_idx] = (valid_tokens // QUEST_PAGE_SIZE) * QUEST_PAGE_SIZE
                 self.refresh_seq_lens_cpu[row_idx] = seq_len
+                if self.refresh_seq_lens_cpu[row_idx] > self.refresh_start_seq_lens_cpu[row_idx]:
+                    refresh_required = True
 
         self.refresh_start_seq_lens[:num_reqs].copy_(
             self.refresh_start_seq_lens_cpu_tensor[:num_reqs],
@@ -136,6 +140,7 @@ class QuestBatchMetadataState:
             refresh_start_seq_lens=self.refresh_start_seq_lens[:num_reqs],
             refresh_seq_lens=self.refresh_seq_lens[:num_reqs],
             ready=True,
+            refresh_required=refresh_required,
         )
 
     def commit(self, num_reqs: int, req_ids: Sequence[str | None]) -> None:
