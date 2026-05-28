@@ -50,6 +50,7 @@ from vllm_ascend.attention.kvcomp_attn.attention_utils import (
 from vllm_ascend.attention.quest_decode import (
     QUEST_HEAD_SIZE,
     QUEST_INDEX_ALIGNMENT,
+    QUEST_PAGE_SIZE,
     attach_layer_tensors,
     get_quest_decode_config,
 )
@@ -81,6 +82,7 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
+QUEST_SPARSE_SELECTED_BLOCK_RATIO_THRESHOLD = 0.5
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -230,6 +232,7 @@ class AscendMetadata:
     quest_refresh_seq_lens: torch.Tensor | None = None
     quest_refresh_required: bool = False
     quest_ready: bool = False
+    quest_sparse_decode: bool = False
     quest_seq_lens: torch.Tensor | None = None
     quest_maxblocks: torch.Tensor | None = None
     quest_minblocks: torch.Tensor | None = None
@@ -280,6 +283,25 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        self.quest_topk_pages = get_quest_decode_config(vllm_config).topk_pages
+
+    @staticmethod
+    def _should_use_quest_sparse_decode(seq_lens: torch.Tensor, batch_size: int, selected_blocks: int) -> bool:
+        if batch_size <= 0 or selected_blocks <= 0:
+            return False
+
+        total_blocks = torch.div(
+            seq_lens[:batch_size] + QUEST_PAGE_SIZE - 1,
+            QUEST_PAGE_SIZE,
+            rounding_mode="floor",
+        )
+        total_blocks = total_blocks[total_blocks > 0]
+        if total_blocks.numel() == 0:
+            return False
+
+        selected_blocks_per_req = torch.clamp(total_blocks, max=selected_blocks)
+        avg_selected_ratio = (selected_blocks_per_req.float() / total_blocks.float()).mean()
+        return bool((avg_selected_ratio < QUEST_SPARSE_SELECTED_BLOCK_RATIO_THRESHOLD).item())
 
     @classmethod
     def get_cudagraph_support(
@@ -317,6 +339,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
         else:
             seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+        seq_lens_for_quest_sparse_decode = seq_lens
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
@@ -336,6 +359,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
         quest_metadata_block_tables = common_attn_metadata.quest_metadata_block_tables
         quest_batch_size = 0 if quest_metadata_block_tables is None else quest_metadata_block_tables.shape[0]
+        seq_lens_list = seq_lens.tolist()
+        quest_selected_blocks = min(self.quest_topk_pages, block_table.shape[1]) if block_table is not None else 0
+        quest_sparse_decode = self._should_use_quest_sparse_decode(
+            seq_lens_for_quest_sparse_decode,
+            quest_batch_size,
+            quest_selected_blocks,
+        )
 
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -344,7 +374,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
-            seq_lens_list=seq_lens.tolist(),
+            seq_lens_list=seq_lens_list,
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
             slot_mapping=slot_mapping,
@@ -368,6 +398,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             ),
             quest_refresh_required=common_attn_metadata.quest_refresh_required,
             quest_ready=common_attn_metadata.quest_ready,
+            quest_sparse_decode=quest_sparse_decode,
             quest_seq_lens=common_attn_metadata.seq_lens[:quest_batch_size] if quest_batch_size > 0 else None,
         )
         return attn_metadata
@@ -477,6 +508,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and self.quest_enabled
             and self.quest_layer_supported
             and attn_metadata.quest_ready
+            and attn_metadata.quest_sparse_decode
             and self.sliding_window is None
             and self.sinks is None
             and attn_metadata.block_tables is not None
@@ -664,7 +696,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and quest_metadata is not None
             and len(quest_metadata) > 0
             and all(
-                metadata.quest_ready and metadata.attn_state == AscendAttentionState.DecodeOnly
+                metadata.quest_ready
+                and metadata.quest_sparse_decode
+                and metadata.attn_state == AscendAttentionState.DecodeOnly
                 for metadata in quest_metadata.values()
             )
         )
