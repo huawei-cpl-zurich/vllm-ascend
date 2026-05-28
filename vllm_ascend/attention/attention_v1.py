@@ -528,6 +528,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if _EXTRA_CTX.capturing:
+            return self.full_graph_quest(query, key, value, attn_metadata, output)
+
         if (
             attn_metadata.quest_metadata_block_tables is None
             or attn_metadata.quest_seq_lens is None
@@ -1441,10 +1444,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         num_tokens = query.shape[0]
         if self._quest_decode_eligible(attn_metadata, num_tokens):
-            if _EXTRA_CTX.capturing:
-                output = self.full_graph_quest(query, key, value, attn_metadata, output)
-            else:
-                output = self.forward_quest_attention(query, key, value, attn_metadata, output)
+            output = self.forward_quest_attention(query, key, value, attn_metadata, output)
         elif (
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and using_paged_attention(num_tokens, self.vllm_config)
