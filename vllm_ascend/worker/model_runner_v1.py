@@ -102,6 +102,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention import quest_decode
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
@@ -2020,6 +2021,8 @@ class NPUModelRunner(GPUModelRunner):
                         for aux_hidden_states_pcp in aux_hidden_states
                     ]
 
+            quest_decode.commit_batch_metadata(self.input_batch, self.input_batch.num_reqs)
+
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -2874,6 +2877,8 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
+            quest_batch_metadata=self.input_batch.quest_metadata,
+            quest_req_ids=self.input_batch.req_ids[:num_reqs],
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -3463,14 +3468,29 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        quest_decode.initialize_metadata(
+            vllm_config=self.vllm_config,
+            ascend_config=self.ascend_config,
+            model_config=self.model_config,
+            max_encoder_len=self.max_encoder_len,
+            max_num_reqs=self.max_num_reqs,
+            device=self.device,
+            use_sparse=self.use_sparse,
+            input_batch=self.input_batch,
+            kv_caches=kv_caches,
+            shared_kv_cache_layers=self.shared_kv_cache_layers,
+        )
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)
-            block_size = (self.kernel_block_sizes[0] if isinstance(
-            self.kernel_block_sizes, list) else self.kernel_block_sizes)
+            block_size = (
+                self.kernel_block_sizes[0]
+                if isinstance(self.kernel_block_sizes, list)
+                else self.kernel_block_sizes
+            )
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
