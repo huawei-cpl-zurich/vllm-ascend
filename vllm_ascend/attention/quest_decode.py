@@ -183,6 +183,20 @@ class _QuestLayerMetadata:
                 continue
             self.valid_tokens[row_idx] = refreshed_seq_len
 
+    def is_ready_for_sparse_decode(self, batch_metadata: QuestBatchMetadata) -> bool:
+        num_reqs = batch_metadata.batch_size
+        if num_reqs <= 0:
+            return False
+
+        for row_idx in range(num_reqs):
+            seq_len = batch_metadata._seq_lens_cpu[row_idx]
+            valid_tokens = int(self.valid_tokens[row_idx])
+            if valid_tokens < 0 or valid_tokens > seq_len:
+                return False
+            if seq_len // QUEST_PAGE_SIZE > valid_tokens // QUEST_PAGE_SIZE:
+                return False
+        return True
+
 
 class QuestDecodeMetadataManager:
     """Central QUEST metadata owner for batch rows and per-layer tensors."""
@@ -477,6 +491,8 @@ class QuestDecodeMetadataManager:
 
         layer_metadata = self.layers.get(layer_name)
         if layer_metadata is None:
+            return None
+        if not layer_metadata.is_ready_for_sparse_decode(batch_metadata):
             return None
 
         return QuestSparseDecodeInputs(
