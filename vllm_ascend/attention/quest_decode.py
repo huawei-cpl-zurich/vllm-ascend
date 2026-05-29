@@ -208,7 +208,7 @@ class QuestBatchMetadataState:
 def _clear_layer_tensors(attn_layers: Mapping[str, AttentionLayerBase]) -> None:
     for attn_layer in attn_layers.values():
         impl = getattr(attn_layer, "impl", None)
-        if hasattr(impl, "quest_layer_tensors"):
+        if impl is not None and hasattr(impl, "quest_layer_tensors"):
             impl.quest_layer_tensors = None
 
 
