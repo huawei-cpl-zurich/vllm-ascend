@@ -15,7 +15,7 @@
 #
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -67,6 +67,7 @@ class QuestBatchMetadata:
     _seq_lens: torch.Tensor | None = None
     _metadata_block_tables: torch.Tensor | None = None
     _selected_k: int = 0
+    _refresh_layer_ids: set[int] = field(default_factory=set)
 
     def refresh_layer_after_cache_update(
         self,
@@ -438,7 +439,13 @@ class QuestDecodeMetadataManager:
         ):
             return
 
-        if not layer_metadata.prepare(batch_metadata):
+        layer_id = id(layer_metadata)
+        refresh_required = layer_id in batch_metadata._refresh_layer_ids
+        if not refresh_required:
+            refresh_required = layer_metadata.prepare(batch_metadata)
+            if refresh_required:
+                batch_metadata._refresh_layer_ids.add(layer_id)
+        if not refresh_required:
             return
 
         batch_size = batch_metadata.batch_size
