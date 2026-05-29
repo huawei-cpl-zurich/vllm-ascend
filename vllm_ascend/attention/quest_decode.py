@@ -15,7 +15,6 @@
 #
 
 from collections.abc import Mapping, Sequence
-from copy import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,12 +27,14 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.ascend_config import AscendConfig, QuestDecodeConfig
 from vllm_ascend.attention.utils import enable_cp
+from vllm_ascend.ops.select_attention import quest_prefill_metadata
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 QUEST_PAGE_SIZE = 128
 QUEST_HEAD_SIZE = 128
 QUEST_MAX_METADATA_BLOCKS_PER_REQ = 6
 QUEST_INDEX_ALIGNMENT = 8
+QUEST_SPARSE_SELECTED_BLOCK_RATIO_THRESHOLD = 0.5
 
 
 def get_quest_decode_config(vllm_config: VllmConfig) -> QuestDecodeConfig:
@@ -44,27 +45,59 @@ def get_quest_decode_config(vllm_config: VllmConfig) -> QuestDecodeConfig:
     return QuestDecodeConfig(additional_config.get("quest_decode_config"))
 
 
-@dataclass
-class QuestBatchPreparedMetadata:
-    metadata_block_tables: torch.Tensor | None = None
-    ready: bool = False
-    batch_size: int = 0
+@dataclass(frozen=True)
+class QuestSparseDecodeInputs:
+    batch_size: int
+    selected_k: int
+    rounded_selected_k: int
+    metadata_block_tables: torch.Tensor
+    seq_lens: torch.Tensor
+    maxblocks: torch.Tensor
+    minblocks: torch.Tensor
 
 
 @dataclass
-class QuestLayerPreparedMetadata:
-    layer_metadata: Any = None
-    metadata_block_tables: torch.Tensor | None = None
-    refresh_start_seq_lens: torch.Tensor | None = None
-    refresh_seq_lens: torch.Tensor | None = None
-    maxblocks: torch.Tensor | None = None
-    minblocks: torch.Tensor | None = None
-    ready: bool = False
-    refresh_required: bool = False
+class QuestBatchMetadata:
+    """Temporary active-batch QUEST handle carried by attention metadata."""
+
+    _manager: "QuestDecodeMetadataManager | None" = None
+    quest_enabled_for_batch: bool = False
     batch_size: int = 0
+    _seq_lens_cpu: tuple[int, ...] = ()
+    _seq_lens: torch.Tensor | None = None
+    _metadata_block_tables: torch.Tensor | None = None
+
+    def refresh_layer_after_cache_update(
+        self,
+        *,
+        layer_name: str,
+        k_cache: torch.Tensor | None,
+        block_tables: torch.Tensor | None,
+    ) -> None:
+        if not self.quest_enabled_for_batch or self._manager is None:
+            return
+        self._manager._refresh_layer_after_cache_update(
+            self,
+            layer_name=layer_name,
+            k_cache=k_cache,
+            block_tables=block_tables,
+        )
+
+    def get_sparse_decode_inputs(
+        self,
+        layer_name: str,
+        block_table_width: int,
+    ) -> QuestSparseDecodeInputs | None:
+        if not self.quest_enabled_for_batch or self._manager is None:
+            return None
+        return self._manager._get_sparse_decode_inputs(
+            self,
+            layer_name=layer_name,
+            block_table_width=block_table_width,
+        )
 
 
-class QuestLayerMetadata:
+class _QuestLayerMetadata:
     """Per-layer QUEST metadata tensors and freshness bookkeeping."""
 
     def __init__(
@@ -80,9 +113,9 @@ class QuestLayerMetadata:
         self.layer_name = layer_name
         self.maxblocks = maxblocks
         self.minblocks = minblocks
-        self.valid_owner_generations = np.full(max_num_reqs, -1, dtype=np.int64)
-        self.valid_tokens_cpu_tensor = torch.zeros(
+        self.valid_tokens_cpu_tensor = torch.full(
             (max_num_reqs,),
+            -1,
             device="cpu",
             dtype=torch.int32,
             pin_memory=False,
@@ -107,43 +140,33 @@ class QuestLayerMetadata:
 
     def invalidate_rows(self, row_indices: Sequence[int]) -> None:
         for row_idx in row_indices:
-            self.valid_owner_generations[row_idx] = -1
-            self.valid_tokens[row_idx] = 0
+            self.valid_tokens[row_idx] = -1
 
     def prepare(
         self,
-        manager: "QuestDecodeMetadataManager",
-    ) -> QuestLayerPreparedMetadata:
-        num_reqs = manager.active_num_reqs
-        metadata_block_tables = manager.active_metadata_block_tables
+        batch_metadata: QuestBatchMetadata,
+    ) -> bool:
+        num_reqs = batch_metadata.batch_size
         if num_reqs <= 0:
-            return QuestLayerPreparedMetadata(
-                layer_metadata=self,
-                metadata_block_tables=metadata_block_tables,
-                maxblocks=self.maxblocks,
-                minblocks=self.minblocks,
-                ready=True,
-                batch_size=0,
-            )
+            return False
 
         self.refresh_start_seq_lens_cpu[:num_reqs].fill(0)
         self.refresh_seq_lens_cpu[:num_reqs].fill(0)
         refresh_required = False
         for row_idx in range(num_reqs):
-            seq_len = manager.active_seq_lens_cpu[row_idx]
+            seq_len = batch_metadata._seq_lens_cpu[row_idx]
             valid_tokens = int(self.valid_tokens[row_idx])
-            stale_owner = self.valid_owner_generations[row_idx] != manager.owner_generations[row_idx]
-            new_owner_or_shrunk = stale_owner or valid_tokens > seq_len
-            crossed_page_boundary = seq_len // QUEST_PAGE_SIZE > valid_tokens // QUEST_PAGE_SIZE
-            if new_owner_or_shrunk or crossed_page_boundary:
-                if not new_owner_or_shrunk:
-                    self.refresh_start_seq_lens_cpu[row_idx] = (valid_tokens // QUEST_PAGE_SIZE) * QUEST_PAGE_SIZE
+            stale_or_shrunk = valid_tokens < 0 or valid_tokens > seq_len
+            if stale_or_shrunk:
                 self.refresh_seq_lens_cpu[row_idx] = seq_len
-                if self.refresh_seq_lens_cpu[row_idx] > self.refresh_start_seq_lens_cpu[row_idx]:
-                    refresh_required = True
+            else:
+                crossed_page_boundary = seq_len // QUEST_PAGE_SIZE > valid_tokens // QUEST_PAGE_SIZE
+                if crossed_page_boundary:
+                    self.refresh_start_seq_lens_cpu[row_idx] = (valid_tokens // QUEST_PAGE_SIZE) * QUEST_PAGE_SIZE
+                    self.refresh_seq_lens_cpu[row_idx] = seq_len
+            if self.refresh_seq_lens_cpu[row_idx] > self.refresh_start_seq_lens_cpu[row_idx]:
+                refresh_required = True
 
-        refresh_start_seq_lens = None
-        refresh_seq_lens = None
         if refresh_required:
             self.refresh_start_seq_lens[:num_reqs].copy_(
                 self.refresh_start_seq_lens_cpu_tensor[:num_reqs],
@@ -153,22 +176,11 @@ class QuestLayerMetadata:
                 self.refresh_seq_lens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
-            refresh_start_seq_lens = self.refresh_start_seq_lens[:num_reqs]
-            refresh_seq_lens = self.refresh_seq_lens[:num_reqs]
 
-        return QuestLayerPreparedMetadata(
-            layer_metadata=self,
-            metadata_block_tables=metadata_block_tables,
-            refresh_start_seq_lens=refresh_start_seq_lens,
-            refresh_seq_lens=refresh_seq_lens,
-            maxblocks=self.maxblocks,
-            minblocks=self.minblocks,
-            ready=True,
-            refresh_required=refresh_required,
-            batch_size=num_reqs,
-        )
+        return refresh_required
 
-    def commit(self, manager: "QuestDecodeMetadataManager", num_reqs: int) -> None:
+    def commit(self, batch_metadata: QuestBatchMetadata) -> None:
+        num_reqs = batch_metadata.batch_size
         if num_reqs <= 0:
             return
 
@@ -177,7 +189,6 @@ class QuestLayerMetadata:
             if refreshed_seq_len <= 0:
                 continue
             self.valid_tokens[row_idx] = refreshed_seq_len
-            self.valid_owner_generations[row_idx] = manager.owner_generations[row_idx]
 
 
 class QuestDecodeMetadataManager:
@@ -196,27 +207,17 @@ class QuestDecodeMetadataManager:
         self.metadata_block_tables: torch.Tensor | None = None
         self.max_num_metadata_blocks_per_req = 0
         self.owner_req_ids: list[str | None] = [None] * max_num_reqs
-        self.owner_generations = np.zeros(max_num_reqs, dtype=np.int64)
-        self.layers: dict[str, QuestLayerMetadata] = {}
+        self.layers: dict[str, _QuestLayerMetadata] = {}
         self.ready = False
-        self.active_num_reqs = 0
-        self.active_seq_lens_cpu: tuple[int, ...] = ()
-        self.active_metadata_block_tables: torch.Tensor | None = None
-        self._owner_signature: tuple[int, tuple[str | None, ...]] | None = None
-        self._active_ready = False
+        self.topk_pages = 0
 
     def clear(self) -> None:
         self.metadata_block_tables = None
         self.max_num_metadata_blocks_per_req = 0
         self.owner_req_ids = [None] * self.max_num_reqs
-        self.owner_generations.fill(0)
         self.layers.clear()
         self.ready = False
-        self.active_num_reqs = 0
-        self.active_seq_lens_cpu = ()
-        self.active_metadata_block_tables = None
-        self._owner_signature = None
-        self._active_ready = False
+        self.topk_pages = 0
 
     def _disable(self, reason: str) -> None:
         logger.warning_once(f"QUEST decode is disabled: {reason}")
@@ -251,12 +252,12 @@ class QuestDecodeMetadataManager:
         self.max_num_reqs = max_num_reqs
         self.device = device
         self.owner_req_ids = [None] * max_num_reqs
-        self.owner_generations = np.zeros(max_num_reqs, dtype=np.int64)
 
         attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
 
         if not ascend_config.quest_decode_config.enable:
             return
+        self.topk_pages = ascend_config.quest_decode_config.topk_pages
 
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
         if cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs():
@@ -354,11 +355,11 @@ class QuestDecodeMetadataManager:
             device=device,
         ).view(max_num_reqs, max_num_metadata_blocks_per_req)
 
-        base_layer_metadata: dict[str, QuestLayerMetadata] = {}
+        base_layer_metadata: dict[str, _QuestLayerMetadata] = {}
         for layer_name, k_cache in base_layer_k_caches.items():
             metadata_shape = (num_metadata_blocks, QUEST_PAGE_SIZE, k_cache.shape[2], QUEST_HEAD_SIZE)
             maxblocks = torch.zeros(metadata_shape, dtype=k_cache.dtype, device=device)
-            layer_metadata = QuestLayerMetadata(
+            layer_metadata = _QuestLayerMetadata(
                 layer_name=layer_name,
                 max_num_reqs=max_num_reqs,
                 maxblocks=maxblocks,
@@ -382,111 +383,144 @@ class QuestDecodeMetadataManager:
         num_reqs: int,
         req_ids: Sequence[str | None] | None,
         seq_lens_cpu: torch.Tensor | np.ndarray,
+        seq_lens: torch.Tensor,
         attn_state: Any,
         max_query_len: int | None,
-    ) -> QuestBatchPreparedMetadata:
-        self.active_num_reqs = 0
-        self.active_seq_lens_cpu = ()
-        self.active_metadata_block_tables = None
-        self._active_ready = False
-
+        block_table_width: int,
+    ) -> QuestBatchMetadata:
         if (
             not self.ready
             or self.metadata_block_tables is None
             or req_ids is None
             or getattr(attn_state, "name", None) != "DecodeOnly"
             or max_query_len != 1
+            or block_table_width <= 0
         ):
-            self._owner_signature = None
-            return QuestBatchPreparedMetadata()
+            return QuestBatchMetadata()
 
         num_reqs = min(num_reqs, len(req_ids), self.max_num_reqs)
+        if num_reqs <= 0:
+            return QuestBatchMetadata()
+
+        selected_blocks = min(self.topk_pages, block_table_width)
+        if not self._should_use_sparse_decode(seq_lens_cpu, num_reqs, selected_blocks):
+            return QuestBatchMetadata()
+
         req_ids_tuple = tuple(req_ids[:num_reqs])
         seq_lens_tuple = tuple(int(seq_lens_cpu[row_idx]) for row_idx in range(num_reqs))
-        owner_signature = (num_reqs, req_ids_tuple)
 
-        if owner_signature != self._owner_signature:
-            changed_rows: list[int] = []
-            for row_idx, req_id in enumerate(req_ids_tuple):
-                if self.owner_req_ids[row_idx] != req_id:
-                    self.owner_req_ids[row_idx] = req_id
-                    self.owner_generations[row_idx] += 1
-                    changed_rows.append(row_idx)
-            for row_idx in range(num_reqs, self.max_num_reqs):
-                if self.owner_req_ids[row_idx] is not None:
-                    self.owner_req_ids[row_idx] = None
-                    self.owner_generations[row_idx] += 1
-                    changed_rows.append(row_idx)
-            self._invalidate_rows(changed_rows)
-            self._owner_signature = owner_signature
+        changed_rows: list[int] = []
+        for row_idx in range(self.max_num_reqs):
+            req_id = req_ids_tuple[row_idx] if row_idx < num_reqs else None
+            if self.owner_req_ids[row_idx] != req_id:
+                self.owner_req_ids[row_idx] = req_id
+                changed_rows.append(row_idx)
+        self._invalidate_rows(changed_rows)
 
-        self.active_num_reqs = num_reqs
-        self.active_seq_lens_cpu = seq_lens_tuple
-        self.active_metadata_block_tables = self.metadata_block_tables[:num_reqs]
-        self._active_ready = True
-        return QuestBatchPreparedMetadata(
-            metadata_block_tables=self.active_metadata_block_tables,
-            ready=True,
+        return QuestBatchMetadata(
+            _manager=self,
+            quest_enabled_for_batch=True,
             batch_size=num_reqs,
+            _seq_lens_cpu=seq_lens_tuple,
+            _seq_lens=seq_lens[:num_reqs],
+            _metadata_block_tables=self.metadata_block_tables[:num_reqs],
         )
 
-    def get_layer(self, layer_name: str) -> QuestLayerPreparedMetadata:
-        if not self._active_ready:
-            return QuestLayerPreparedMetadata()
+    def _refresh_layer_after_cache_update(
+        self,
+        batch_metadata: QuestBatchMetadata,
+        *,
+        layer_name: str,
+        k_cache: torch.Tensor | None,
+        block_tables: torch.Tensor | None,
+    ) -> None:
+        if not batch_metadata.quest_enabled_for_batch:
+            return
         layer_metadata = self.layers.get(layer_name)
-        if layer_metadata is None:
-            return QuestLayerPreparedMetadata()
-        return QuestLayerPreparedMetadata(
-            layer_metadata=layer_metadata,
-            metadata_block_tables=self.active_metadata_block_tables,
+        if (
+            layer_metadata is None
+            or k_cache is None
+            or block_tables is None
+            or batch_metadata._metadata_block_tables is None
+        ):
+            return
+
+        if not layer_metadata.prepare(batch_metadata):
+            return
+
+        batch_size = batch_metadata.batch_size
+        quest_prefill_metadata(
+            k_cache=k_cache,
+            block_tables=block_tables[:batch_size],
+            refresh_start_seq_lens=layer_metadata.refresh_start_seq_lens[:batch_size],
+            refresh_seq_lens=layer_metadata.refresh_seq_lens[:batch_size],
+            metadata_block_tables=batch_metadata._metadata_block_tables,
             maxblocks=layer_metadata.maxblocks,
             minblocks=layer_metadata.minblocks,
-            ready=True,
-            batch_size=self.active_num_reqs,
         )
+        layer_metadata.commit(batch_metadata)
+
+    def _get_sparse_decode_inputs(
+        self,
+        batch_metadata: QuestBatchMetadata,
+        *,
+        layer_name: str,
+        block_table_width: int,
+    ) -> QuestSparseDecodeInputs | None:
+        if (
+            not batch_metadata.quest_enabled_for_batch
+            or batch_metadata.batch_size <= 0
+            or block_table_width <= 0
+            or batch_metadata._metadata_block_tables is None
+            or batch_metadata._seq_lens is None
+        ):
+            return None
+
+        layer_metadata = self.layers.get(layer_name)
+        if layer_metadata is None:
+            return None
+
+        selected_k = min(self.topk_pages, block_table_width)
+        if selected_k <= 0:
+            return None
+
+        return QuestSparseDecodeInputs(
+            batch_size=batch_metadata.batch_size,
+            selected_k=selected_k,
+            rounded_selected_k=cdiv(selected_k, QUEST_INDEX_ALIGNMENT) * QUEST_INDEX_ALIGNMENT,
+            metadata_block_tables=batch_metadata._metadata_block_tables,
+            seq_lens=batch_metadata._seq_lens,
+            maxblocks=layer_metadata.maxblocks,
+            minblocks=layer_metadata.minblocks,
+        )
+
+    @staticmethod
+    def _should_use_sparse_decode(
+        seq_lens: torch.Tensor | np.ndarray,
+        batch_size: int,
+        selected_blocks: int,
+    ) -> bool:
+        if batch_size <= 0 or selected_blocks <= 0:
+            return False
+
+        seq_lens_tensor = seq_lens[:batch_size]
+        if not isinstance(seq_lens_tensor, torch.Tensor):
+            seq_lens_tensor = torch.as_tensor(seq_lens_tensor)
+
+        total_blocks = torch.div(
+            seq_lens_tensor + QUEST_PAGE_SIZE - 1,
+            QUEST_PAGE_SIZE,
+            rounding_mode="floor",
+        )
+        total_blocks = total_blocks[total_blocks > 0]
+        if total_blocks.numel() == 0:
+            return False
+
+        selected_blocks_per_req = torch.clamp(total_blocks, max=selected_blocks)
+        avg_selected_ratio = (selected_blocks_per_req.float() / total_blocks.float()).mean()
+        return bool((avg_selected_ratio < QUEST_SPARSE_SELECTED_BLOCK_RATIO_THRESHOLD).item())
 
 
 def _get_max_num_metadata_blocks_per_req(model_config: Any, max_encoder_len: int | None) -> int:
     quest_max_model_len = max(model_config.max_model_len, max_encoder_len or 0)
     return cdiv(cdiv(quest_max_model_len, QUEST_PAGE_SIZE), QUEST_PAGE_SIZE)
-
-
-def attach_layer_metadata(attn_metadata: Any, layer_name: str) -> Any:
-    manager = getattr(attn_metadata, "quest_manager", None)
-    if manager is None:
-        return attn_metadata
-
-    prepared_metadata = manager.get_layer(layer_name)
-    if not prepared_metadata.ready:
-        return attn_metadata
-
-    attn_metadata_layer = copy(attn_metadata)
-    attn_metadata_layer.quest_layer_metadata = prepared_metadata.layer_metadata
-    attn_metadata_layer.quest_metadata_block_tables = prepared_metadata.metadata_block_tables
-    attn_metadata_layer.quest_refresh_start_seq_lens = prepared_metadata.refresh_start_seq_lens
-    attn_metadata_layer.quest_refresh_seq_lens = prepared_metadata.refresh_seq_lens
-    attn_metadata_layer.quest_refresh_required = prepared_metadata.refresh_required
-    attn_metadata_layer.quest_maxblocks = prepared_metadata.maxblocks
-    attn_metadata_layer.quest_minblocks = prepared_metadata.minblocks
-    attn_metadata_layer.quest_ready = prepared_metadata.ready
-    return attn_metadata_layer
-
-
-def prepare_attached_layer_metadata(attn_metadata: Any) -> Any:
-    manager = getattr(attn_metadata, "quest_manager", None)
-    layer_metadata = getattr(attn_metadata, "quest_layer_metadata", None)
-    if manager is None or layer_metadata is None:
-        return attn_metadata
-
-    prepared_metadata = layer_metadata.prepare(manager)
-    if not prepared_metadata.ready:
-        return attn_metadata
-
-    attn_metadata.quest_metadata_block_tables = prepared_metadata.metadata_block_tables
-    attn_metadata.quest_refresh_start_seq_lens = prepared_metadata.refresh_start_seq_lens
-    attn_metadata.quest_refresh_seq_lens = prepared_metadata.refresh_seq_lens
-    attn_metadata.quest_refresh_required = prepared_metadata.refresh_required
-    attn_metadata.quest_maxblocks = prepared_metadata.maxblocks
-    attn_metadata.quest_minblocks = prepared_metadata.minblocks
-    attn_metadata.quest_ready = prepared_metadata.ready
-    return attn_metadata
