@@ -100,50 +100,6 @@ class QuestBatchMetadataState:
         )
         self.refresh_seq_lens_cpu = self.refresh_seq_lens_cpu_tensor.numpy()
 
-    def clear_row(self, row_idx: int) -> None:
-        self.owner_req_ids[row_idx] = None
-        self.valid_tokens[row_idx] = 0
-        self.refresh_start_seq_lens_cpu[row_idx] = 0
-        self.refresh_seq_lens_cpu[row_idx] = 0
-
-    def reset_all(self) -> None:
-        self.owner_req_ids[:] = [None] * len(self.owner_req_ids)
-        self.valid_tokens.fill(0)
-        self.refresh_start_seq_lens_cpu.fill(0)
-        self.refresh_seq_lens_cpu.fill(0)
-
-    def swap_rows(self, row_idx_a: int, row_idx_b: int) -> None:
-        if row_idx_a == row_idx_b:
-            return
-
-        self.owner_req_ids[row_idx_a], self.owner_req_ids[row_idx_b] = (
-            self.owner_req_ids[row_idx_b],
-            self.owner_req_ids[row_idx_a],
-        )
-        self.valid_tokens[row_idx_a], self.valid_tokens[row_idx_b] = (
-            self.valid_tokens[row_idx_b],
-            self.valid_tokens[row_idx_a],
-        )
-        self.refresh_start_seq_lens_cpu[row_idx_a], self.refresh_start_seq_lens_cpu[row_idx_b] = (
-            self.refresh_start_seq_lens_cpu[row_idx_b],
-            self.refresh_start_seq_lens_cpu[row_idx_a],
-        )
-        self.refresh_seq_lens_cpu[row_idx_a], self.refresh_seq_lens_cpu[row_idx_b] = (
-            self.refresh_seq_lens_cpu[row_idx_b],
-            self.refresh_seq_lens_cpu[row_idx_a],
-        )
-
-        metadata_blocks_tmp = self.metadata_block_tables[row_idx_a].clone()
-        self.metadata_block_tables[row_idx_a].copy_(self.metadata_block_tables[row_idx_b])
-        self.metadata_block_tables[row_idx_b].copy_(metadata_blocks_tmp)
-
-    def move_row(self, src_idx: int, dst_idx: int) -> None:
-        if src_idx == dst_idx:
-            return
-
-        self.swap_rows(src_idx, dst_idx)
-        self.clear_row(src_idx)
-
     def prepare(
         self,
         num_reqs: int,
