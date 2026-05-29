@@ -482,6 +482,11 @@ class NPUModelRunner(GPUModelRunner):
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+        self.quest_decode_metadata = quest_decode.QuestDecodeMetadataManager(
+            max_num_reqs=self.max_num_reqs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -2021,8 +2026,6 @@ class NPUModelRunner(GPUModelRunner):
                         for aux_hidden_states_pcp in aux_hidden_states
                     ]
 
-            quest_decode.commit_batch_metadata(self.input_batch, self.input_batch.num_reqs)
-
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -2877,7 +2880,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
-            quest_batch_metadata=self.input_batch.quest_metadata,
+            quest_manager=self.quest_decode_metadata,
             quest_req_ids=self.input_batch.req_ids[:num_reqs],
         )
 
@@ -3468,7 +3471,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-        quest_decode.initialize_metadata(
+        self.quest_decode_metadata.initialize(
             vllm_config=self.vllm_config,
             ascend_config=self.ascend_config,
             model_config=self.model_config,
@@ -3476,7 +3479,6 @@ class NPUModelRunner(GPUModelRunner):
             max_num_reqs=self.max_num_reqs,
             device=self.device,
             use_sparse=self.use_sparse,
-            input_batch=self.input_batch,
             kv_caches=kv_caches,
             shared_kv_cache_layers=self.shared_kv_cache_layers,
         )

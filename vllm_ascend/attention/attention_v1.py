@@ -17,6 +17,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 import torch
 import torch_npu
@@ -51,8 +52,9 @@ from vllm_ascend.attention.quest_decode import (
     QUEST_HEAD_SIZE,
     QUEST_INDEX_ALIGNMENT,
     QUEST_PAGE_SIZE,
-    attach_layer_tensors,
+    attach_layer_metadata,
     get_quest_decode_config,
+    prepare_attached_layer_metadata,
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -237,6 +239,8 @@ class AscendMetadata:
     quest_seq_lens: torch.Tensor | None = None
     quest_maxblocks: torch.Tensor | None = None
     quest_minblocks: torch.Tensor | None = None
+    quest_manager: Any = None
+    quest_layer_metadata: Any = None
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -358,14 +362,31 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
-        quest_metadata_block_tables = common_attn_metadata.quest_metadata_block_tables
-        quest_batch_size = 0 if quest_metadata_block_tables is None else quest_metadata_block_tables.shape[0]
+        quest_manager = common_attn_metadata.quest_manager
+        quest_req_ids = common_attn_metadata.quest_req_ids
+        quest_batch_prepared_metadata = None
+        if quest_manager is not None:
+            quest_batch_prepared_metadata = quest_manager.prepare_batch(
+                num_reqs=0 if quest_req_ids is None else len(quest_req_ids),
+                req_ids=quest_req_ids,
+                seq_lens_cpu=seq_lens_for_quest_sparse_decode,
+                attn_state=attn_state,
+                max_query_len=common_attn_metadata.max_query_len,
+            )
+        quest_metadata_block_tables = (
+            None if quest_batch_prepared_metadata is None else quest_batch_prepared_metadata.metadata_block_tables
+        )
+        quest_ready = False if quest_batch_prepared_metadata is None else quest_batch_prepared_metadata.ready
+        quest_batch_size = 0 if quest_batch_prepared_metadata is None else quest_batch_prepared_metadata.batch_size
         seq_lens_list = seq_lens.tolist()
         quest_selected_blocks = min(self.quest_topk_pages, block_table.shape[1]) if block_table is not None else 0
-        quest_sparse_decode = self._should_use_quest_sparse_decode(
-            seq_lens_for_quest_sparse_decode,
-            quest_batch_size,
-            quest_selected_blocks,
+        quest_sparse_decode = (
+            quest_ready
+            and self._should_use_quest_sparse_decode(
+                seq_lens_for_quest_sparse_decode,
+                quest_batch_size,
+                quest_selected_blocks,
+            )
         )
 
         attn_metadata = AscendMetadata(
@@ -387,20 +408,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             model_runner_type=self.model_config.runner_type,
             kvcomp_metadata=common_attn_metadata.kvcomp_metadata,
             quest_metadata_block_tables=quest_metadata_block_tables,
-            quest_refresh_start_seq_lens=(
-                common_attn_metadata.quest_refresh_start_seq_lens[:quest_batch_size]
-                if common_attn_metadata.quest_refresh_start_seq_lens is not None and quest_batch_size > 0
-                else None
-            ),
-            quest_refresh_seq_lens=(
-                common_attn_metadata.quest_refresh_seq_lens[:quest_batch_size]
-                if common_attn_metadata.quest_refresh_seq_lens is not None and quest_batch_size > 0
-                else None
-            ),
-            quest_refresh_required=common_attn_metadata.quest_refresh_required,
-            quest_ready=common_attn_metadata.quest_ready,
+            quest_ready=quest_ready,
             quest_sparse_decode=quest_sparse_decode,
             quest_seq_lens=common_attn_metadata.seq_lens[:quest_batch_size] if quest_batch_size > 0 else None,
+            quest_manager=quest_manager,
         )
         return attn_metadata
 
@@ -472,7 +483,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and self.sliding_window is None
             and sinks is None
         )
-        self.quest_layer_tensors = None
         self.is_kv_producer = (
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
@@ -497,6 +507,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and attn_metadata.quest_seq_lens is not None
             and attn_metadata.quest_maxblocks is not None
             and attn_metadata.quest_minblocks is not None
+            and attn_metadata.quest_manager is not None
+            and attn_metadata.quest_layer_metadata is not None
         )
 
     @staticmethod
@@ -694,16 +706,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
     ):
-        quest_metadata = forward_context.attn_metadata
+        attn_metadata_map = forward_context.attn_metadata
         quest_graph_ready = (
             not _EXTRA_CTX.is_draft_model
-            and quest_metadata is not None
-            and len(quest_metadata) > 0
+            and attn_metadata_map is not None
+            and len(attn_metadata_map) > 0
             and all(
                 metadata.quest_ready
                 and metadata.quest_sparse_decode
                 and metadata.attn_state == AscendAttentionState.DecodeOnly
-                for metadata in quest_metadata.values()
+                for metadata in attn_metadata_map.values()
             )
         )
         if quest_graph_ready:
@@ -1612,6 +1624,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
                 slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32),
             )
+            prepare_attached_layer_metadata(attn_metadata)
             if self._should_refresh_quest_metadata(attn_metadata):
                 batch_size = attn_metadata.quest_metadata_block_tables.shape[0]
                 quest_prefill_metadata(
@@ -1623,6 +1636,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     maxblocks=attn_metadata.quest_maxblocks,
                     minblocks=attn_metadata.quest_minblocks,
                 )
+                attn_metadata.quest_layer_metadata.commit(attn_metadata.quest_manager, batch_size)
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
         return query, key, value, output
@@ -1684,7 +1698,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)
-        attn_metadata = attach_layer_tensors(attn_metadata, self)
+        attn_metadata = attach_layer_metadata(attn_metadata, layer.layer_name)
 
         # Initialize key_cache and value_cache from kv_cache if not already set.
         # This is needed for DecodeOnly mode where key/value are None but we still
@@ -1747,7 +1761,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)
-        attn_metadata = attach_layer_tensors(attn_metadata, self)
+        attn_metadata = attach_layer_metadata(attn_metadata, layer.layer_name)
 
         self._prepare_c8_scales(layer, query.device)
         float_key, float_value = None, None

@@ -186,51 +186,15 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
     kvcomp_metadata: KVCompMetaData | None = None
 
-    # Active-row QUEST metadata block mapping used by the optional sparse
-    # decode path.
-    quest_metadata_block_tables: torch.Tensor | None = None
-
-    # Per-row refresh ranges for the metadata kernel. Rows with empty ranges
-    # are skipped and retain their existing metadata.
-    quest_refresh_start_seq_lens: torch.Tensor | None = None
-    quest_refresh_seq_lens: torch.Tensor | None = None
-    quest_refresh_required: bool = False
-
-    # Model/batch-level gate for the optional QUEST sparse decode path.
-    quest_ready: bool = False
-
-    # Internal QUEST batch state. When present, it prepares the public QUEST
-    # fields above during construction.
-    quest_batch_metadata: Any = None
+    # Opaque QUEST sparse-decode manager and active request ids. The manager
+    # owns all refresh bookkeeping and per-layer metadata tensors.
+    quest_manager: Any = None
     quest_req_ids: list[str | None] | None = None
 
     def __post_init__(self) -> None:
         super_post_init = getattr(super(), "__post_init__", None)
         if super_post_init is not None:
             super_post_init()
-
-        if (
-            self.quest_batch_metadata is None
-            or self.quest_req_ids is None
-            or getattr(self.attn_state, "name", None) != "DecodeOnly"
-            or self.max_query_len != 1
-        ):
-            return
-
-        seq_lens_cpu = self._seq_lens_cpu if self._seq_lens_cpu is not None else self.seq_lens_cpu
-        if seq_lens_cpu is None:
-            return
-
-        prepared_metadata = self.quest_batch_metadata.prepare(
-            len(self.quest_req_ids),
-            self.quest_req_ids,
-            seq_lens_cpu,
-        )
-        self.quest_metadata_block_tables = prepared_metadata.metadata_block_tables
-        self.quest_refresh_start_seq_lens = prepared_metadata.refresh_start_seq_lens
-        self.quest_refresh_seq_lens = prepared_metadata.refresh_seq_lens
-        self.quest_refresh_required = prepared_metadata.refresh_required
-        self.quest_ready = prepared_metadata.ready
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -265,21 +229,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound[:num_actual_reqs]
             if self.seq_lens_cpu_upper_bound is not None
             else None,
-            quest_metadata_block_tables=(
-                self.quest_metadata_block_tables[:num_actual_reqs]
-                if self.quest_metadata_block_tables is not None
-                else None
-            ),
-            quest_refresh_start_seq_lens=(
-                self.quest_refresh_start_seq_lens[:num_actual_reqs]
-                if self.quest_refresh_start_seq_lens is not None
-                else None
-            ),
-            quest_refresh_seq_lens=(
-                self.quest_refresh_seq_lens[:num_actual_reqs] if self.quest_refresh_seq_lens is not None else None
-            ),
-            quest_refresh_required=self.quest_refresh_required,
-            quest_ready=self.quest_ready,
+            quest_manager=self.quest_manager,
+            quest_req_ids=self.quest_req_ids[:num_actual_reqs] if self.quest_req_ids is not None else None,
             max_seq_len=self.max_seq_len,
             # Propagate parent-class fields so the unpadded view is a
             # faithful sub-batch of the original. Missing any of these
