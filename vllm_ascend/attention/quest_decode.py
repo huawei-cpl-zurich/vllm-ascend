@@ -75,7 +75,7 @@ class QuestBatchMetadata:
         k_cache: torch.Tensor | None,
         block_tables: torch.Tensor | None,
     ) -> None:
-        if not self.quest_enabled_for_batch or self._manager is None:
+        if self._manager is None:
             return
         self._manager._refresh_layer_after_cache_update(
             self,
@@ -395,8 +395,7 @@ class QuestDecodeMetadataManager:
             return QuestBatchMetadata()
 
         selected_blocks = min(self.topk_pages, block_table_width)
-        if not self._should_use_sparse_decode(seq_lens_cpu, num_reqs, selected_blocks):
-            return QuestBatchMetadata()
+        sparse_decode_enabled = self._should_use_sparse_decode(seq_lens_cpu, num_reqs, selected_blocks)
 
         req_ids_tuple = tuple(req_ids[:num_reqs])
         seq_lens_tuple = tuple(int(seq_lens_cpu[row_idx]) for row_idx in range(num_reqs))
@@ -411,12 +410,12 @@ class QuestDecodeMetadataManager:
 
         return QuestBatchMetadata(
             _manager=self,
-            quest_enabled_for_batch=True,
+            quest_enabled_for_batch=sparse_decode_enabled,
             batch_size=num_reqs,
             _seq_lens_cpu=seq_lens_tuple,
             _seq_lens=seq_lens[:num_reqs],
             _metadata_block_tables=self.metadata_block_tables[:num_reqs],
-            _selected_k=selected_blocks,
+            _selected_k=selected_blocks if sparse_decode_enabled else 0,
         )
 
     def _refresh_layer_after_cache_update(
@@ -427,7 +426,7 @@ class QuestDecodeMetadataManager:
         k_cache: torch.Tensor | None,
         block_tables: torch.Tensor | None,
     ) -> None:
-        if not batch_metadata.quest_enabled_for_batch:
+        if batch_metadata.batch_size <= 0:
             return
         layer_metadata = self.layers.get(layer_name)
         if (
