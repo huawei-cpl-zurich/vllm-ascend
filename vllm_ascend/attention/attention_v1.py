@@ -223,7 +223,7 @@ class AscendMetadata:
 
     kvcomp_metadata: KVCompMetaData | None = None
 
-    # Opaque QUEST active-batch handle.
+    # QUEST active-batch handle.
     quest_metadata: QuestBatchMetadata = field(default_factory=QuestBatchMetadata)
 
 
@@ -1607,8 +1607,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_output_buffer = output_padded if output_padded is not None else output
         quest_inputs = None
         if quest_metadata.quest_enabled_for_batch:
-            block_table_width = 0 if attn_metadata.block_tables is None else attn_metadata.block_tables.shape[1]
-            quest_inputs = quest_metadata.get_sparse_decode_inputs(layer.layer_name, block_table_width)
+            quest_inputs = quest_metadata.get_sparse_decode_inputs(layer.layer_name)
         if quest_inputs is not None:
             attn_output = self.forward_quest_attention(query, key, value, attn_metadata, attn_output_buffer, quest_inputs)
         else:
