@@ -66,7 +66,6 @@ class QuestBatchMetadata:
     _seq_lens_cpu: tuple[int, ...] = ()
     _seq_lens: torch.Tensor | None = None
     _metadata_block_tables: torch.Tensor | None = None
-    _selected_k: int = 0
 
     def refresh_layer_after_cache_update(
         self,
@@ -87,12 +86,14 @@ class QuestBatchMetadata:
     def get_sparse_decode_inputs(
         self,
         layer_name: str,
+        block_table_width: int,
     ) -> QuestSparseDecodeInputs | None:
         if not self.quest_enabled_for_batch or self._manager is None:
             return None
         return self._manager._get_sparse_decode_inputs(
             self,
             layer_name=layer_name,
+            block_table_width=block_table_width,
         )
 
 
@@ -112,7 +113,14 @@ class _QuestLayerMetadata:
         self.layer_name = layer_name
         self.maxblocks = maxblocks
         self.minblocks = minblocks
-        self.valid_tokens = np.full(max_num_reqs, -1, dtype=np.int32)
+        self.valid_tokens_cpu_tensor = torch.full(
+            (max_num_reqs,),
+            -1,
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=False,
+        )
+        self.valid_tokens = self.valid_tokens_cpu_tensor.numpy()
         self.refresh_start_seq_lens = torch.zeros((max_num_reqs,), dtype=torch.int32, device=device)
         self.refresh_start_seq_lens_cpu_tensor = torch.zeros(
             (max_num_reqs,),
@@ -203,7 +211,7 @@ class QuestDecodeMetadataManager:
         self.ready = False
         self.topk_pages = 0
 
-    def _reset(self) -> None:
+    def clear(self) -> None:
         self.metadata_block_tables = None
         self.max_num_metadata_blocks_per_req = 0
         self.owner_req_ids = [None] * self.max_num_reqs
@@ -213,7 +221,7 @@ class QuestDecodeMetadataManager:
 
     def _disable(self, reason: str) -> None:
         logger.warning_once(f"QUEST decode is disabled: {reason}")
-        self._reset()
+        self.clear()
 
     def _invalidate_rows(self, row_indices: Sequence[int]) -> None:
         if not row_indices:
@@ -240,7 +248,7 @@ class QuestDecodeMetadataManager:
         shared_kv_cache_layers: dict[str, str],
     ) -> None:
         """Validate and allocate all QUEST metadata for a loaded model."""
-        self._reset()
+        self.clear()
         self.max_num_reqs = max_num_reqs
         self.device = device
         self.owner_req_ids = [None] * max_num_reqs
@@ -416,7 +424,6 @@ class QuestDecodeMetadataManager:
             _seq_lens_cpu=seq_lens_tuple,
             _seq_lens=seq_lens[:num_reqs],
             _metadata_block_tables=self.metadata_block_tables[:num_reqs],
-            _selected_k=selected_blocks,
         )
 
     def _refresh_layer_after_cache_update(
@@ -458,11 +465,12 @@ class QuestDecodeMetadataManager:
         batch_metadata: QuestBatchMetadata,
         *,
         layer_name: str,
+        block_table_width: int,
     ) -> QuestSparseDecodeInputs | None:
         if (
             not batch_metadata.quest_enabled_for_batch
             or batch_metadata.batch_size <= 0
-            or batch_metadata._selected_k <= 0
+            or block_table_width <= 0
             or batch_metadata._metadata_block_tables is None
             or batch_metadata._seq_lens is None
         ):
@@ -472,10 +480,14 @@ class QuestDecodeMetadataManager:
         if layer_metadata is None:
             return None
 
+        selected_k = min(self.topk_pages, block_table_width)
+        if selected_k <= 0:
+            return None
+
         return QuestSparseDecodeInputs(
             batch_size=batch_metadata.batch_size,
-            selected_k=batch_metadata._selected_k,
-            rounded_selected_k=cdiv(batch_metadata._selected_k, QUEST_INDEX_ALIGNMENT) * QUEST_INDEX_ALIGNMENT,
+            selected_k=selected_k,
+            rounded_selected_k=cdiv(selected_k, QUEST_INDEX_ALIGNMENT) * QUEST_INDEX_ALIGNMENT,
             metadata_block_tables=batch_metadata._metadata_block_tables,
             seq_lens=batch_metadata._seq_lens,
             maxblocks=layer_metadata.maxblocks,

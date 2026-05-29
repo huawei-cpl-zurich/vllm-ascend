@@ -186,7 +186,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
     kvcomp_metadata: KVCompMetaData | None = None
 
-    # QUEST sparse-decode manager and active request ids. The manager
+    # Opaque QUEST sparse-decode manager and active request ids. The manager
     # owns all refresh bookkeeping and per-layer metadata tensors.
     quest_manager: Any = None
     quest_req_ids: list[str | None] | None = None
