@@ -1590,10 +1590,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         output_padded = None
         quest_metadata = getattr(attn_metadata, "quest_metadata", None)
-        quest_decode_enabled = (
-            isinstance(quest_metadata, QuestBatchMetadata)
-            and quest_metadata.quest_enabled_for_batch
-        )
+        quest_decode_enabled = isinstance(quest_metadata, QuestBatchMetadata) and quest_metadata.quest_enabled_for_batch
         if key is not None and value is not None:
             output_padded = output
             query, key, value, output_padded = self.reshape_and_cache(
