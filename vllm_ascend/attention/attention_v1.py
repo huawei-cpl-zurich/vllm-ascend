@@ -515,7 +515,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             dtype=torch.int32,
             device=query.device,
         )
-        selected_q_indices = selected_q_indices_buffer[:, :, :quest_inputs.selected_k]
+        selected_q_indices = selected_q_indices_buffer[:, :, : quest_inputs.selected_k]
         workspace = graph_params.workspaces.get(num_tokens)
         if workspace is None:
             workspace = paged_select_attention_get_workspace(
@@ -1591,7 +1591,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         quest_metadata = attn_metadata.quest_metadata
         if key is not None and value is not None:
             output_padded = output
-            query, key, value, output_padded = self.reshape_and_cache(query, key, value, kv_cache, attn_metadata, output)
+            query, key, value, output_padded = self.reshape_and_cache(
+                query, key, value, kv_cache, attn_metadata, output
+            )
             if quest_metadata.quest_enabled_for_batch:
                 quest_metadata.refresh_layer_after_cache_update(
                     layer_name=layer.layer_name,
@@ -1609,7 +1611,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if quest_metadata.quest_enabled_for_batch:
             quest_inputs = quest_metadata.get_sparse_decode_inputs(layer.layer_name)
         if quest_inputs is not None:
-            attn_output = self.forward_quest_attention(query, key, value, attn_metadata, attn_output_buffer, quest_inputs)
+            attn_output = self.forward_quest_attention(
+                query, key, value, attn_metadata, attn_output_buffer, quest_inputs
+            )
         else:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, attn_output_buffer)
         output[:num_tokens] = attn_output[:num_tokens]
