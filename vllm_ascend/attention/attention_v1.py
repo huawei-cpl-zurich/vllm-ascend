@@ -1590,13 +1590,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         output_padded = None
         quest_metadata = getattr(attn_metadata, "quest_metadata", None)
-        quest_decode_enabled = isinstance(quest_metadata, QuestBatchMetadata) and quest_metadata.quest_enabled_for_batch
         if key is not None and value is not None:
             output_padded = output
             query, key, value, output_padded = self.reshape_and_cache(
                 query, key, value, kv_cache, attn_metadata, output
             )
-            if quest_decode_enabled:
+            if isinstance(quest_metadata, QuestBatchMetadata) and quest_metadata.quest_enabled_for_batch:
                 quest_metadata.refresh_layer_after_cache_update(
                     layer_name=layer.layer_name,
                     k_cache=self.key_cache,
@@ -1610,7 +1609,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         attn_output_buffer = output_padded if output_padded is not None else output
         quest_inputs = None
-        if quest_decode_enabled:
+        if isinstance(quest_metadata, QuestBatchMetadata) and quest_metadata.quest_enabled_for_batch:
             quest_inputs = quest_metadata.get_sparse_decode_inputs(layer.layer_name)
         if quest_inputs is not None:
             attn_output = self.forward_quest_attention(
