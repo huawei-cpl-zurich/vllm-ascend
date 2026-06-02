@@ -69,9 +69,9 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.select_attention import (
-    paged_select_attention,
     paged_select_attention_get_workspace,
     paged_select_attention_graph_out,
+    paged_select_attention_out,
     quest_block_select_paged,
     quest_block_select_paged_out,
 )
@@ -472,7 +472,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             k=quest_inputs.selected_k,
             tokens_since_metadata_update=0,
         )
-        attn_output = paged_select_attention(
+        quest_output = output[:batch_size]
+        paged_select_attention_out(
             query,
             key,
             value,
@@ -484,8 +485,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             self.scale,
             self.num_kv_heads,
             block_size,
+            quest_output,
         )
-        output[:batch_size] = attn_output[:batch_size]
         return output
 
     def full_graph_quest(
@@ -1607,16 +1608,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output[:num_tokens] = attn_output[:num_tokens]
             return output
 
-        attn_output_buffer = output_padded if output_padded is not None else output
+        # Quest sparse decode path
         quest_inputs = None
         if isinstance(quest_metadata, QuestBatchMetadata) and quest_metadata.quest_enabled_for_batch:
             quest_inputs = quest_metadata.get_sparse_decode_inputs(layer.layer_name)
-        if quest_inputs is not None:
-            attn_output = self.forward_quest_attention(
-                query, key, value, attn_metadata, attn_output_buffer, quest_inputs
-            )
+            if quest_inputs is not None:
+                _ = self.forward_quest_attention( # quest attention writes in-place
+                    query, key, value, attn_metadata, output, quest_inputs
+                )
+                return output
+
+        if output_padded is not None:
+            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
         else:
-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, attn_output_buffer)
+            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
 

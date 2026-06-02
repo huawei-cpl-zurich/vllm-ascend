@@ -111,6 +111,37 @@ def paged_select_attention(
     )
 
 
+def paged_select_attention_out(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    actual_seq_lengths: list[int],
+    actual_seq_lengths_kv: list[int],
+    block_table: torch.Tensor,
+    selected_kv_indices: torch.Tensor,
+    num_heads: int,
+    scale_value: float,
+    num_key_value_heads: int,
+    block_size: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    enable_custom_op()
+    return torch.ops._C_ascend.npu_paged_select_attention_out(
+        query,
+        key,
+        value,
+        actual_seq_lengths,
+        actual_seq_lengths_kv,
+        block_table,
+        selected_kv_indices,
+        num_heads,
+        scale_value,
+        num_key_value_heads,
+        block_size,
+        out,
+    )
+
+
 def paged_select_attention_get_workspace(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -177,6 +208,7 @@ def paged_select_attention_graph_out(
 
 __all__ = [
     "paged_select_attention",
+    "paged_select_attention_out",
     "paged_select_attention_get_workspace",
     "paged_select_attention_graph_out",
     "quest_prefill_metadata",
