@@ -15,7 +15,8 @@
 #
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from contextvars import ContextVar
+from dataclasses import dataclass, field, fields as dataclass_fields
 from typing import Any
 
 import numpy as np
@@ -24,32 +25,54 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import AttentionLayer, AttentionType
+from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import AscendConfig, QuestDecodeConfig
-from vllm_ascend.attention.utils import enable_cp
-from vllm_ascend.ops.select_attention import quest_prefill_metadata
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionBackendImpl,
+    AscendAttentionMetadataBuilder,
+    AscendAttentionState,
+    AscendMetadata,
+)
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, enable_cp
+from vllm_ascend.ops.select_attention import (
+    paged_select_attention_out,
+    quest_block_select_paged,
+    quest_prefill_metadata,
+)
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 QUEST_PAGE_SIZE = 128
 QUEST_HEAD_SIZE = 128
 QUEST_MAX_METADATA_BLOCKS_PER_REQ = 6
-QUEST_INDEX_ALIGNMENT = 8
 QUEST_SPARSE_SELECTED_BLOCK_RATIO_THRESHOLD = 0.5
 
 
 def get_quest_decode_config(vllm_config: VllmConfig) -> QuestDecodeConfig:
-    """Resolve QUEST config without requiring the global AscendConfig singleton."""
+    """Parse QUEST config from vLLM config before the AscendConfig singleton exists.
+    Platform backend selection needs this early view to route dense attention through QUEST.
+    """
     additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, Mapping):
         return QuestDecodeConfig()
     return QuestDecodeConfig(additional_config.get("quest_decode_config"))
 
 
+def _get_max_num_metadata_blocks_per_req(model_config: Any, max_encoder_len: int | None) -> int:
+    """Compute the per-request QUEST metadata table width for the largest context.
+    This bounds the metadata block table allocation made once per model runner.
+    """
+    quest_max_model_len = max(model_config.max_model_len, max_encoder_len or 0)
+    return cdiv(cdiv(quest_max_model_len, QUEST_PAGE_SIZE), QUEST_PAGE_SIZE)
+
+
 @dataclass(frozen=True)
 class QuestSparseDecodeInputs:
     batch_size: int
     selected_k: int
-    rounded_selected_k: int
     metadata_block_tables: torch.Tensor
     seq_lens: torch.Tensor
     maxblocks: torch.Tensor
@@ -67,18 +90,27 @@ class QuestBatchMetadata:
     _seq_lens: torch.Tensor | None = None
     _metadata_block_tables: torch.Tensor | None = None
     _selected_k: int = 0
-    _refresh_layer_ids: set[int] = field(default_factory=set)
 
-    def refresh_layer_after_cache_update(
+    @property
+    def is_enabled(self) -> bool:
+        """Return whether this batch can call back into the QUEST manager.
+        Both the batch-level sparse decision and manager reference must be present.
+        """
+        return self.quest_enabled_for_batch and self._manager is not None
+
+    def refresh_layer_after_kv_cache_update(
         self,
         *,
         layer_name: str,
         k_cache: torch.Tensor | None,
         block_tables: torch.Tensor | None,
-    ) -> None:
-        if not self.quest_enabled_for_batch or self._manager is None:
-            return
-        self._manager._refresh_layer_after_cache_update(
+    ) -> bool:
+        """Refresh one layer's QUEST metadata after KV cache writes.
+        The boolean result tells the attention impl whether sparse decode may proceed.
+        """
+        if not self.is_enabled:
+            return False
+        return self._manager._refresh_layer_after_kv_cache_update(
             self,
             layer_name=layer_name,
             k_cache=k_cache,
@@ -89,12 +121,22 @@ class QuestBatchMetadata:
         self,
         layer_name: str,
     ) -> QuestSparseDecodeInputs | None:
-        if not self.quest_enabled_for_batch or self._manager is None:
+        """Build sparse decode kernel inputs for one layer in this active batch.
+        The manager owns the per-layer tensors, so this wrapper keeps callers batch-centric.
+        """
+        if not self.is_enabled:
             return None
         return self._manager._get_sparse_decode_inputs(
             self,
             layer_name=layer_name,
         )
+
+
+@dataclass
+class QuestAttentionMetadata(AscendMetadata):
+    """Ascend attention metadata plus the QUEST active-batch handle."""
+
+    quest_metadata: QuestBatchMetadata = field(default_factory=QuestBatchMetadata)
 
 
 class _QuestLayerMetadata:
@@ -103,99 +145,85 @@ class _QuestLayerMetadata:
     def __init__(
         self,
         *,
-        layer_name: str,
         max_num_reqs: int,
         maxblocks: torch.Tensor,
         minblocks: torch.Tensor,
         device: torch.device,
         pin_memory: bool,
     ) -> None:
-        self.layer_name = layer_name
+        """Allocate the min/max metadata tensors and freshness trackers for one layer.
+        These buffers let QUEST refresh only the KV pages whose metadata is stale.
+        """
         self.maxblocks = maxblocks
         self.minblocks = minblocks
-        self.valid_tokens = np.full(max_num_reqs, -1, dtype=np.int32)
-        self.refresh_start_seq_lens = torch.zeros((max_num_reqs,), dtype=torch.int32, device=device)
-        self.refresh_start_seq_lens_cpu_tensor = torch.zeros(
-            (max_num_reqs,),
-            device="cpu",
+        self.refresh_start_seq_lens = CpuGpuBuffer(
+            max_num_reqs,
             dtype=torch.int32,
+            device=device,
             pin_memory=pin_memory,
         )
-        self.refresh_start_seq_lens_cpu = self.refresh_start_seq_lens_cpu_tensor.numpy()
-        self.refresh_seq_lens = torch.zeros((max_num_reqs,), dtype=torch.int32, device=device)
-        self.refresh_seq_lens_cpu_tensor = torch.zeros(
-            (max_num_reqs,),
-            device="cpu",
+        self.refresh_start_seq_lens.np.fill(-1)
+        self.refresh_end_seq_lens = CpuGpuBuffer(
+            max_num_reqs,
             dtype=torch.int32,
+            device=device,
             pin_memory=pin_memory,
         )
-        self.refresh_seq_lens_cpu = self.refresh_seq_lens_cpu_tensor.numpy()
 
     def invalidate_rows(self, row_indices: Sequence[int]) -> None:
+        """Mark reused batch rows stale so their metadata is refreshed.
+        Row ownership changes when scheduler slots are reused for different request ids.
+        """
         for row_idx in row_indices:
-            self.valid_tokens[row_idx] = -1
+            self.refresh_start_seq_lens.np[row_idx] = -1
 
-    def prepare(
+    def prepare_refresh_if_needed(
         self,
         batch_metadata: QuestBatchMetadata,
     ) -> bool:
+        """Compute and upload the token ranges that need metadata refresh for this layer.
+        Start lengths are persistent freshness markers, while end lengths are per-call refresh requests.
+        """
         num_reqs = batch_metadata.batch_size
         if num_reqs <= 0:
             return False
 
-        self.refresh_start_seq_lens_cpu[:num_reqs].fill(0)
-        self.refresh_seq_lens_cpu[:num_reqs].fill(0)
+        self.refresh_end_seq_lens.np[:num_reqs].fill(0)
         refresh_required = False
         for row_idx in range(num_reqs):
             seq_len = batch_metadata._seq_lens_cpu[row_idx]
-            valid_tokens = int(self.valid_tokens[row_idx])
-            stale_or_shrunk = valid_tokens < 0 or valid_tokens > seq_len
+            refreshed_seq_len = int(self.refresh_start_seq_lens.np[row_idx])
+            stale_or_shrunk = refreshed_seq_len < 0 or refreshed_seq_len > seq_len
             if stale_or_shrunk:
-                self.refresh_seq_lens_cpu[row_idx] = seq_len
+                self.refresh_start_seq_lens.np[row_idx] = 0
+                refreshed_seq_len = 0
+                self.refresh_end_seq_lens.np[row_idx] = seq_len
             else:
-                crossed_page_boundary = seq_len // QUEST_PAGE_SIZE > valid_tokens // QUEST_PAGE_SIZE
+                crossed_page_boundary = seq_len // QUEST_PAGE_SIZE > refreshed_seq_len // QUEST_PAGE_SIZE
                 if crossed_page_boundary:
-                    self.refresh_start_seq_lens_cpu[row_idx] = (valid_tokens // QUEST_PAGE_SIZE) * QUEST_PAGE_SIZE
-                    self.refresh_seq_lens_cpu[row_idx] = seq_len
-            if self.refresh_seq_lens_cpu[row_idx] > self.refresh_start_seq_lens_cpu[row_idx]:
+                    self.refresh_end_seq_lens.np[row_idx] = seq_len
+            if self.refresh_end_seq_lens.np[row_idx] > refreshed_seq_len:
                 refresh_required = True
 
         if refresh_required:
-            self.refresh_start_seq_lens[:num_reqs].copy_(
-                self.refresh_start_seq_lens_cpu_tensor[:num_reqs],
-                non_blocking=True,
-            )
-            self.refresh_seq_lens[:num_reqs].copy_(
-                self.refresh_seq_lens_cpu_tensor[:num_reqs],
-                non_blocking=True,
-            )
+            self.refresh_start_seq_lens.copy_to_gpu(num_reqs)
+            self.refresh_end_seq_lens.copy_to_gpu(num_reqs)
 
         return refresh_required
 
     def commit(self, batch_metadata: QuestBatchMetadata) -> None:
+        """Record refreshed lengths after the metadata refresh kernel completes.
+        This advances the persistent start markers that later layer visits use for freshness checks.
+        """
         num_reqs = batch_metadata.batch_size
         if num_reqs <= 0:
             return
 
         for row_idx in range(num_reqs):
-            refreshed_seq_len = int(self.refresh_seq_lens_cpu[row_idx])
-            if refreshed_seq_len <= 0:
-                continue
-            self.valid_tokens[row_idx] = refreshed_seq_len
-
-    def is_ready_for_sparse_decode(self, batch_metadata: QuestBatchMetadata) -> bool:
-        num_reqs = batch_metadata.batch_size
-        if num_reqs <= 0:
-            return False
-
-        for row_idx in range(num_reqs):
-            seq_len = batch_metadata._seq_lens_cpu[row_idx]
-            valid_tokens = int(self.valid_tokens[row_idx])
-            if valid_tokens < 0 or valid_tokens > seq_len:
-                return False
-            if seq_len // QUEST_PAGE_SIZE > valid_tokens // QUEST_PAGE_SIZE:
-                return False
-        return True
+            start_seq_len = int(self.refresh_start_seq_lens.np[row_idx])
+            end_seq_len = int(self.refresh_end_seq_lens.np[row_idx])
+            if end_seq_len > start_seq_len:
+                self.refresh_start_seq_lens.np[row_idx] = end_seq_len
 
 
 class QuestDecodeMetadataManager:
@@ -204,156 +232,57 @@ class QuestDecodeMetadataManager:
     def __init__(
         self,
         *,
-        max_num_reqs: int,
-        device: torch.device,
-        pin_memory: bool,
-    ) -> None:
-        self.max_num_reqs = max_num_reqs
-        self.device = device
-        self.pin_memory = pin_memory
-        self.metadata_block_tables: torch.Tensor | None = None
-        self.max_num_metadata_blocks_per_req = 0
-        self.owner_req_ids: list[str | None] = [None] * max_num_reqs
-        self.layers: dict[str, _QuestLayerMetadata] = {}
-        self.ready = False
-        self.topk_pages = 0
-
-    def _reset(self) -> None:
-        self.metadata_block_tables = None
-        self.max_num_metadata_blocks_per_req = 0
-        self.owner_req_ids = [None] * self.max_num_reqs
-        self.layers.clear()
-        self.ready = False
-        self.topk_pages = 0
-
-    def _disable(self, reason: str) -> None:
-        logger.warning_once(f"QUEST decode is disabled: {reason}")
-        self._reset()
-
-    def _invalidate_rows(self, row_indices: Sequence[int]) -> None:
-        if not row_indices:
-            return
-        seen_layers: set[int] = set()
-        for layer_metadata in self.layers.values():
-            layer_id = id(layer_metadata)
-            if layer_id in seen_layers:
-                continue
-            seen_layers.add(layer_id)
-            layer_metadata.invalidate_rows(row_indices)
-
-    def initialize(
-        self,
-        *,
         vllm_config: VllmConfig,
         ascend_config: AscendConfig,
         model_config: Any,
         max_encoder_len: int | None,
         max_num_reqs: int,
         device: torch.device,
+        pin_memory: bool,
         use_sparse: bool,
         kv_caches: dict[str, Any],
         shared_kv_cache_layers: dict[str, str],
     ) -> None:
-        """Validate and allocate all QUEST metadata for a loaded model."""
-        self._reset()
+        """Validate QUEST support and allocate metadata once KV caches exist.
+        The runner creates this manager after KV cache initialization because layer shapes come from caches.
+        """
         self.max_num_reqs = max_num_reqs
         self.device = device
-        self.owner_req_ids = [None] * max_num_reqs
-
-        attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+        self.pin_memory = pin_memory
+        self.metadata_block_tables: torch.Tensor | None = None
+        self.max_num_metadata_blocks_per_req = 0
+        self.owner_req_ids: list[str | None] = [None] * max_num_reqs
+        self.layer_metadata: list[_QuestLayerMetadata] = []
+        self.layer_metadata_by_name: dict[str, _QuestLayerMetadata] = {}
+        self._is_disabled = False
+        self.ready = False
+        self.topk_pages = 0
 
         if not ascend_config.quest_decode_config.enable:
             return
-        self.topk_pages = ascend_config.quest_decode_config.topk_pages
-
-        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
-        if cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs():
-            self._disable(
-                "full graph execution is enabled, but QUEST decode currently requires "
-                "runtime switching between dense and sparse attention paths."
-            )
-            return
-
-        if get_ascend_device_type() not in {AscendDeviceType.A2, AscendDeviceType.A3}:
-            self._disable(
-                "current hardware is unsupported, QUEST decode currently supports only "
-                "Ascend A2/A3 (ascend910b/ascend910_93)."
-            )
-            return
-
-        if vllm_config.kv_transfer_config is not None:
-            self._disable("kv_transfer_config is set, but QUEST decode requires a local KV cache.")
-            return
-        if enable_cp():
-            self._disable("context parallel is enabled, but QUEST decode requires unsharded request metadata.")
-            return
-        if ascend_config.xlite_graph_config.enabled:
-            self._disable(
-                "xLite graph execution is enabled, but QUEST decode only supports the standard v1 decode path."
-            )
-            return
-        if model_config.use_mla:
-            self._disable("MLA attention is enabled, but QUEST decode only supports standard v1 attention.")
-            return
-        if use_sparse:
-            self._disable("sparse attention is enabled, but QUEST decode only supports standard v1 attention.")
-            return
 
         max_num_metadata_blocks_per_req = _get_max_num_metadata_blocks_per_req(model_config, max_encoder_len)
-        if max_num_metadata_blocks_per_req > QUEST_MAX_METADATA_BLOCKS_PER_REQ:
-            self._disable(
-                "the configured max_model_len requires more metadata blocks per request "
-                f"({max_num_metadata_blocks_per_req}) than the kernel limit "
-                f"({QUEST_MAX_METADATA_BLOCKS_PER_REQ})."
-            )
+        is_disabled, disable_reason = self._quest_is_disabled(
+            vllm_config=vllm_config,
+            ascend_config=ascend_config,
+            model_config=model_config,
+            use_sparse=use_sparse,
+            max_num_metadata_blocks_per_req=max_num_metadata_blocks_per_req,
+        )
+        if is_disabled:
+            self._disable(disable_reason)
             return
 
-        base_layer_k_caches: dict[str, torch.Tensor] = {}
-        for layer_name, attn_layer in attn_layers.items():
-            if layer_name in shared_kv_cache_layers:
-                continue
-            if layer_name not in kv_caches:
-                self._disable(f"attention layer {layer_name} does not have a local KV cache.")
-                return
-
-            impl = getattr(attn_layer, "impl", None)
-            if not getattr(impl, "quest_layer_supported", False):
-                self._disable(f"attention layer {layer_name} is not QUEST-compatible.")
-                return
-
-            kv_cache = kv_caches[layer_name]
-            if not isinstance(kv_cache, tuple) or len(kv_cache) < 2:
-                self._disable(f"attention layer {layer_name} does not expose a standard KV cache tuple.")
-                return
-
-            k_cache = kv_cache[0]
-            if not isinstance(k_cache, torch.Tensor) or k_cache.ndim != 4:
-                self._disable(f"attention layer {layer_name} has an unsupported key-cache layout.")
-                return
-            if k_cache.shape[1] != QUEST_PAGE_SIZE or k_cache.shape[-1] != QUEST_HEAD_SIZE:
-                self._disable(
-                    f"attention layer {layer_name} has block_size={k_cache.shape[1]} and "
-                    f"head_size={k_cache.shape[-1]}, but QUEST requires block_size={QUEST_PAGE_SIZE} "
-                    f"and head_size={QUEST_HEAD_SIZE}."
-                )
-                return
-
-            base_layer_k_caches[layer_name] = k_cache
-
-        for layer_name, target_layer_name in shared_kv_cache_layers.items():
-            if layer_name not in attn_layers:
-                continue
-            if target_layer_name not in base_layer_k_caches:
-                self._disable(
-                    f"attention layer {layer_name} shares KV cache with {target_layer_name}, "
-                    "but the target layer is not QUEST-compatible."
-                )
-                return
-
-        if not base_layer_k_caches:
-            self._disable("no compatible v1 attention layers were found with block_size 128 and head_size 128.")
+        layer_inputs = self._collect_quest_k_caches(
+            vllm_config=vllm_config,
+            kv_caches=kv_caches,
+            shared_kv_cache_layers=shared_kv_cache_layers,
+        )
+        if layer_inputs is None:
             return
+        base_layers, shared_layers = layer_inputs
 
+        self.topk_pages = ascend_config.quest_decode_config.topk_pages
         self.max_num_metadata_blocks_per_req = max_num_metadata_blocks_per_req
         num_metadata_blocks = max_num_reqs * max_num_metadata_blocks_per_req
         self.metadata_block_tables = torch.arange(
@@ -363,26 +292,167 @@ class QuestDecodeMetadataManager:
         ).view(max_num_reqs, max_num_metadata_blocks_per_req)
 
         base_layer_metadata: dict[str, _QuestLayerMetadata] = {}
-        for layer_name, k_cache in base_layer_k_caches.items():
+        for layer_name, k_cache in base_layers.items():
             metadata_shape = (num_metadata_blocks, QUEST_PAGE_SIZE, k_cache.shape[2], QUEST_HEAD_SIZE)
-            maxblocks = torch.zeros(metadata_shape, dtype=k_cache.dtype, device=device)
             layer_metadata = _QuestLayerMetadata(
-                layer_name=layer_name,
                 max_num_reqs=max_num_reqs,
-                maxblocks=maxblocks,
-                minblocks=torch.zeros_like(maxblocks),
+                maxblocks=torch.zeros(metadata_shape, dtype=k_cache.dtype, device=device),
+                minblocks=torch.zeros(metadata_shape, dtype=k_cache.dtype, device=device),
                 device=device,
-                pin_memory=self.pin_memory,
+                pin_memory=pin_memory,
             )
             base_layer_metadata[layer_name] = layer_metadata
-            self.layers[layer_name] = layer_metadata
+            self.layer_metadata.append(layer_metadata)
+            self.layer_metadata_by_name[layer_name] = layer_metadata
 
-        for layer_name, target_layer_name in shared_kv_cache_layers.items():
-            if layer_name not in attn_layers:
-                continue
-            self.layers[layer_name] = base_layer_metadata[target_layer_name]
+        for layer_name, target_layer_name in shared_layers.items():
+            self.layer_metadata_by_name[layer_name] = base_layer_metadata[target_layer_name]
 
         self.ready = True
+
+    def _disable(self, reason: str) -> None:
+        """Permanently disable QUEST for this model runner and emit one warning.
+        Dense attention remains available through the inherited backend path.
+        """
+        logger.warning_once(f"QUEST decode is disabled: {reason}")
+        self._is_disabled = True
+        self.ready = False
+
+    def _invalidate_rows(self, row_indices: Sequence[int]) -> None:
+        """Propagate row invalidation to every unique layer metadata object.
+        Shared-KV layers point at the same object, so iterating this list avoids duplicate work.
+        """
+        if not row_indices:
+            return
+        for layer_metadata in self.layer_metadata:
+            layer_metadata.invalidate_rows(row_indices)
+
+    def _quest_is_disabled(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        ascend_config: AscendConfig,
+        model_config: Any,
+        use_sparse: bool,
+        max_num_metadata_blocks_per_req: int,
+    ) -> tuple[bool, str]:
+        """Check model-wide conditions that make QUEST unsupported.
+        These are static constraints where selecting sparse decode would be invalid or unsafe.
+        """
+        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+        if cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs():
+            return True, (
+                "full graph execution is enabled, but QUEST decode currently requires "
+                "runtime switching between dense and sparse attention paths."
+            )
+
+        if get_ascend_device_type() not in {AscendDeviceType.A2, AscendDeviceType.A3}:
+            return True, (
+                "current hardware is unsupported, QUEST decode currently supports only "
+                "Ascend A2/A3 (ascend910b/ascend910_93)."
+            )
+
+        if vllm_config.kv_transfer_config is not None:
+            return True, "kv_transfer_config is set, but QUEST decode requires a local KV cache."
+        if enable_cp():
+            return True, "context parallel is enabled, but QUEST decode requires unsharded request metadata."
+        if ascend_config.xlite_graph_config.enabled:
+            return True, "xLite graph execution is enabled, but QUEST decode only supports the standard v1 decode path."
+        if model_config.use_mla:
+            return True, "MLA attention is enabled, but QUEST decode only supports standard v1 attention."
+        if use_sparse:
+            return True, "sparse attention is enabled, but QUEST decode only supports standard v1 attention."
+        if max_num_metadata_blocks_per_req > QUEST_MAX_METADATA_BLOCKS_PER_REQ:
+            return True, (
+                "the configured max_model_len requires more metadata blocks per request "
+                f"({max_num_metadata_blocks_per_req}) than the kernel limit "
+                f"({QUEST_MAX_METADATA_BLOCKS_PER_REQ})."
+            )
+        return False, ""
+
+    def _validate_quest_layer_impl(self, layer_name: str, attn_layer: Any) -> bool:
+        """Ensure a layer is backed by a QUEST-capable attention impl.
+        A mismatch means backend selection or layer replacement has made sparse decode unsafe.
+        """
+        impl = getattr(attn_layer, "impl", None)
+        if not isinstance(impl, QuestAttentionBackendImpl):
+            self._disable(
+                f"attention layer {layer_name} does not use QuestAttentionBackendImpl; "
+                "dense attention will be used."
+            )
+            return False
+        if not impl.supports_quest():
+            self._disable(f"attention layer {layer_name} is not QUEST-compatible.")
+            return False
+        return True
+
+    def _get_layer_k_cache(self, layer_name: str, kv_caches: dict[str, Any]) -> torch.Tensor | None:
+        """Return a layer key cache if its layout matches QUEST kernels.
+        QUEST metadata kernels require the standard local KV tuple with 128-token pages and 128-wide heads.
+        """
+        if layer_name not in kv_caches:
+            self._disable(f"attention layer {layer_name} does not have a local KV cache.")
+            return None
+
+        kv_cache = kv_caches[layer_name]
+        if not isinstance(kv_cache, tuple) or len(kv_cache) < 2:
+            self._disable(f"attention layer {layer_name} does not expose a standard KV cache tuple.")
+            return None
+
+        k_cache = kv_cache[0]
+        if not isinstance(k_cache, torch.Tensor) or k_cache.ndim != 4:
+            self._disable(f"attention layer {layer_name} has an unsupported key-cache layout.")
+            return None
+        if k_cache.shape[1] != QUEST_PAGE_SIZE or k_cache.shape[-1] != QUEST_HEAD_SIZE:
+            self._disable(
+                f"attention layer {layer_name} has block_size={k_cache.shape[1]} and "
+                f"head_size={k_cache.shape[-1]}, but QUEST requires block_size={QUEST_PAGE_SIZE} "
+                f"and head_size={QUEST_HEAD_SIZE}."
+            )
+            return None
+        return k_cache
+
+    def _collect_quest_k_caches(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        kv_caches: dict[str, Any],
+        shared_kv_cache_layers: dict[str, str],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, str]] | None:
+        """Collect base and shared layer KV-cache mappings for QUEST setup.
+        The result drives per-layer metadata allocation while preserving shared-KV aliases.
+        """
+        attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+        base_layers: dict[str, torch.Tensor] = {}
+        shared_layers: dict[str, str] = {}
+
+        for layer_name, attn_layer in attn_layers.items():
+            if not self._validate_quest_layer_impl(layer_name, attn_layer):
+                return None
+
+            target_layer_name = shared_kv_cache_layers.get(layer_name)
+            if target_layer_name is not None:
+                shared_layers[layer_name] = target_layer_name
+                continue
+
+            k_cache = self._get_layer_k_cache(layer_name, kv_caches)
+            if k_cache is None:
+                return None
+            base_layers[layer_name] = k_cache
+
+        for layer_name, target_layer_name in shared_layers.items():
+            if target_layer_name not in base_layers:
+                self._disable(
+                    f"attention layer {layer_name} shares KV cache with {target_layer_name}, "
+                    "but the target layer is not QUEST-compatible."
+                )
+                return None
+
+        if not base_layers:
+            self._disable("no compatible v1 attention layers were found with block_size 128 and head_size 128.")
+            return None
+
+        return base_layers, shared_layers
 
     def prepare_batch(
         self,
@@ -395,11 +465,15 @@ class QuestDecodeMetadataManager:
         max_query_len: int | None,
         block_table_width: int,
     ) -> QuestBatchMetadata:
+        """Create active-batch QUEST metadata when sparse decode is valid and worthwhile.
+        Ineligible batches return empty metadata so the attention impl falls back to dense attention.
+        """
         if (
-            not self.ready
+            self._is_disabled
+            or not self.ready
             or self.metadata_block_tables is None
             or req_ids is None
-            or getattr(attn_state, "name", None) != "DecodeOnly"
+            or attn_state != AscendAttentionState.DecodeOnly
             or max_query_len != 1
             or block_table_width <= 0
         ):
@@ -410,7 +484,7 @@ class QuestDecodeMetadataManager:
             return QuestBatchMetadata()
 
         selected_blocks = min(self.topk_pages, block_table_width)
-        if not self._should_use_sparse_decode(seq_lens_cpu, num_reqs, selected_blocks):
+        if not self._meets_sparse_selection_ratio(seq_lens_cpu, num_reqs, selected_blocks):
             return QuestBatchMetadata()
 
         req_ids_tuple = tuple(req_ids[:num_reqs])
@@ -434,45 +508,44 @@ class QuestDecodeMetadataManager:
             _selected_k=selected_blocks,
         )
 
-    def _refresh_layer_after_cache_update(
+    def _refresh_layer_after_kv_cache_update(
         self,
         batch_metadata: QuestBatchMetadata,
         *,
         layer_name: str,
         k_cache: torch.Tensor | None,
         block_tables: torch.Tensor | None,
-    ) -> None:
-        if not batch_metadata.quest_enabled_for_batch:
-            return
-        layer_metadata = self.layers.get(layer_name)
-        if (
-            layer_metadata is None
-            or k_cache is None
-            or block_tables is None
-            or batch_metadata._metadata_block_tables is None
-        ):
-            return
+    ) -> bool:
+        """Refresh one layer's metadata and report if sparse decode can use it.
+        Returning False keeps the layer on dense attention instead of using stale or missing metadata.
+        """
+        layer_metadata = self.layer_metadata_by_name.get(layer_name)
+        if layer_metadata is None:
+            return False
 
-        layer_id = id(layer_metadata)
-        refresh_required = layer_id in batch_metadata._refresh_layer_ids
-        if not refresh_required:
-            refresh_required = layer_metadata.prepare(batch_metadata)
-            if refresh_required:
-                batch_metadata._refresh_layer_ids.add(layer_id)
-        if not refresh_required:
-            return
+        if k_cache is None or block_tables is None:
+            return False
+
+        # No rows crossed a metadata page boundary, so existing QUEST metadata
+        # is still fresh and sparse decode can proceed without a refresh launch.
+        if not layer_metadata.prepare_refresh_if_needed(batch_metadata):
+            return True
+
+        metadata_block_tables = batch_metadata._metadata_block_tables
+        assert metadata_block_tables is not None
 
         batch_size = batch_metadata.batch_size
         quest_prefill_metadata(
             k_cache=k_cache,
             block_tables=block_tables[:batch_size],
-            refresh_start_seq_lens=layer_metadata.refresh_start_seq_lens[:batch_size],
-            refresh_seq_lens=layer_metadata.refresh_seq_lens[:batch_size],
-            metadata_block_tables=batch_metadata._metadata_block_tables,
+            refresh_start_seq_lens=layer_metadata.refresh_start_seq_lens.gpu[:batch_size],
+            refresh_end_seq_lens=layer_metadata.refresh_end_seq_lens.gpu[:batch_size],
+            metadata_block_tables=metadata_block_tables,
             maxblocks=layer_metadata.maxblocks,
             minblocks=layer_metadata.minblocks,
         )
         layer_metadata.commit(batch_metadata)
+        return True
 
     def _get_sparse_decode_inputs(
         self,
@@ -480,37 +553,36 @@ class QuestDecodeMetadataManager:
         *,
         layer_name: str,
     ) -> QuestSparseDecodeInputs | None:
-        if (
-            not batch_metadata.quest_enabled_for_batch
-            or batch_metadata.batch_size <= 0
-            or batch_metadata._selected_k <= 0
-            or batch_metadata._metadata_block_tables is None
-            or batch_metadata._seq_lens is None
-        ):
-            return None
-
-        layer_metadata = self.layers.get(layer_name)
+        """Package already-refreshed layer metadata for the sparse kernel.
+        Batch eligibility and freshness are checked before this helper, so it only resolves layer tensors.
+        """
+        layer_metadata = self.layer_metadata_by_name.get(layer_name)
         if layer_metadata is None:
             return None
-        if not layer_metadata.is_ready_for_sparse_decode(batch_metadata):
-            return None
+
+        metadata_block_tables = batch_metadata._metadata_block_tables
+        seq_lens = batch_metadata._seq_lens
+        assert metadata_block_tables is not None
+        assert seq_lens is not None
 
         return QuestSparseDecodeInputs(
             batch_size=batch_metadata.batch_size,
             selected_k=batch_metadata._selected_k,
-            rounded_selected_k=cdiv(batch_metadata._selected_k, QUEST_INDEX_ALIGNMENT) * QUEST_INDEX_ALIGNMENT,
-            metadata_block_tables=batch_metadata._metadata_block_tables,
-            seq_lens=batch_metadata._seq_lens,
+            metadata_block_tables=metadata_block_tables,
+            seq_lens=seq_lens,
             maxblocks=layer_metadata.maxblocks,
             minblocks=layer_metadata.minblocks,
         )
 
     @staticmethod
-    def _should_use_sparse_decode(
+    def _meets_sparse_selection_ratio(
         seq_lens: torch.Tensor | np.ndarray,
         batch_size: int,
         selected_blocks: int,
     ) -> bool:
+        """Return whether selected pages are sparse enough to justify QUEST decode.
+        If the selected-page ratio is too high, dense attention is expected to be the better path.
+        """
         if batch_size <= 0 or selected_blocks <= 0:
             return False
 
@@ -532,6 +604,206 @@ class QuestDecodeMetadataManager:
         return bool((avg_selected_ratio < QUEST_SPARSE_SELECTED_BLOCK_RATIO_THRESHOLD).item())
 
 
-def _get_max_num_metadata_blocks_per_req(model_config: Any, max_encoder_len: int | None) -> int:
-    quest_max_model_len = max(model_config.max_model_len, max_encoder_len or 0)
-    return cdiv(cdiv(quest_max_model_len, QUEST_PAGE_SIZE), QUEST_PAGE_SIZE)
+class QuestAttentionBackend(AscendAttentionBackend):
+    """Dedicated QUEST backend that falls back to dense Ascend attention."""
+
+    @staticmethod
+    def get_impl_cls():
+        """Use the QUEST impl so each forward can choose sparse or inherited dense decode.
+        Unsupported cases are disabled by the manager and continue through the dense fallback.
+        """
+        return QuestAttentionBackendImpl
+
+    @staticmethod
+    def get_builder_cls():
+        """Use the QUEST metadata builder to attach sparse-decode batch state.
+        The base Ascend metadata is preserved and QUEST state is added only as an extension.
+        """
+        return QuestAttentionMetadataBuilder
+
+
+class QuestAttentionMetadataBuilder(AscendAttentionMetadataBuilder):
+    """Build dense Ascend metadata and attach QUEST batch metadata."""
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> QuestAttentionMetadata:
+        """Build dense Ascend metadata and attach optional QUEST batch state.
+        This keeps dense behavior identical while giving the QUEST impl the request ids and sequence lengths it needs.
+        """
+        base_metadata = super().build(
+            common_prefix_len=common_prefix_len,
+            common_attn_metadata=common_attn_metadata,
+            fast_build=fast_build,
+        )
+
+        num_reqs = common_attn_metadata.num_reqs
+        if common_attn_metadata._seq_lens_cpu is not None:
+            quest_seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
+        elif common_attn_metadata.seq_lens_cpu is not None:
+            quest_seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        else:
+            quest_seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+
+        quest_metadata = QuestBatchMetadata()
+        quest_manager = common_attn_metadata.quest_manager
+        quest_req_ids = common_attn_metadata.quest_req_ids
+        block_table = common_attn_metadata.block_table_tensor
+        if quest_manager is not None:
+            quest_metadata = quest_manager.prepare_batch(
+                num_reqs=0 if quest_req_ids is None else len(quest_req_ids),
+                req_ids=quest_req_ids,
+                seq_lens_cpu=quest_seq_lens_cpu,
+                seq_lens=common_attn_metadata.seq_lens,
+                attn_state=base_metadata.attn_state,
+                max_query_len=common_attn_metadata.max_query_len,
+                block_table_width=block_table.shape[1] if block_table is not None else 0,
+            )
+
+        metadata_kwargs = {
+            field_info.name: getattr(base_metadata, field_info.name) for field_info in dataclass_fields(AscendMetadata)
+        }
+        return QuestAttentionMetadata(**metadata_kwargs, quest_metadata=quest_metadata)
+
+
+class QuestAttentionBackendImpl(AscendAttentionBackendImpl):
+    """Sparse QUEST decode overlay for the dense Ascend v1 attention impl."""
+
+    _current_layer_name: ContextVar[str | None] = ContextVar(
+        "quest_current_layer_name",
+        default=None,
+    )
+
+    def supports_quest(self) -> bool:
+        """Return whether this attention layer shape can run QUEST kernels.
+        The manager uses this to disable QUEST early for MLA, CP, sliding-window, cross-attention, or wrong head size.
+        """
+        return (
+            not enable_cp()
+            and not self.vllm_config.model_config.use_mla
+            and self.head_size == QUEST_HEAD_SIZE
+            and self.attn_type != AttentionType.ENCODER_DECODER
+            and self.sliding_window is None
+            and self.sinks is None
+        )
+
+    def forward(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Store the current layer name while preserving the inherited forward path.
+        QUEST needs the layer name in forward_impl because the base AttentionImpl API does not pass it there.
+        """
+        token = self._current_layer_name.set(layer.layer_name)
+        try:
+            return super().forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
+        finally:
+            self._current_layer_name.reset(token)
+
+    def forward_quest_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: QuestAttentionMetadata,
+        output: torch.Tensor,
+        quest_inputs: QuestSparseDecodeInputs,
+    ) -> torch.Tensor:
+        """Run QUEST block selection followed by paged sparse attention.
+        Inputs are already validated and refreshed, so this method only invokes the sparse kernels.
+        """
+        if attn_metadata.block_tables is None:
+            raise RuntimeError("QUEST decode was selected without block tables.")
+
+        batch_size = quest_inputs.batch_size
+        key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
+        block_table = block_table[:batch_size]
+        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q[:batch_size]
+        actual_seq_lengths_kv = actual_seq_lengths_kv[:batch_size]
+
+        query = query[:batch_size]
+        selected_q_indices = quest_block_select_paged(
+            query=query,
+            maxblocks=quest_inputs.maxblocks,
+            minblocks=quest_inputs.minblocks,
+            metadata_block_tables=quest_inputs.metadata_block_tables,
+            seq_lens=quest_inputs.seq_lens,
+            k=quest_inputs.selected_k,
+            tokens_since_metadata_update=0,
+        )
+        quest_output = output[:batch_size]
+        paged_select_attention_out(
+            query,
+            key,
+            value,
+            actual_seq_lengths_q,
+            actual_seq_lengths_kv,
+            block_table,
+            selected_q_indices,
+            self.num_heads,
+            self.scale,
+            self.num_kv_heads,
+            block_size,
+            quest_output,
+        )
+        return output
+
+    def forward_impl(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ):
+        """Try QUEST sparse decode for an eligible decode batch, otherwise fall back dense.
+        Graph capture and missing or disabled QUEST metadata deliberately use the inherited dense implementation.
+        """
+        quest_metadata = getattr(attn_metadata, "quest_metadata", None)
+        if (
+            _EXTRA_CTX.capturing
+            or not isinstance(quest_metadata, QuestBatchMetadata)
+            or not quest_metadata.is_enabled
+        ):
+            return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
+
+        layer_name = self._current_layer_name.get()
+        assert layer_name is not None, "QUEST sparse decode requires the current attention layer name."
+
+        # We need to ensure the quest metadata from prefill and previous decode steps is ready
+        metadata_ready = quest_metadata.refresh_layer_after_kv_cache_update(
+            layer_name=layer_name,
+            k_cache=self.key_cache,
+            block_tables=attn_metadata.block_tables,
+        )
+
+        if not metadata_ready:
+            return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
+
+        quest_inputs = quest_metadata.get_sparse_decode_inputs(layer_name)
+        if quest_inputs is not None:
+            return self.forward_quest_attention(query, key, value, attn_metadata, output, quest_inputs)
+
+        return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)

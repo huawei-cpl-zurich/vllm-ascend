@@ -49,7 +49,7 @@ public:
         GM_ADDR k_cache,
         GM_ADDR block_tables,
         GM_ADDR refresh_start_seq_lens,
-        GM_ADDR refresh_seq_lens,
+        GM_ADDR refresh_end_seq_lens,
         GM_ADDR metadata_block_tables,
         GM_ADDR maxblocks,
         GM_ADDR minblocks,
@@ -70,7 +70,7 @@ public:
         k_cache_gm_.SetGlobalBuffer((__gm__ StorageT *)k_cache);
         block_tables_gm_.SetGlobalBuffer((__gm__ int32_t *)block_tables);
         refresh_start_seq_lens_gm_.SetGlobalBuffer((__gm__ int32_t *)refresh_start_seq_lens);
-        refresh_seq_lens_gm_.SetGlobalBuffer((__gm__ int32_t *)refresh_seq_lens);
+        refresh_end_seq_lens_gm_.SetGlobalBuffer((__gm__ int32_t *)refresh_end_seq_lens);
         metadata_block_tables_gm_.SetGlobalBuffer((__gm__ int32_t *)metadata_block_tables);
         maxblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)maxblocks);
         minblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)minblocks);
@@ -101,7 +101,7 @@ public:
             int32_t head_idx = batch_head_idx % num_kv_heads_;
 
             int32_t start_len = refresh_start_seq_lens_gm_.GetValue(request_idx);
-            int32_t end_len = refresh_seq_lens_gm_.GetValue(request_idx);
+            int32_t end_len = refresh_end_seq_lens_gm_.GetValue(request_idx);
             if (end_len <= start_len) {
                 continue;
             }
@@ -323,7 +323,7 @@ private:
     GlobalTensor<StorageT> minblocks_gm_;
     GlobalTensor<int32_t> block_tables_gm_;
     GlobalTensor<int32_t> refresh_start_seq_lens_gm_;
-    GlobalTensor<int32_t> refresh_seq_lens_gm_;
+    GlobalTensor<int32_t> refresh_end_seq_lens_gm_;
     GlobalTensor<int32_t> metadata_block_tables_gm_;
 
     int32_t batch_size_;
@@ -339,7 +339,7 @@ __aicore__ inline void RunQuestPrefillMetadata(
     GM_ADDR k_cache,
     GM_ADDR block_tables,
     GM_ADDR refresh_start_seq_lens,
-    GM_ADDR refresh_seq_lens,
+    GM_ADDR refresh_end_seq_lens,
     GM_ADDR metadata_block_tables,
     GM_ADDR maxblocks,
     GM_ADDR minblocks,
@@ -350,7 +350,7 @@ __aicore__ inline void RunQuestPrefillMetadata(
         k_cache,
         block_tables,
         refresh_start_seq_lens,
-        refresh_seq_lens,
+        refresh_end_seq_lens,
         metadata_block_tables,
         maxblocks,
         minblocks,
@@ -367,7 +367,7 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
     GM_ADDR k_cache,
     GM_ADDR block_tables,
     GM_ADDR refresh_start_seq_lens,
-    GM_ADDR refresh_seq_lens,
+    GM_ADDR refresh_end_seq_lens,
     GM_ADDR metadata_block_tables,
     GM_ADDR maxblocks,
     GM_ADDR minblocks,
@@ -387,7 +387,7 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
             k_cache,
             block_tables,
             refresh_start_seq_lens,
-            refresh_seq_lens,
+            refresh_end_seq_lens,
             metadata_block_tables,
             maxblocks,
             minblocks,
@@ -400,7 +400,7 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
             k_cache,
             block_tables,
             refresh_start_seq_lens,
-            refresh_seq_lens,
+            refresh_end_seq_lens,
             metadata_block_tables,
             maxblocks,
             minblocks,

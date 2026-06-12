@@ -26,7 +26,7 @@ inline void npu_quest_prefill_metadata(
     const at::Tensor &k_cache,
     const at::Tensor &block_tables,
     const at::Tensor &refresh_start_seq_lens,
-    const at::Tensor &refresh_seq_lens,
+    const at::Tensor &refresh_end_seq_lens,
     const at::Tensor &metadata_block_tables,
     at::Tensor &maxblocks,
     at::Tensor &minblocks)
@@ -34,7 +34,7 @@ inline void npu_quest_prefill_metadata(
     TORCH_CHECK(k_cache.dim() == 4, "k_cache must be 4D.");
     TORCH_CHECK(block_tables.dim() == 2, "block_tables must be 2D.");
     TORCH_CHECK(refresh_start_seq_lens.dim() == 1, "refresh_start_seq_lens must be 1D.");
-    TORCH_CHECK(refresh_seq_lens.dim() == 1, "refresh_seq_lens must be 1D.");
+    TORCH_CHECK(refresh_end_seq_lens.dim() == 1, "refresh_end_seq_lens must be 1D.");
     TORCH_CHECK(metadata_block_tables.dim() == 2, "metadata_block_tables must be 2D.");
     TORCH_CHECK(maxblocks.dim() == 4, "maxblocks must be 4D.");
     TORCH_CHECK(minblocks.dim() == 4, "minblocks must be 4D.");
@@ -46,11 +46,11 @@ inline void npu_quest_prefill_metadata(
                 "quest_prefill_metadata requires maxblocks and minblocks to match k_cache dtype.");
     TORCH_CHECK(block_tables.scalar_type() == at::kInt &&
                     refresh_start_seq_lens.scalar_type() == at::kInt &&
-                    refresh_seq_lens.scalar_type() == at::kInt &&
+                    refresh_end_seq_lens.scalar_type() == at::kInt &&
                     metadata_block_tables.scalar_type() == at::kInt,
-                "quest_prefill_metadata expects int32 block tables and refresh seq lens.");
+                "quest_prefill_metadata expects int32 block tables and refresh start/end seq lens.");
 
-    const int64_t batch_size = refresh_seq_lens.size(0);
+    const int64_t batch_size = refresh_end_seq_lens.size(0);
     // QUEST metadata remains KV-head aligned because the cache stores keys at
     // KV-head granularity even when decode-time selection is performed per q head.
     const int64_t num_kv_heads = k_cache.size(2);
@@ -62,11 +62,11 @@ inline void npu_quest_prefill_metadata(
     TORCH_CHECK(block_size == QUEST_BLOCK_SIZE,
                 "quest_prefill_metadata requires block_size == 128, got ", block_size);
     TORCH_CHECK(refresh_start_seq_lens.size(0) == batch_size,
-                "Batch size mismatch between refresh_start_seq_lens and refresh_seq_lens.");
+                "Batch size mismatch between refresh_start_seq_lens and refresh_end_seq_lens.");
     TORCH_CHECK(block_tables.size(0) == batch_size,
-                "Batch size mismatch between refresh_seq_lens and block_tables.");
+                "Batch size mismatch between refresh_end_seq_lens and block_tables.");
     TORCH_CHECK(metadata_block_tables.size(0) == batch_size,
-                "Batch size mismatch between refresh_seq_lens and metadata_block_tables.");
+                "Batch size mismatch between refresh_end_seq_lens and metadata_block_tables.");
     TORCH_CHECK(maxblocks.size(1) == block_size && minblocks.size(1) == block_size,
                 "Metadata outputs must use the same block size as k_cache.");
     TORCH_CHECK(maxblocks.size(2) == num_kv_heads && minblocks.size(2) == num_kv_heads,
@@ -81,7 +81,7 @@ inline void npu_quest_prefill_metadata(
         k_cache,
         block_tables,
         refresh_start_seq_lens,
-        refresh_seq_lens,
+        refresh_end_seq_lens,
         metadata_block_tables,
         maxblocks,
         minblocks);

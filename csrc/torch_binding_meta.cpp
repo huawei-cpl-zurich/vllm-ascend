@@ -395,7 +395,7 @@ void npu_quest_prefill_metadata_meta(
     const at::Tensor &k_cache,
     const at::Tensor &block_tables,
     const at::Tensor &refresh_start_seq_lens,
-    const at::Tensor &refresh_seq_lens,
+    const at::Tensor &refresh_end_seq_lens,
     const at::Tensor &metadata_block_tables,
     at::Tensor &maxblocks,
     at::Tensor &minblocks)
@@ -403,7 +403,7 @@ void npu_quest_prefill_metadata_meta(
     (void)k_cache;
     (void)block_tables;
     (void)refresh_start_seq_lens;
-    (void)refresh_seq_lens;
+    (void)refresh_end_seq_lens;
     (void)metadata_block_tables;
     (void)maxblocks;
     (void)minblocks;
