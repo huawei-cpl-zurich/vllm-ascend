@@ -16,7 +16,8 @@
 
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from typing import Any
 
 import numpy as np
@@ -377,8 +378,7 @@ class QuestDecodeMetadataManager:
         impl = getattr(attn_layer, "impl", None)
         if not isinstance(impl, QuestAttentionBackendImpl):
             self._disable(
-                f"attention layer {layer_name} does not use QuestAttentionBackendImpl; "
-                "dense attention will be used."
+                f"attention layer {layer_name} does not use QuestAttentionBackendImpl; dense attention will be used."
             )
             return False
         if not impl.supports_quest():
@@ -782,11 +782,7 @@ class QuestAttentionBackendImpl(AscendAttentionBackendImpl):
         Graph capture and missing or disabled QUEST metadata deliberately use the inherited dense implementation.
         """
         quest_metadata = getattr(attn_metadata, "quest_metadata", None)
-        if (
-            _EXTRA_CTX.capturing
-            or not isinstance(quest_metadata, QuestBatchMetadata)
-            or not quest_metadata.is_enabled
-        ):
+        if _EXTRA_CTX.capturing or not isinstance(quest_metadata, QuestBatchMetadata) or not quest_metadata.is_enabled:
             return super().forward_impl(query, key, value, kv_cache, attn_metadata, output)
 
         layer_name = self._current_layer_name.get()
