@@ -22,9 +22,14 @@ latency and fitting a quadratic model.
 
 The approach:
 1. Profile: Run forward passes with different chunk sizes to measure latency
-2. Fit: Use quadratic model f(l) = a*l^2 + b*l + c to fit the latency data
-3. Predict: Given current num_computed_tokens, solve for chunk size that achieves
-   target latency
+2. Fit: Use quadratic model f(l) = a·l² + b·l + c to fit the latency data
+3. Predict: Given current num_computed_tokens H, solve for chunk size x
+   that achieves target latency T using the correct incremental cost model:
+
+       T_incr(x, H) = a·x·(H+x) + b·x + c
+
+   This is NOT f(H+x) − f(H) — the latter double-counts the attention
+   cross-term between cached and new tokens (see ChunkSizePredictor).
 """
 
 import math
@@ -36,12 +41,22 @@ from vllm.logger import logger
 class ChunkSizePredictor:
     """Predictor for dynamic chunk size based on quadratic latency model.
 
-    Models latency as: f(l) = a*l^2 + b*l + c
+    Models latency as: f(l) = a·l² + b·l + c
 
-    Given a target latency T and current history length L, predicts next
-    chunk size x such that: f(L+x) - f(L) = T
+    The incremental latency of processing x new tokens when H tokens are
+    already in KVCache is:
 
-    This expands to the quadratic equation: a*x^2 + (2aL+b)*x - T = 0
+        T_incr(x, H) = a·x·(H+x) + b·x + c
+
+    Only the x new query tokens attend to the H+x KV positions — the
+    H cached tokens do not recompute attention.  This is fundamentally
+    different from the naïve f(H+x) − f(H) subtraction, which would give
+    2aHx + ax² + bx (overcounting the cross-term by a factor of 2).
+
+    Given a target latency T and current history length H, predicts next
+    chunk size x such that: a·x·(H+x) + b·x = T − c
+
+    This expands to the quadratic equation: a·x² + (aH + b)·x + (c − T) = 0
     """
 
     def __init__(self, smooth_factor: float = 0.8, min_chunk: int = 4096):
@@ -177,15 +192,18 @@ class ChunkSizePredictor:
         return True
 
     def set_target_latency(self, base_chunk_size: int, elapsed_time: float = 0.0) -> None:
-        """Set target latency based on base chunk size."""
+        """Set target latency based on base chunk size.
 
-        def f(seq_lens: float) -> float:
-            return self.quadratic_coeff_a * seq_lens * seq_lens + self.linear_coeff_b * seq_lens + self.constant_coeff_c
-
+        Uses the corrected incremental model: T_target = a·base·(base+0) + b·base + c
+        which simplifies to f(base_chunk_size) — the full cost of a forward pass
+        processing base_chunk_size tokens with no KVCache.
+        """
         if elapsed_time > 0:
             self.target_latency = elapsed_time
         else:
-            self.target_latency = f(float(base_chunk_size)) - f(0.0)
+            self.target_latency = self.quadratic_coeff_a * base_chunk_size * base_chunk_size \
+                                + self.linear_coeff_b * base_chunk_size \
+                                + self.constant_coeff_c
         if self.target_latency <= 0:
             self.target_latency = 1.0
 
@@ -200,12 +218,19 @@ class ChunkSizePredictor:
         query_len: int,
         num_computed_tokens: int,
     ) -> float:
-        """Get time T based on current seq_lens, f(l) = al^2 + bl + c, f(L+x) - f(L) = T"""
+        """Get predicted incremental latency for processing x new tokens with H cached.
 
-        def f(seq_lens: float) -> float:
-            return self.quadratic_coeff_a * seq_lens * seq_lens + self.linear_coeff_b * seq_lens + self.constant_coeff_c
+        Correct model: T_incr(x, H) = a·x·(H+x) + b·x + c
 
-        return f(query_len + num_computed_tokens) - f(num_computed_tokens)
+        Only the x new tokens compute attention (attending to H+x KV positions),
+        unlike full prefill where all H+x tokens attend to all H+x tokens.
+        Using f(H+x) - f(H) = 2aHx + ax² + bx overcounts the cross-term by aHx.
+        """
+        return (
+            self.quadratic_coeff_a * query_len * (query_len + num_computed_tokens)
+            + self.linear_coeff_b * query_len
+            + self.constant_coeff_c
+        )
 
     def get_time_with_history(
         self,
@@ -225,7 +250,23 @@ class ChunkSizePredictor:
         base_chunk_size: int,
         page_size: int,
     ) -> int | None:
-        """Predict next chunk size x such that f(L+x) - f(L) = target_latency."""
+        """Predict next chunk size x such that a·x·(H+x) + b·x = T.
+
+        The incremental latency of processing x new tokens when H tokens are
+        already cached is:  T_incr(x, H) = a·x·(H+x) + b·x + c
+
+        The constant overhead c affects every forward pass equally regardless
+        of chunk size, so it cancels when solving for the optimal x:
+            a·x² + (a·H + b)·x - (a·base² + b·base) = 0
+
+        The key difference from the naive f(H+x)-f(H) subtraction is that
+        full prefill attention cost is a·(H+x)² (all H+x tokens attend to all
+        H+x tokens), while incremental attention cost is only a·x·(H+x)
+        (only the x new tokens attend to the H+x KV positions — the H cached
+        tokens do not recompute attention).  Using f(H+x)-f(H) overcounts the
+        cross-term by a factor of 2, which systematically shrinks predictions
+        as H grows.
+        """
         if not self.is_ready or self.target_latency is None:
             return None
 
@@ -233,7 +274,7 @@ class ChunkSizePredictor:
             return None
 
         A = self.quadratic_coeff_a
-        B = 2 * self.quadratic_coeff_a * num_computed_tokens + self.linear_coeff_b
+        B = self.quadratic_coeff_a * num_computed_tokens + self.linear_coeff_b
         C = -self.target_latency
 
         discriminant = B * B - 4 * A * C
