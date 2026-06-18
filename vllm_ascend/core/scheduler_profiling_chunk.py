@@ -149,6 +149,7 @@ class ProfilingChunkScheduler(Scheduler):
         total_steps = len(profile_grid)
         log_interval = max(1, total_steps // 10)
         t_start = time.perf_counter()
+        failed_points = 0
 
         for i, (chunk_size, history_len) in enumerate(profile_grid):
             if i % log_interval == 0 or i == total_steps - 1:
@@ -175,13 +176,21 @@ class ProfilingChunkScheduler(Scheduler):
                 samples.append(sample)
 
             except Exception as e:
-                logger.debug(
+                failed_points += 1
+                log_failed_point = logger.warning if failed_points <= 3 else logger.debug
+                log_failed_point(
                     "[ProfilingChunk] Forward failed for chunk=%d, history=%d: %s",
                     chunk_size,
                     history_len,
                     e,
                 )
                 continue
+
+        if failed_points > 3:
+            logger.warning(
+                "[ProfilingChunk] %d startup profiling points failed; first 3 were logged above",
+                failed_points,
+            )
 
         if len(samples) < 5:
             logger.warning(
@@ -211,15 +220,19 @@ class ProfilingChunkScheduler(Scheduler):
         if not hasattr(model_executor, "collective_rpc"):
             return kwargs
 
-        sig = inspect.signature(model_executor.collective_rpc)
+        try:
+            sig = inspect.signature(model_executor.collective_rpc)
+        except (TypeError, ValueError):
+            return kwargs
         if "unique_reply_rank" not in sig.parameters:
             return kwargs
 
         try:
             pc = model_executor.vllm_config.parallel_config
             output_rank = pc.world_size - pc.tensor_parallel_size * pc.prefill_context_parallel_size
-            kwargs["unique_reply_rank"] = output_rank
-        except AttributeError:
+            if output_rank >= 0:
+                kwargs["unique_reply_rank"] = output_rank
+        except (AttributeError, TypeError):
             pass
 
         return kwargs
@@ -237,7 +250,15 @@ class ProfilingChunkScheduler(Scheduler):
     def _extract_profile_sample(result, chunk_size: int, history_len: int) -> dict | None:
         """Extract a startup profile sample from collective_rpc result."""
         if isinstance(result, list) and len(result) > 0:
-            result = result[0]
+            samples = [
+                sample
+                for item in result
+                if (sample := ProfilingChunkScheduler._extract_profile_sample(item, chunk_size, history_len))
+                is not None
+            ]
+            if samples:
+                return max(samples, key=lambda sample: sample["median_ms"])
+            return None
         if isinstance(result, dict):
             runs = [float(value) for value in result.get("runs_ms", [])]
             median_ms = result.get("median_ms")

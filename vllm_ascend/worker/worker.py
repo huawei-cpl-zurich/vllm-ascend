@@ -836,6 +836,22 @@ class NPUWorker(WorkerBase):
         )
         return result["median_ms"]
 
+    def _get_profile_max_model_len(self) -> int:
+        """Resolve max_model_len for synthetic profiling runs."""
+        for source in (
+            getattr(self, "model_config", None),
+            getattr(self, "model_runner", None),
+            getattr(self, "scheduler_config", None),
+        ):
+            max_model_len = getattr(source, "max_model_len", None)
+            if max_model_len is not None:
+                return int(max_model_len)
+
+        raise RuntimeError(
+            "Unable to determine max_model_len for profiling chunk startup. "
+            "Expected model_config.max_model_len or model_runner.max_model_len."
+        )
+
     @torch.inference_mode()
     def profile_chunked_prefill_latency(
         self,
@@ -853,7 +869,7 @@ class NPUWorker(WorkerBase):
         import time
 
         # Clamp to valid range
-        max_model_len = getattr(self.model_config, "max_model_len", self.scheduler_config.max_model_len)
+        max_model_len = self._get_profile_max_model_len()
         chunk_size = min(chunk_size, self.scheduler_config.max_num_batched_tokens)
         chunk_size = min(chunk_size, max_model_len)
         chunk_size = max(chunk_size, 1)
