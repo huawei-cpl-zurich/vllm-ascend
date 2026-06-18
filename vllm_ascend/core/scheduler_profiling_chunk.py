@@ -46,11 +46,12 @@ from vllm_ascend.core.profiling_chunk_predictor import ProfilingChunkManager
 class ProfilingChunkScheduler(Scheduler):
     """Scheduler with profiling-based dynamic chunk sizing.
 
-    During initialization, the scheduler profiles prefill latency at various
-    chunk sizes by calling ``profile_prefill_latency`` on each worker via
-    ``collective_rpc``.  A quadratic latency model is then fitted, and during
-    scheduling the model predicts the optimal chunk size for each waiting
-    request based on its ``num_computed_tokens``.
+    During initialization, the scheduler loads cached profiling data or profiles
+    a grid of ``(chunk_size, history_len)`` points by calling
+    ``profile_chunked_prefill_latency`` on each worker via ``collective_rpc``.
+    A history-aware latency model is then fitted, and during scheduling the
+    model predicts the optimal chunk size for each request based on its
+    ``num_computed_tokens``.
     """
 
     def __init__(
@@ -88,15 +89,24 @@ class ProfilingChunkScheduler(Scheduler):
             page_size=self.cache_config.block_size,
             smooth_factor=profiling_cfg.smooth_factor,
             min_chunk=profiling_cfg.min_chunk,
+            cache_dir=profiling_cfg.cache_dir,
+            cache_mode=profiling_cfg.cache_mode,
+            profile_repeats=profiling_cfg.profile_repeats,
+            profile_max_seq_len=profiling_cfg.profile_max_seq_len,
+            profile_chunk_sizes=profiling_cfg.profile_chunk_sizes,
+            profile_history_sizes=profiling_cfg.profile_history_sizes,
         )
         self._profiling_initialized = False
 
         logger.info(
-            "[ProfilingChunk] Scheduler initialized. base_chunk=%d, page_size=%d, smooth_factor=%.2f, min_chunk=%d",
+            "[ProfilingChunk] Scheduler initialized. base_chunk=%d, page_size=%d, "
+            "smooth_factor=%.2f, min_chunk=%d, cache_mode=%s, repeats=%d",
             base_chunk,
             self.cache_config.block_size,
             profiling_cfg.smooth_factor,
             profiling_cfg.min_chunk,
+            profiling_cfg.cache_mode,
+            profiling_cfg.profile_repeats,
         )
 
     # ------------------------------------------------------------------
@@ -104,96 +114,93 @@ class ProfilingChunkScheduler(Scheduler):
     # ------------------------------------------------------------------
 
     def run_profiling_chunk_init(self, model_executor) -> None:
-        """Profile prefill latency using real model forward passes.
+        """Load or build startup profiling data using real model forward passes.
 
         Called by EngineCore after model_executor is ready.  Collects latency
-        samples at different chunk sizes and fits the quadratic model.
+        samples at different chunk/history pairs and fits the cached model.
         """
         if self._profiling_initialized:
             return
         self._profiling_initialized = True
 
-        if model_executor is None:
-            logger.warning("[ProfilingChunk] No model_executor provided, skipping profiling")
+        if self.profiling_chunk_manager.load_cached_profile(self.vllm_config, self.max_model_len):
             return
 
-        logger.info("[ProfilingChunk] Running startup profiling with real model forward...")
+        if model_executor is None:
+            logger.warning("[ProfilingChunk] No model_executor provided and no cache hit, skipping profiling")
+            return
 
-        seq_lens: list[int] = []
-        latencies: list[float] = []
+        profile_grid = self.profiling_chunk_manager.get_profile_grid(self.max_model_len)
+        if not profile_grid:
+            logger.warning("[ProfilingChunk] Startup profiling grid is empty")
+            return
 
-        base_chunk_size = self.profiling_chunk_manager.base_chunk_size
-        num_samples = 64
+        logger.info(
+            "[ProfilingChunk] Running startup profiling with %d (chunk, history) points and %d repeats",
+            len(profile_grid),
+            self.profiling_chunk_manager.profile_repeats,
+        )
+
+        samples: list[dict] = []
 
         # Determine unique_reply_rank for PP setups
         rpc_kwargs = self._build_rpc_kwargs(model_executor)
 
-        total_steps = num_samples + 1
+        total_steps = len(profile_grid)
         log_interval = max(1, total_steps // 10)
         t_start = time.perf_counter()
 
-        for i in range(total_steps):
-            chunk_size = int(base_chunk_size - (i - 1) * (base_chunk_size / num_samples))
-            if chunk_size <= 0:
-                break
-
+        for i, (chunk_size, history_len) in enumerate(profile_grid):
             if i % log_interval == 0 or i == total_steps - 1:
                 elapsed = time.perf_counter() - t_start
                 logger.info(
-                    "[ProfilingChunk] Profiling prefill latency: %d/%d samples done (chunk=%d, elapsed=%.1fs)",
-                    max(i - 1, 0),
-                    num_samples,
+                    "[ProfilingChunk] Profiling chunk latency: %d/%d points done "
+                    "(chunk=%d, history=%d, elapsed=%.1fs)",
+                    i,
+                    total_steps,
                     chunk_size,
+                    history_len,
                     elapsed,
                 )
 
             try:
                 result = model_executor.collective_rpc(
-                    "profile_prefill_latency",
-                    args=(chunk_size,),
+                    "profile_chunked_prefill_latency",
+                    args=(chunk_size, history_len, self.profiling_chunk_manager.profile_repeats),
                     **rpc_kwargs,
                 )
-
-                # First iteration is warm-up
-                if i == 0:
+                sample = self._extract_profile_sample(result, chunk_size, history_len)
+                if sample is None:
                     continue
-
-                latency_ms = self._extract_latency(result)
-                if latency_ms is None:
-                    continue
-
-                seq_lens.append(chunk_size)
-                latencies.append(latency_ms)
+                samples.append(sample)
 
             except Exception as e:
                 logger.debug(
-                    "[ProfilingChunk] Forward failed for chunk=%d: %s",
+                    "[ProfilingChunk] Forward failed for chunk=%d, history=%d: %s",
                     chunk_size,
+                    history_len,
                     e,
                 )
                 continue
 
-        if len(seq_lens) < 8:
+        if len(samples) < 5:
             logger.warning(
                 "[ProfilingChunk] Profiling failed: only %d samples collected",
-                len(seq_lens),
+                len(samples),
             )
             return
 
         logger.info(
-            "[ProfilingChunk] Collected %d samples. Latency range: [%.2f, %.2f] ms",
-            len(seq_lens),
-            min(latencies),
-            max(latencies),
+            "[ProfilingChunk] Collected %d samples. Median latency range: [%.2f, %.2f] ms",
+            len(samples),
+            min(sample["median_ms"] for sample in samples),
+            max(sample["median_ms"] for sample in samples),
         )
 
-        predictor = self.profiling_chunk_manager.predictor
-        if not predictor.fit(seq_lens, latencies):
+        if not self.profiling_chunk_manager.fit_profile_samples(samples):
             return
 
-        predictor.set_target_latency(base_chunk_size)
-        predictor.is_ready = True
-        self.profiling_chunk_manager._profiling_done = True
+        self.profiling_chunk_manager.save_profile_cache(self.vllm_config, self.max_model_len)
 
         logger.info("[ProfilingChunk] Profiling completed successfully")
 
@@ -225,6 +232,47 @@ class ProfilingChunkScheduler(Scheduler):
         if isinstance(result, list) and len(result) > 0:
             return float(result[0])
         return None
+
+    @staticmethod
+    def _extract_profile_sample(result, chunk_size: int, history_len: int) -> dict | None:
+        """Extract a startup profile sample from collective_rpc result."""
+        if isinstance(result, list) and len(result) > 0:
+            result = result[0]
+        if isinstance(result, dict):
+            runs = [float(value) for value in result.get("runs_ms", [])]
+            median_ms = result.get("median_ms")
+            mean_ms = result.get("mean_ms")
+            if median_ms is None and runs:
+                sorted_runs = sorted(runs)
+                mid = len(sorted_runs) // 2
+                median_ms = (
+                    sorted_runs[mid]
+                    if len(sorted_runs) % 2
+                    else (sorted_runs[mid - 1] + sorted_runs[mid]) / 2.0
+                )
+            if mean_ms is None and runs:
+                mean_ms = sum(runs) / len(runs)
+            if median_ms is None or mean_ms is None:
+                return None
+            return {
+                "chunk_size": int(result.get("chunk_size", chunk_size)),
+                "history_len": int(result.get("history_len", history_len)),
+                "seq_len": int(result.get("seq_len", chunk_size + history_len)),
+                "runs_ms": runs,
+                "mean_ms": float(mean_ms),
+                "median_ms": float(median_ms),
+            }
+        latency_ms = ProfilingChunkScheduler._extract_latency(result)
+        if latency_ms is None:
+            return None
+        return {
+            "chunk_size": chunk_size,
+            "history_len": history_len,
+            "seq_len": chunk_size + history_len,
+            "runs_ms": [latency_ms],
+            "mean_ms": latency_ms,
+            "median_ms": latency_ms,
+        }
 
     # ------------------------------------------------------------------
     # schedule() override

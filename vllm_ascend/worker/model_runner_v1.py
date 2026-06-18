@@ -20,7 +20,6 @@
 import gc
 import math
 import sys
-import time
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -1902,16 +1901,6 @@ class NPUModelRunner(GPUModelRunner):
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
 
-        if self.ascend_config.profiling_chunk_config.need_timing:
-            # Check if the scheduler signaled that calibration is complete.
-            # This flag is set cross-process via scheduler_output because
-            # modifying the config singleton in the scheduler process does
-            # not affect this worker process.
-            if getattr(scheduler_output, "disable_profiling_timing", False):
-                self.ascend_config.profiling_chunk_config.need_timing = False
-            else:
-                self._sync_device()
-                self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
        
@@ -2470,10 +2459,6 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats=cudagraph_stats,
             routed_experts=routed_experts_lists,
         )
-        if self.ascend_config.profiling_chunk_config.need_timing and hasattr(self, '_execution_start_time'):
-            self._sync_device()
-            model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
-
         if self.dynamic_eplb:
             self.eplb_updator.forward_end()
 
@@ -3275,6 +3260,7 @@ class NPUModelRunner(GPUModelRunner):
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        profile_history_len: int = 0,
         profile_cpp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
@@ -3372,8 +3358,11 @@ class NPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it"
                 )
-            self.attn_state = AscendAttentionState.DecodeOnly
-            if self.speculative_config and self.speculative_config.method == "mtp":
+            if profile_cpp:
+                self.attn_state = AscendAttentionState.ChunkedPrefill
+            else:
+                self.attn_state = AscendAttentionState.DecodeOnly
+            if not profile_cpp and self.speculative_config and self.speculative_config.method == "mtp":
                 # `AscendAttentionState.SpecDecoding` is only designed for mla
                 if self.vllm_config.model_config.use_mla:
                     self.attn_state = AscendAttentionState.SpecDecoding
@@ -3404,6 +3393,41 @@ class NPUModelRunner(GPUModelRunner):
             if self._has_gdn:
                 self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                 self.gdn_query_start_loc.copy_to_gpu()
+
+            if profile_cpp:
+                history_len = max(0, int(profile_history_len))
+                seq_len = int(profile_seq_lens) if profile_seq_lens is not None else history_len + num_tokens_unpadded
+                seq_len = max(seq_len, num_tokens_unpadded)
+                history_len = max(seq_len - num_tokens_unpadded, 0)
+
+                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].fill_(history_len)
+                self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs].fill_(seq_len)
+                self.input_batch.num_tokens[:num_reqs] = seq_len
+                self.input_batch.num_tokens_no_spec_cpu_tensor[:num_reqs].fill_(seq_len)
+
+                profile_positions = np.arange(
+                    history_len,
+                    history_len + num_tokens_unpadded,
+                    dtype=np.int64,
+                )
+                self._positions_np_buf[:num_tokens_unpadded] = profile_positions
+                self.positions[:num_tokens_unpadded].copy_(
+                    torch.from_numpy(profile_positions).to(self.device),
+                    non_blocking=True,
+                )
+
+                block_ids = []
+                for block_table in self.input_batch.block_table.block_tables:
+                    num_blocks = math.ceil(seq_len / block_table.physical_block_size)
+                    num_blocks = min(num_blocks, block_table.max_num_blocks_per_req)
+                    block_ids.append(list(range(num_blocks)))
+                self.input_batch.block_table.add_row(tuple(block_ids), 0)
+                self.input_batch.block_table.commit_block_table(num_reqs)
+                self.input_batch.block_table.compute_slot_mapping(
+                    num_reqs,
+                    self.query_start_loc.gpu[: num_reqs + 1],
+                    self.positions[:num_tokens_unpadded],
+                )
 
             if not profile_cpp:
                 num_reqs_padded = self._pad_query_start_loc_for_fia(

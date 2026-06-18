@@ -829,49 +829,95 @@ class NPUWorker(WorkerBase):
         Returns:
             Latency in milliseconds
         """
+        result = self.profile_chunked_prefill_latency(
+            chunk_size=num_tokens,
+            history_len=0,
+            repeats=1,
+        )
+        return result["median_ms"]
+
+    @torch.inference_mode()
+    def profile_chunked_prefill_latency(
+        self,
+        chunk_size: int,
+        history_len: int = 0,
+        repeats: int = 5,
+    ) -> dict:
+        """
+        Profile chunked prefill latency for one synthetic request.
+
+        The measured shape is C new query tokens with H tokens already in
+        KVCache, represented as query length ``chunk_size`` and KV sequence
+        length ``history_len + chunk_size``.
+        """
         import time
 
         # Clamp to valid range
-        num_tokens = min(num_tokens, self.scheduler_config.max_num_batched_tokens)
-        num_tokens = max(num_tokens, 1)
-
-        # Synchronize all devices before timing
-        # This ensures clean measurement in PP/TP scenarios
-        torch.npu.synchronize()
+        max_model_len = getattr(self.model_config, "max_model_len", self.scheduler_config.max_model_len)
+        chunk_size = min(chunk_size, self.scheduler_config.max_num_batched_tokens)
+        chunk_size = min(chunk_size, max_model_len)
+        chunk_size = max(chunk_size, 1)
+        history_len = max(history_len, 0)
+        seq_len = min(history_len + chunk_size, max_model_len)
+        history_len = max(seq_len - chunk_size, 0)
+        repeats = max(repeats, 1)
 
         # In PP mode, we still run on all ranks to keep them synchronized
         # but only the first rank's timing is used for scheduling decisions
         is_first_pp_rank = get_pp_group().is_first_rank
 
-        start = time.perf_counter()
+        latencies_ms = []
+        for i in range(repeats + 1):
+            # Synchronize all devices before timing.  This ensures clean
+            # measurement in PP/TP scenarios and excludes previous work.
+            torch.npu.synchronize()
+            start = time.perf_counter()
 
-        # Run real model forward with force_attention=True
-        # This ensures attention is actually executed, not skipped.
-        # Without force_attention, attn_metadata may be None and attention
-        # won't run, making profiling results inaccurate.
-        # _dummy_run handles PP internally (intermediate tensors, etc.)
-        self.model_runner._dummy_run(
-            num_tokens=num_tokens,
-            force_attention=True,  # Critical: ensure attention is executed
-            profile_cpp=True,
+            # Run real model forward with force_attention=True.  This ensures
+            # attention is actually executed, not skipped.
+            self.model_runner._dummy_run(
+                num_tokens=chunk_size,
+                force_attention=True,
+                profile_cpp=True,
+                profile_seq_lens=seq_len,
+                profile_history_len=history_len,
+            )
+
+            # Synchronize after forward to ensure NPU operations complete.
+            torch.npu.synchronize()
+
+            if i > 0:
+                latencies_ms.append((time.perf_counter() - start) * 1000)
+
+        sorted_latencies = sorted(latencies_ms)
+        mid = len(sorted_latencies) // 2
+        median_ms = (
+            sorted_latencies[mid]
+            if len(sorted_latencies) % 2
+            else (sorted_latencies[mid - 1] + sorted_latencies[mid]) / 2.0
         )
-
-        # Synchronize after forward to ensure NPU operations complete
-        torch.npu.synchronize()
-
-        latency_ms = (time.perf_counter() - start) * 1000
+        mean_ms = sum(latencies_ms) / len(latencies_ms)
 
         # Log for debugging in PP mode
         if not is_first_pp_rank:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    "[ProfilingChunk] PP rank %d: profiled %d tokens, latency=%.2f ms (not used)",
+                    "[ProfilingChunk] PP rank %d: profiled chunk=%d, history=%d, "
+                    "median=%.2f ms (not used)",
                     get_pp_group().rank_in_group,
-                    num_tokens,
-                    latency_ms,
+                    chunk_size,
+                    history_len,
+                    median_ms,
                 )
 
-        return latency_ms
+        return {
+            "chunk_size": chunk_size,
+            "history_len": history_len,
+            "seq_len": seq_len,
+            "runs_ms": latencies_ms,
+            "mean_ms": mean_ms,
+            "median_ms": median_ms,
+        }
 
     def get_kv_connector_handshake_metadata(
         self,
