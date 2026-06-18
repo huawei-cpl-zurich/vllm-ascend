@@ -455,6 +455,7 @@ class ProfilingChunkManager:
     ):
         self.base_chunk_size = base_chunk_size
         self.page_size = page_size
+        self.min_chunk = min_chunk
         self.profile_samples: list[dict[str, Any]] = []
         self.profile_repeats = profile_repeats
         self.profile_max_seq_len = profile_max_seq_len
