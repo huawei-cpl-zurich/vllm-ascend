@@ -3472,7 +3472,6 @@ class NPUModelRunner(GPUModelRunner):
             self.quest_decode_metadata_manager = QuestDecodeMetadataManager(
                 vllm_config=self.vllm_config,
                 ascend_config=self.ascend_config,
-                model_config=self.model_config,
                 max_encoder_len=self.max_encoder_len,
                 max_num_reqs=self.max_num_reqs,
                 device=self.device,
