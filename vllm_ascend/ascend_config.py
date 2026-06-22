@@ -585,8 +585,8 @@ class QuestDecodeConfig:
         self.enable = bool(quest_decode_config.get("enable", False))
         topk_pages = quest_decode_config.get("topk_pages")
         if self.enable:
-            if not isinstance(topk_pages, int) or topk_pages <= 0:
-                raise ValueError("quest_decode_config.topk_pages must be a positive integer when QUEST is enabled.")
+            if not isinstance(topk_pages, int) or topk_pages < 2:
+                raise ValueError("quest_decode_config.topk_pages must be an integer >= 2 when QUEST is enabled.")
         self.topk_pages = topk_pages or 0
 
 

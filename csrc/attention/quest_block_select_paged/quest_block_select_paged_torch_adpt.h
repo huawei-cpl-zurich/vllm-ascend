@@ -82,6 +82,8 @@ inline void check_quest_block_select_paged_common(
     TORCH_CHECK(output.size(0) == batch_size && output.size(1) == num_heads,
                 "selected_indices must have shape [B, H, k].");
     TORCH_CHECK(output_k > 0, "k must be positive.");
+    TORCH_CHECK(tokens_since_metadata_update == -1 || output_k >= 2,
+                "quest_block_select_paged requires k >= 2 when fixed anchors are enabled.");
     TORCH_CHECK(num_heads % num_kv_heads == 0,
                 "num_heads must be divisible by num_kv_heads.");
     TORCH_CHECK(metadata_block_tables.size(1) <= QUEST_BLOCK_SELECT_MAX_MMBPR,
@@ -108,6 +110,8 @@ inline at::Tensor npu_quest_block_select_paged(
     int64_t tokens_since_metadata_update)
 {
     TORCH_CHECK(k > 0, "k must be positive.");
+    TORCH_CHECK(tokens_since_metadata_update == -1 || k >= 2,
+                "quest_block_select_paged requires k >= 2 when fixed anchors are enabled.");
     const int64_t rounded_k = round_k_for_quest(k);
     at::Tensor output = at::empty(
         {query.size(0), query.size(1), rounded_k},

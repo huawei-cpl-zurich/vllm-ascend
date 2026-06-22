@@ -421,8 +421,9 @@ at::Tensor npu_quest_block_select_paged_meta(
     (void)minblocks;
     (void)metadata_block_tables;
     (void)seq_lens;
-    (void)tokens_since_metadata_update;
     TORCH_CHECK(k > 0, "k must be positive.");
+    TORCH_CHECK(tokens_since_metadata_update == -1 || k >= 2,
+                "quest_block_select_paged requires k >= 2 when fixed anchors are enabled.");
     return at::empty(
         {query.size(0), query.size(1), k},
         query.options().dtype(at::kInt));
