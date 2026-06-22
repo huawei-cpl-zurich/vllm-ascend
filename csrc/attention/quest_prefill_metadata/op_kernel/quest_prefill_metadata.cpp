@@ -107,8 +107,11 @@ public:
             }
             ASSERT(start_len >= 0 && "refresh_start_seq_lens must be non-negative.");
 
+            // Metadata is materialized only for complete KV pages. The active
+            // tail page is selected by the decode selector's fixed anchor, so
+            // do not refresh partial-page metadata here.
             int32_t start_page = start_len / block_size_;
-            int32_t end_page = ceilDiv(end_len, block_size_);
+            int32_t end_page = end_len / block_size_;
             int32_t start_meta_block = start_page / block_size_;
             int32_t end_meta_block = ceilDiv(end_page, block_size_);
 
@@ -133,12 +136,6 @@ public:
                 for (int32_t page_offset = first_page; page_offset < last_page; ++page_offset) {
                     int32_t logical_page = meta_block_start_page + page_offset;
                     int32_t tokens_to_reduce = block_size_;
-                    if (logical_page == end_page - 1) {
-                        int32_t tail_tokens = end_len - logical_page * block_size_;
-                        if (tail_tokens > 0 && tail_tokens < block_size_) {
-                            tokens_to_reduce = tail_tokens;
-                        }
-                    }
 
                     int32_t kv_block_id = block_tables_gm_.GetValue(
                         request_idx * max_kv_blocks_per_request_ + logical_page);

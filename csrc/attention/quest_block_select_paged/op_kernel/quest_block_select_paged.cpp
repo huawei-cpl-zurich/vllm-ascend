@@ -30,55 +30,50 @@ using namespace AscendC;
 
 __aicore__ inline void quest_apply_anchor_selection(
     LocalTensor<uint32_t> &selected_indices_lt,
-    int32_t seq_len,
-    int32_t block_size,
+    LocalTensor<uint32_t> &candidate_indices_lt,
+    int32_t valid_page_count,
     int32_t k)
 {
-    if (seq_len <= 0 || k <= 0) {
+    if (valid_page_count <= 0 || k <= 0) {
         return;
     }
 
-    int32_t num_valid_pages = DIV_ROUNDUP(seq_len, block_size);
-    int32_t num_selected_pages = MIN(k, num_valid_pages);
-    // Case 1: Nothing selected
+    int32_t num_selected_pages = MIN(k, valid_page_count);
     if (num_selected_pages <= 0) {
         return;
     }
 
-    // Case 2: <= 2 blocks selected
-    uint32_t last_anchor = static_cast<uint32_t>(num_valid_pages - 1);
+    uint32_t last_anchor = static_cast<uint32_t>(valid_page_count - 1);
     if (unlikely(num_selected_pages <= 2)) {
         for (int32_t idx = 0; idx < k; ++idx) {
             selected_indices_lt.SetValue(idx, 0U);
         }
-        // If only one page is selected, last_anchor should win
-        selected_indices_lt.SetValue(num_selected_pages - 1, last_anchor);
+        if (num_selected_pages == 1) {
+            selected_indices_lt.SetValue(0, last_anchor);
+        } else {
+            selected_indices_lt.SetValue(0, 0U);
+            selected_indices_lt.SetValue(1, last_anchor);
+        }
         return;
     }
 
-    // Case 3: > 2 blocks selected
-    bool has_first_anchor = false;
-    bool has_last_anchor = false;
-    for (int32_t idx = 0; idx < num_selected_pages; ++idx) {
-        uint32_t selected_page = selected_indices_lt.GetValue(idx);
-        has_first_anchor = has_first_anchor || selected_page == 0U;
-        has_last_anchor = has_last_anchor || selected_page == last_anchor;
-        if (has_first_anchor && has_last_anchor) {
-            break;
-        }
-    }
-
-    if (!has_first_anchor) {
-        selected_indices_lt.SetValue(num_selected_pages - 1, 0U);
-    }
-    if (!has_last_anchor) {
-        selected_indices_lt.SetValue(
-            num_selected_pages - 1 - static_cast<int32_t>(!has_first_anchor),
-            last_anchor);
-    }
-
-    for (int32_t idx = num_selected_pages; idx < k; ++idx) {
+    for (int32_t idx = 0; idx < k; ++idx) {
+        candidate_indices_lt.SetValue(idx, selected_indices_lt.GetValue(idx));
         selected_indices_lt.SetValue(idx, 0U);
+    }
+
+    selected_indices_lt.SetValue(0, 0U);
+    selected_indices_lt.SetValue(1, last_anchor);
+
+    int32_t output_idx = 2;
+    for (int32_t idx = 0; idx < k && output_idx < num_selected_pages; ++idx) {
+        uint32_t page_idx = candidate_indices_lt.GetValue(idx);
+        if (page_idx == 0U || page_idx == last_anchor ||
+            page_idx >= static_cast<uint32_t>(valid_page_count)) {
+            continue;
+        }
+        selected_indices_lt.SetValue(output_idx, page_idx);
+        output_idx++;
     }
 }
 
@@ -215,9 +210,15 @@ public:
             int32_t seq_len = seq_lens_gm_.GetValue(batch_idx);
             int32_t valid_page_count = seq_len > 0 ? DIV_ROUNDUP(seq_len, block_size_) : 0;
             bool use_fixed_anchors = tokens_since_metadata_update_ >= 0;
-            if (unlikely(valid_page_count <= 0 || k_ >= valid_page_count)) {
+            if (unlikely(valid_page_count <= 0 || (!use_fixed_anchors && k_ >= valid_page_count))) {
                 quest_apply_sequential_selection(
                     tensors.selected_indices,
+                    valid_page_count,
+                    k_);
+            } else if (unlikely(use_fixed_anchors && valid_page_count <= 2)) {
+                quest_apply_anchor_selection(
+                    tensors.selected_indices,
+                    tensors.index_local,
                     valid_page_count,
                     k_);
             } else {
@@ -241,13 +242,18 @@ public:
                         num_meta_blocks_in_request);
                 }
 
+                if (likely(use_fixed_anchors)) {
+                    // Anchors are inserted after sorting; mask their scores so
+                    // the remaining slots are selected only from interior pages.
+                    MaskAnchorScores(tensors, valid_page_count);
+                }
                 SortAndExtract(tensors, sort_element_count);
 
                 if (likely(use_fixed_anchors)) {
                     quest_apply_anchor_selection(
                         tensors.selected_indices,
-                        seq_len,
-                        block_size_,
+                        tensors.index_local,
+                        valid_page_count,
                         k_);
                 }
             }
@@ -450,6 +456,17 @@ private:
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             }
         }
+    }
+
+    __aicore__ inline void MaskAnchorScores(LocalTensors &tensors, int32_t valid_page_count)
+    {
+        if (valid_page_count <= 0) {
+            return;
+        }
+
+        tensors.accumulated_scores.SetValue(0, static_cast<ComputeT>(MINFLOAT));
+        tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(MINFLOAT));
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void SortAndExtract(

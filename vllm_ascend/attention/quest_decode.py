@@ -183,7 +183,9 @@ class _QuestLayerMetadata:
         batch_metadata: QuestBatchMetadata,
     ) -> bool:
         """Compute and upload the token ranges that need metadata refresh for this layer.
-        Start lengths are persistent freshness markers, while end lengths are per-call refresh requests.
+        Start lengths are persistent raw-token freshness markers, while end
+        lengths are per-call refresh requests. The metadata kernel maps this
+        raw range to selector-specific page boundaries.
         """
         num_reqs = batch_metadata.batch_size
         if num_reqs <= 0:
