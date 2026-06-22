@@ -603,13 +603,25 @@ class QuestDecodeMetadataManager:
             QUEST_PAGE_SIZE,
             rounding_mode="floor",
         )
-        total_blocks = total_blocks[total_blocks > 0]
-        if total_blocks.numel() == 0:
-            return False
-
-        selected_blocks_per_req = torch.clamp(total_blocks, max=selected_blocks)
-        avg_selected_ratio = (selected_blocks_per_req.float() / total_blocks.float()).mean()
-        return bool((avg_selected_ratio < QUEST_SPARSE_SELECTED_BLOCK_RATIO_THRESHOLD).item())
+        valid_mask = total_blocks > 0
+        safe_total_blocks = torch.where(
+            valid_mask,
+            total_blocks,
+            torch.ones_like(total_blocks),
+        )
+        selected_blocks_per_req = torch.clamp(safe_total_blocks, max=selected_blocks)
+        selected_ratio = selected_blocks_per_req.float() / safe_total_blocks.float()
+        selected_ratio = torch.where(
+            valid_mask,
+            selected_ratio,
+            torch.zeros_like(selected_ratio),
+        )
+        valid_count = valid_mask.sum()
+        avg_selected_ratio = selected_ratio.sum() / torch.clamp(valid_count, min=1)
+        return bool((
+            (valid_count > 0)
+            & (avg_selected_ratio < QUEST_SPARSE_SELECTED_BLOCK_RATIO_THRESHOLD)
+        ).item())
 
 
 class QuestAttentionBackend(AscendAttentionBackend):
