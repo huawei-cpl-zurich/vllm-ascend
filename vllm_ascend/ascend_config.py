@@ -626,61 +626,20 @@ class ProfilingChunkConfig:
         self.enabled: bool = config.get("enabled", False)
         self.smooth_factor: float = float(config.get("smooth_factor", 1.0))
         self.min_chunk: int = int(config.get("min_chunk", 4096))
-        self.cache_dir: str | None = config.get("cache_dir", None)
-        self.cache_mode: str = config.get("cache_mode", "auto")
-        self.profile_repeats: int = int(config.get("profile_repeats", 5))
-        profile_max_seq_len = config.get("profile_max_seq_len", None)
-        self.profile_max_seq_len: int | None = (
-            int(profile_max_seq_len) if profile_max_seq_len is not None else None
-        )
-        self.profile_chunk_sizes: list[int] | None = self._parse_int_list(
-            config.get("profile_chunk_sizes", None),
-            "profile_chunk_sizes",
-            allow_zero=False,
-        )
-        self.profile_history_sizes: list[int] | None = self._parse_int_list(
-            config.get("profile_history_sizes", None),
-            "profile_history_sizes",
-            allow_zero=True,
-        )
+        # Controls online history-aware calibration. When True, the model
+        # runner synchronizes the device each step to measure execution time
+        # and feeds it back for incremental refitting.  Automatically set to
+        # False once calibration completes.  Users can set it to False from
+        # the start to skip online calibration entirely and rely solely on
+        # the startup profiling model (avoids per-step sync overhead).
+        self.need_timing: bool = config.get("need_timing", self.enabled)
         self._validate()
-
-    @staticmethod
-    def _parse_int_list(value, name: str, allow_zero: bool) -> list[int] | None:
-        if value is None:
-            return None
-        if not isinstance(value, list):
-            raise ValueError(f"profiling_chunk_config.{name} must be a list of integers")
-        parsed = [int(item) for item in value]
-        if allow_zero:
-            invalid = any(item < 0 for item in parsed)
-            requirement = "non-negative"
-        else:
-            invalid = any(item <= 0 for item in parsed)
-            requirement = "positive"
-        if invalid:
-            raise ValueError(f"profiling_chunk_config.{name} must contain only {requirement} integers")
-        return parsed
 
     def _validate(self):
         if not (0 < self.smooth_factor <= 1.0):
             raise ValueError(f"profiling_chunk_config.smooth_factor must be in (0, 1], got {self.smooth_factor}")
         if self.min_chunk <= 0:
             raise ValueError(f"profiling_chunk_config.min_chunk must be positive, got {self.min_chunk}")
-        if self.cache_mode not in {"auto", "refresh", "readonly", "off"}:
-            raise ValueError(
-                "profiling_chunk_config.cache_mode must be one of "
-                f"['auto', 'refresh', 'readonly', 'off'], got {self.cache_mode}"
-            )
-        if self.profile_repeats <= 0:
-            raise ValueError(
-                f"profiling_chunk_config.profile_repeats must be positive, got {self.profile_repeats}"
-            )
-        if self.profile_max_seq_len is not None and self.profile_max_seq_len <= 0:
-            raise ValueError(
-                "profiling_chunk_config.profile_max_seq_len must be positive, "
-                f"got {self.profile_max_seq_len}"
-            )
 
 
 class RejectionSamplerConfig:
