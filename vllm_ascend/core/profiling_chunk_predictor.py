@@ -14,413 +14,623 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""
-Profiling-based Dynamic Chunk Size Predictor.
+"""Lookup-table dynamic chunked prefill scheduling.
 
-This module implements a dynamic chunk sizing strategy based on profiling prefill
-latency and fitting a quadratic model.
-
-The approach:
-1. Profile: Run forward passes with different chunk sizes to measure latency
-2. Fit: Use quadratic model f(l) = a·l² + b·l + c to fit the latency data
-3. Predict: Given current num_computed_tokens H, solve for chunk size x
-   that achieves target latency T using the correct incremental cost model:
-
-       T_incr(x, H) = a·x·(H+x) + b·x + c
-
-   This is NOT f(H+x) − f(H) — the latter double-counts the attention
-   cross-term between cached and new tokens (see ChunkSizePredictor).
+The lookup table is the source of truth.  Startup either loads a JSON table or
+profiles full forward passes for a fixed grid of history and chunk sizes.  At
+runtime a small receding-horizon beam search chooses the next chunk from the
+allowed chunk set.
 """
 
-import math
+import json
+import os
+from bisect import bisect_left
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-import numpy as np
 from vllm.logger import logger
 
+PROFILE_SCHEMA_VERSION = 1
 
-class ChunkSizePredictor:
-    """Predictor for dynamic chunk size based on quadratic latency model.
 
-    Models latency as: f(l) = a·l² + b·l + c
+def _align_down(value: int, alignment: int) -> int:
+    return value // alignment * alignment
 
-    The incremental latency of processing x new tokens when H tokens are
-    already in KVCache is:
 
-        T_incr(x, H) = a·x·(H+x) + b·x + c
+def _align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
 
-    Only the x new query tokens attend to the H+x KV positions — the
-    H cached tokens do not recompute attention.  This is fundamentally
-    different from the naïve f(H+x) − f(H) subtraction, which would give
-    2aHx + ax² + bx (overcounting the cross-term by a factor of 2).
 
-    Given a target latency T and current history length H, predicts next
-    chunk size x such that: a·x·(H+x) + b·x = T − c
+def _median(values: list[float]) -> float:
+    sorted_values = sorted(values)
+    mid = len(sorted_values) // 2
+    if len(sorted_values) % 2:
+        return float(sorted_values[mid])
+    return float((sorted_values[mid - 1] + sorted_values[mid]) / 2.0)
 
-    This expands to the quadratic equation: a·x² + (aH + b)·x + (c − T) = 0
-    """
 
-    def __init__(self, smooth_factor: float = 0.8, min_chunk: int = 4096):
-        self.quadratic_coeff_a: float = 0.0
-        self.linear_coeff_b: float = 0.0
-        self.constant_coeff_c: float = 0.0
+def generate_allowed_chunk_sizes(
+    min_chunk: int,
+    max_chunk: int,
+    alignment: int,
+) -> list[int]:
+    """Generate hardware-friendly chunks of the form 2^n and 3*2^(n-1)."""
+    candidates: set[int] = set()
+    power = 1
+    while power <= max_chunk:
+        if power >= min_chunk:
+            candidates.add(power)
+        three_half = 3 * power // 2
+        if power % 2 == 0 and min_chunk <= three_half <= max_chunk:
+            candidates.add(three_half)
+        power *= 2
 
-        self.quadratic_chunk_a: float = 0.0
-        self.linear_chunk_b: float = 0.0
-        self.constant_chunk_c: float = 0.0
+    aligned = {
+        _align_up(chunk_size, alignment)
+        for chunk_size in candidates
+        if min_chunk <= chunk_size <= max_chunk
+    }
+    return sorted(
+        chunk_size
+        for chunk_size in aligned
+        if min_chunk <= chunk_size <= max_chunk
+        and chunk_size % alignment == 0
+    )
 
-        self.target_latency: float | None = None
-        self.is_ready: bool = False
-        self.with_history_ready: bool = False
-        self.smooth_factor = smooth_factor
-        self.min_chunk = min_chunk
-        self.history_fitted = False
 
-    def clamp_quadratic_and_linear_if_negative(self, fitted_a: float, fitted_b: float) -> tuple[float, float]:
-        """In theory, for the Transfomur structure of LLM, the fitted quadratic and linear
-        terms should not be negative. Can perform zero clamping for inaccurate fitting
-        """
-        if fitted_a < 0:
-            logger.warning("Fitted a=%.2e is not positive. Setting a=1e-9.", fitted_a)
-            fitted_a = 1e-9
-        if fitted_b < 0:
-            logger.warning("Fitted b=%.2e is not positive. Setting b=0.0.", fitted_b)
-            fitted_b = 1e-9
-
-        return fitted_a, fitted_b
-
-    def fit(self, seq_lens: list[int], latencies: list[float]) -> bool:
-        """Fit quadratic coefficients f(l) = al^2 + bl + c from data points.
-
-        Returns:
-            True if fitting succeeded, False otherwise
-        """
-        L = np.array(seq_lens, dtype=np.float64)
-        T = np.array(latencies, dtype=np.float64)
-        MIN_FIT_POINTS_NO_CHUNK = 8
-
-        if len(L) < MIN_FIT_POINTS_NO_CHUNK:
-            logger.warning(
-                "Not enough data points for quadratic fitting (%d < 8)",
-                len(L),
-            )
-            return False
-
-        X = np.column_stack([L * L, L, np.ones_like(L)])
-
-        try:
-            coeffs, _, _, _ = np.linalg.lstsq(X, T, rcond=None)
-            fitted_a = float(coeffs[0])
-            fitted_b = float(coeffs[1])
-            fitted_c = float(coeffs[2])
-        except Exception as e:
-            # Keep a robust fallback for environments where least-squares may
-            # fail due backend/LAPACK differences.
-            try:
-                poly = np.polyfit(L, T, 2)
-                fitted_a = float(poly[0])
-                fitted_b = float(poly[1])
-                fitted_c = float(poly[2])
-                logger.warning(
-                    "Least-squares fitting failed (%s), fallback to polyfit succeeded.",
-                    e,
-                )
-            except Exception as fallback_error:
-                logger.warning("Failed to fit quadratic model: %s", fallback_error)
-                return False
-
-        fitted_a, fitted_b = self.clamp_quadratic_and_linear_if_negative(fitted_a, fitted_b)
-
-        self.quadratic_coeff_a = fitted_a
-        self.linear_coeff_b = fitted_b
-        self.constant_coeff_c = fitted_c
-
-        logger.info(
-            "[ProfilingChunk] Fitted: a=%.2e, b=%.2e, c=%.2e",
-            fitted_a,
-            fitted_b,
-            fitted_c,
-        )
-        return True
-
-    def fit_chunk(self, chunked_data: list) -> bool:
-        """Fit time with chunks: f(C,H) = a*C(C+H) + b*C + c*H.
-
-        Returns:
-            True if fitting succeeded, False otherwise
-        """
-        num_points = len(chunked_data)
-        # experience values, can be tuned. We don't want the online calibration process
-        # to be too long, so we have limited the amount of data.
-        # 30 data points are already sufficient.
-        MIN_FIT_POINTS_CHUNK = 5
-        MAX_FIT_POINTS_CHUNK = 30
-        if num_points < MIN_FIT_POINTS_CHUNK:
-            logger.warning(
-                "Not enough data points for chunked data fitting (%d < 5)",
-                num_points,
-            )
-            return False
-        if num_points > MAX_FIT_POINTS_CHUNK:
-            self.history_fitted = True
-            return False
-
-        chunked_data_array = np.array(chunked_data)
-        execute_time = chunked_data_array[:, -1]
-        input_x = chunked_data_array[:, :-1]
-
-        try:
-            params, _, _, _ = np.linalg.lstsq(input_x, execute_time, rcond=None)
-            fitted_a = float(params[0])
-            fitted_b = float(params[1])
-            fitted_c = float(params[2])
-        except np.linalg.LinAlgError as e:
-            logger.warning("Failed to fit chunked model: %s", e)
-            return False
-
-        fitted_a, fitted_b = self.clamp_quadratic_and_linear_if_negative(fitted_a, fitted_b)
-
-        self.quadratic_chunk_a = fitted_a
-        self.linear_chunk_b = fitted_b
-        self.constant_chunk_c = fitted_c
-
-        logger.info(
-            "[ProfilingChunk With History] Fitted: a=%.2e, b=%.2e, c=%.2e",
-            fitted_a,
-            fitted_b,
-            fitted_c,
-        )
-        return True
-
-    def set_target_latency(self, base_chunk_size: int, elapsed_time: float = 0.0) -> None:
-        """Set target latency based on base chunk size.
-
-        Uses the corrected incremental model: T_target = a·base·(base+0) + b·base + c
-        which simplifies to f(base_chunk_size) — the full cost of a forward pass
-        processing base_chunk_size tokens with no KVCache.
-        """
-        if elapsed_time > 0:
-            self.target_latency = elapsed_time
+def generate_history_sizes(
+    max_model_len: int,
+    num_points: int,
+    alignment: int,
+) -> list[int]:
+    """Generate an evenly spaced, aligned history grid."""
+    history_sizes: set[int] = {0, max_model_len}
+    for index in range(num_points):
+        raw_history = round(index * max_model_len / (num_points - 1))
+        if index == num_points - 1:
+            history = max_model_len
+        elif raw_history == 0:
+            history = 0
         else:
-            self.target_latency = self.quadratic_coeff_a * base_chunk_size * base_chunk_size \
-                                + self.linear_coeff_b * base_chunk_size \
-                                + self.constant_coeff_c
-        if self.target_latency <= 0:
-            self.target_latency = 1.0
+            history = _align_down(raw_history, alignment)
+        history_sizes.add(max(0, min(history, max_model_len)))
+    return sorted(history_sizes)
 
-        logger.info(
-            "[ProfilingChunk] Target latency: %.2f ms (base_chunk=%d)",
-            self.target_latency,
-            base_chunk_size,
+
+@dataclass
+class ChunkLatencyTable:
+    history_sizes: list[int]
+    chunk_sizes: list[int]
+    latencies_ms: list[list[float | None]]
+    metadata: dict[str, Any] | None = None
+
+    @classmethod
+    def from_json_file(cls, path: str) -> "ChunkLatencyTable":
+        with open(path, encoding="utf-8") as profile_file:
+            payload = json.load(profile_file)
+
+        history_sizes = [int(item) for item in payload["history_sizes"]]
+        chunk_sizes = [int(item) for item in payload["chunk_sizes"]]
+        latencies_ms = [
+            [None if value is None else float(value) for value in row]
+            for row in payload["latencies_ms"]
+        ]
+        table = cls(
+            history_sizes=history_sizes,
+            chunk_sizes=chunk_sizes,
+            latencies_ms=latencies_ms,
+            metadata=dict(payload.get("metadata", {})),
         )
+        table.validate()
+        return table
 
-    def get_time(
-        self,
-        query_len: int,
-        num_computed_tokens: int,
-    ) -> float:
-        """Get predicted incremental latency for processing x new tokens with H cached.
+    def to_json_file(self, path: str) -> None:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        payload = {
+            "schema_version": PROFILE_SCHEMA_VERSION,
+            "metadata": self.metadata or {},
+            "history_sizes": self.history_sizes,
+            "chunk_sizes": self.chunk_sizes,
+            "latencies_ms": self.latencies_ms,
+        }
+        with open(path, "w", encoding="utf-8") as profile_file:
+            json.dump(payload, profile_file, indent=2, sort_keys=True)
 
-        Correct model: T_incr(x, H) = a·x·(H+x) + b·x + c
+    def validate(self) -> None:
+        if not self.history_sizes:
+            raise ValueError("profiling table history_sizes is empty")
+        if not self.chunk_sizes:
+            raise ValueError("profiling table chunk_sizes is empty")
+        if sorted(set(self.history_sizes)) != self.history_sizes:
+            raise ValueError("profiling table history_sizes must be unique and sorted")
+        if sorted(set(self.chunk_sizes)) != self.chunk_sizes:
+            raise ValueError("profiling table chunk_sizes must be unique and sorted")
+        if len(self.latencies_ms) != len(self.history_sizes):
+            raise ValueError("latency row count does not match history count")
+        for row in self.latencies_ms:
+            if len(row) != len(self.chunk_sizes):
+                raise ValueError("latency column count does not match chunk count")
 
-        Only the x new tokens compute attention (attending to H+x KV positions),
-        unlike full prefill where all H+x tokens attend to all H+x tokens.
-        Using f(H+x) - f(H) = 2aHx + ax² + bx overcounts the cross-term by aHx.
-        """
-        return (
-            self.quadratic_coeff_a * query_len * (query_len + num_computed_tokens)
-            + self.linear_coeff_b * query_len
-            + self.constant_coeff_c
-        )
+    def has_usable_entry(self) -> bool:
+        return any(value is not None for row in self.latencies_ms for value in row)
 
-    def get_time_with_history(
-        self,
-        query_len: int,
-        num_computed_tokens: int,
-    ) -> float:
-        """Get time T based on current seq_lens, f(C,H) = a*C(C+H) + b*(C+H) + c = T"""
-        return (
-            self.quadratic_chunk_a * query_len * (query_len + num_computed_tokens)
-            + self.linear_chunk_b * (query_len + num_computed_tokens)
-            + self.constant_chunk_c
-        )
+    def _history_index(self, history: int) -> int:
+        index = bisect_left(self.history_sizes, history)
+        if index >= len(self.history_sizes):
+            return len(self.history_sizes) - 1
+        return index
 
-    def predict(
-        self,
-        num_computed_tokens: int,
-        base_chunk_size: int,
-        page_size: int,
-    ) -> int | None:
-        """Predict next chunk size x such that a·x·(H+x) + b·x = T.
-
-        The incremental latency of processing x new tokens when H tokens are
-        already cached is:  T_incr(x, H) = a·x·(H+x) + b·x + c
-
-        The constant overhead c affects every forward pass equally regardless
-        of chunk size, so it cancels when solving for the optimal x:
-            a·x² + (a·H + b)·x - (a·base² + b·base) = 0
-
-        The key difference from the naive f(H+x)-f(H) subtraction is that
-        full prefill attention cost is a·(H+x)² (all H+x tokens attend to all
-        H+x tokens), while incremental attention cost is only a·x·(H+x)
-        (only the x new tokens attend to the H+x KV positions — the H cached
-        tokens do not recompute attention).  Using f(H+x)-f(H) overcounts the
-        cross-term by a factor of 2, which systematically shrinks predictions
-        as H grows.
-        """
-        if not self.is_ready or self.target_latency is None:
+    def latency_or_none(self, history: int, chunk: int) -> float | None:
+        try:
+            chunk_index = self.chunk_sizes.index(chunk)
+        except ValueError:
             return None
+        return self.latencies_ms[self._history_index(history)][chunk_index]
 
-        if self.quadratic_coeff_a <= 0:
-            return None
-
-        A = self.quadratic_coeff_a
-        B = self.quadratic_coeff_a * num_computed_tokens + self.linear_coeff_b
-        C = -self.target_latency
-
-        discriminant = B * B - 4 * A * C
-        if discriminant < 0:
-            return None
-
-        sqrt_disc = math.sqrt(discriminant)
-        x = (-B + sqrt_disc) / (2 * A)
-
-        if x <= 0:
-            return None
-
-        smoothed = base_chunk_size + self.smooth_factor * (x - base_chunk_size)
-        chunk_size = max(int(smoothed), self.min_chunk)
-
-        align = max(page_size, 64)
-        chunk_size = ((chunk_size + align - 1) // align) * align
-        if chunk_size < align:
-            chunk_size = align
-
-        logger.debug("[ProfilingChunk] Predicted chunk_size=%d", chunk_size)
-        return chunk_size if chunk_size >= align else None
-
-    def predict_with_history(
-        self,
-        num_computed_tokens: int,
-        base_chunk_size: int,
-        page_size: int,
-    ) -> int | None:
-        """Predict next chunk size x using the history-aware model
-        f(C,H) = a*C(C+H) + b*C + c*H."""
-        if not self.is_ready or self.target_latency is None:
-            return None
-
-        if not self.with_history_ready:
-            return None
-
-        if self.quadratic_chunk_a <= 0:
-            return None
-
-        # a*C^2 + (a*H + b)*C + b*H + c - T = 0
-        A = self.quadratic_chunk_a
-        B = self.quadratic_chunk_a * num_computed_tokens + self.linear_chunk_b
-        C = self.linear_chunk_b * num_computed_tokens + self.constant_chunk_c - self.target_latency
-
-        discriminant = B * B - 4 * A * C
-        if discriminant < 0:
-            return None
-
-        sqrt_disc = math.sqrt(discriminant)
-        x = (-B + sqrt_disc) / (2 * A)
-
-        if x <= 0:
-            return None
-
-        logger.debug("[ProfilingChunk] History-aware raw prediction: %.1f", x)
-        smoothed = base_chunk_size + self.smooth_factor * (x - base_chunk_size)
-        chunk_size = max(int(smoothed), self.min_chunk)
-
-        align = max(page_size, 64)
-        chunk_size = ((chunk_size + align - 1) // align) * align
-        if chunk_size < align:
-            chunk_size = align
-
-        return chunk_size if chunk_size >= align else None
+    def lookup(self, history: int, chunk: int) -> float:
+        latency = self.latency_or_none(history, chunk)
+        if latency is None:
+            raise ValueError(f"missing latency for history={history}, chunk={chunk}")
+        return latency
 
 
-class ProfilingChunkManager:
-    """Manager for profiling-based dynamic chunk sizing.
-
-    Handles the profiling process and maintains the ChunkSizePredictor.
-    """
+class FullForwardChunkProfiler:
+    """Root-side orchestration for distributed full-forward profiling."""
 
     def __init__(
         self,
-        base_chunk_size: int,
-        page_size: int,
-        smooth_factor: float = 0.8,
-        min_chunk: int = 4096,
-    ):
-        self.base_chunk_size = base_chunk_size
-        self.page_size = page_size
-        self.chunked_fit_data: list = []
+        model_executor: Any,
+        metadata: dict[str, Any],
+    ) -> None:
+        self.model_executor = model_executor
+        self.metadata = metadata
 
-        self.predictor = ChunkSizePredictor(smooth_factor=smooth_factor, min_chunk=min_chunk)
-        self._profiling_done = False
-        self._set_time_count = 0
-        self._set_time_done = False
+    def profile(
+        self,
+        history_sizes: list[int],
+        chunk_sizes: list[int],
+        repeats: int,
+        max_model_len: int,
+    ) -> ChunkLatencyTable:
+        latencies_ms: list[list[float | None]] = []
+        total_points = len(history_sizes) * len(chunk_sizes)
+        completed = 0
+
+        logger.info(
+            "[ProfilingChunk] Running full-forward profiling: %d histories, "
+            "%d chunks, %d repeats",
+            len(history_sizes),
+            len(chunk_sizes),
+            repeats,
+        )
+
+        for history in history_sizes:
+            row: list[float | None] = []
+            for chunk in chunk_sizes:
+                completed += 1
+                if history + chunk > max_model_len:
+                    row.append(None)
+                    continue
+                try:
+                    result = self.model_executor.collective_rpc(
+                        "profile_prefill_latency",
+                        args=(history, chunk, repeats),
+                    )
+                    latency_ms = self._extract_latency(result)
+                    row.append(latency_ms)
+                    logger.info(
+                        "[ProfilingChunk] Profiled %d/%d: history=%d, chunk=%d, "
+                        "latency=%s ms",
+                        completed,
+                        total_points,
+                        history,
+                        chunk,
+                        "%.3f" % latency_ms if latency_ms is not None else "null",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[ProfilingChunk] Profiling failed for history=%d, "
+                        "chunk=%d: %s",
+                        history,
+                        chunk,
+                        e,
+                    )
+                    row.append(None)
+            latencies_ms.append(row)
+
+        table = ChunkLatencyTable(
+            history_sizes=history_sizes,
+            chunk_sizes=chunk_sizes,
+            latencies_ms=latencies_ms,
+            metadata=self.metadata,
+        )
+        table.validate()
+        if not table.has_usable_entry():
+            raise RuntimeError("profiling produced no usable latency entries")
+        return table
+
+    @classmethod
+    def _extract_latency(cls, result: Any) -> float | None:
+        runs = cls._extract_runs(result)
+        if runs:
+            return _median(runs)
+        values = cls._extract_scalar_latencies(result)
+        if not values:
+            return None
+        return max(values)
+
+    @classmethod
+    def _extract_runs(cls, result: Any) -> list[float]:
+        if isinstance(result, dict) and isinstance(result.get("runs_ms"), list):
+            return [float(value) for value in result["runs_ms"]]
+        if isinstance(result, list):
+            per_rank_runs = []
+            for item in result:
+                runs = cls._extract_runs(item)
+                if runs:
+                    per_rank_runs.append(runs)
+            if not per_rank_runs:
+                return []
+            min_len = min(len(runs) for runs in per_rank_runs)
+            return [
+                max(runs[index] for runs in per_rank_runs)
+                for index in range(min_len)
+            ]
+        return []
+
+    @classmethod
+    def _extract_scalar_latencies(cls, result: Any) -> list[float]:
+        if isinstance(result, (int, float)):
+            return [float(result)]
+        if isinstance(result, dict):
+            for key in ("latency_ms", "median_ms"):
+                if key in result and result[key] is not None:
+                    return [float(result[key])]
+            return []
+        if isinstance(result, list):
+            values: list[float] = []
+            for item in result:
+                values.extend(cls._extract_scalar_latencies(item))
+            return values
+        return []
+
+
+@dataclass(frozen=True)
+class SearchState:
+    history: int
+    scheduled_tokens: int
+    sum_latency_ms: float
+    max_latency_ms: float
+    chunks: tuple[int, ...]
+
+
+class ChunkBeamSearch:
+    """Bounded receding-horizon beam search over discrete chunk sizes."""
+
+    def __init__(
+        self,
+        table: ChunkLatencyTable,
+        allowed_chunk_sizes: list[int],
+        search_depth: int,
+        beam_width: int,
+    ) -> None:
+        self.table = table
+        self.allowed_chunk_sizes = allowed_chunk_sizes
+        self.search_depth = search_depth
+        self.beam_width = beam_width
+
+    @property
+    def min_chunk(self) -> int:
+        return self.allowed_chunk_sizes[0]
+
+    def select_next_chunk(
+        self,
+        history: int,
+        remaining_prompt_tokens: int,
+        token_budget: int,
+        pp_size: int,
+    ) -> int | None:
+        if remaining_prompt_tokens <= 0 or token_budget <= 0:
+            return None
+
+        initial = SearchState(
+            history=history,
+            scheduled_tokens=0,
+            sum_latency_ms=0.0,
+            max_latency_ms=0.0,
+            chunks=(),
+        )
+        beam = [initial]
+        best_states: list[SearchState] = []
+
+        for _ in range(self.search_depth):
+            candidates: list[SearchState] = []
+            for state in beam:
+                remaining = remaining_prompt_tokens - state.scheduled_tokens
+                if remaining <= 0:
+                    best_states.append(state)
+                    continue
+                candidates.extend(
+                    self._expand_state(
+                        state=state,
+                        remaining=remaining,
+                        token_budget=token_budget,
+                    )
+                )
+
+            if not candidates:
+                break
+
+            candidates = self._remove_dominated(candidates)
+            candidates.sort(key=lambda state: self._sort_key(state, pp_size))
+            beam = candidates[: self.beam_width]
+            best_states.extend(
+                state
+                for state in beam
+                if state.scheduled_tokens >= remaining_prompt_tokens
+            )
+            if all(state.scheduled_tokens >= remaining_prompt_tokens for state in beam):
+                break
+
+        selectable = [state for state in (best_states or beam) if state.chunks]
+        if not selectable:
+            return None
+        selectable.sort(key=lambda state: self._sort_key(state, pp_size))
+        return selectable[0].chunks[0]
+
+    def fallback_chunk(
+        self,
+        history: int,
+        remaining_prompt_tokens: int,
+        token_budget: int,
+    ) -> int | None:
+        if remaining_prompt_tokens <= 0 or token_budget <= 0:
+            return None
+        if remaining_prompt_tokens < self.min_chunk and remaining_prompt_tokens <= token_budget:
+            return remaining_prompt_tokens
+        for chunk in reversed(self.allowed_chunk_sizes):
+            if chunk <= remaining_prompt_tokens and chunk <= token_budget:
+                if self.table.latency_or_none(history, chunk) is not None:
+                    return chunk
+        return None
+
+    def _expand_state(
+        self,
+        state: SearchState,
+        remaining: int,
+        token_budget: int,
+    ) -> list[SearchState]:
+        expanded: list[SearchState] = []
+        if remaining < self.min_chunk and remaining <= token_budget:
+            latency = self.table.latency_or_none(state.history, self.min_chunk)
+            if latency is not None:
+                expanded.append(self._append_chunk(state, remaining, latency))
+            return expanded
+
+        for chunk in self.allowed_chunk_sizes:
+            if chunk > remaining or chunk > token_budget:
+                continue
+            latency = self.table.latency_or_none(state.history, chunk)
+            if latency is None:
+                continue
+            expanded.append(self._append_chunk(state, chunk, latency))
+        return expanded
+
+    @staticmethod
+    def _append_chunk(
+        state: SearchState,
+        chunk: int,
+        latency: float,
+    ) -> SearchState:
+        return SearchState(
+            history=state.history + chunk,
+            scheduled_tokens=state.scheduled_tokens + chunk,
+            sum_latency_ms=state.sum_latency_ms + latency,
+            max_latency_ms=max(state.max_latency_ms, latency),
+            chunks=state.chunks + (chunk,),
+        )
+
+    @staticmethod
+    def _remove_dominated(states: list[SearchState]) -> list[SearchState]:
+        grouped: dict[int, list[SearchState]] = {}
+        for state in states:
+            grouped.setdefault(state.history, []).append(state)
+
+        kept: list[SearchState] = []
+        for group in grouped.values():
+            for candidate in group:
+                dominated = False
+                for other in group:
+                    if candidate is other:
+                        continue
+                    no_worse = (
+                        other.sum_latency_ms <= candidate.sum_latency_ms
+                        and other.max_latency_ms <= candidate.max_latency_ms
+                    )
+                    strictly_better = (
+                        other.sum_latency_ms < candidate.sum_latency_ms
+                        or other.max_latency_ms < candidate.max_latency_ms
+                    )
+                    if no_worse and strictly_better:
+                        dominated = True
+                        break
+                if not dominated:
+                    kept.append(candidate)
+        return kept
+
+    @staticmethod
+    def _pipeline_cost(state: SearchState, pp_size: int) -> float:
+        return state.sum_latency_ms + max(pp_size - 1, 0) * state.max_latency_ms
+
+    def _sort_key(self, state: SearchState, pp_size: int) -> tuple[float, float, int, int, int]:
+        cost = self._pipeline_cost(state, pp_size)
+        score = cost / state.scheduled_tokens
+        first_chunk = state.chunks[0]
+        return (
+            score,
+            cost,
+            -state.scheduled_tokens,
+            len(state.chunks),
+            -first_chunk,
+        )
+
+
+class ProfilingChunkManager:
+    """Owns the lookup table and chunk optimizer used by the scheduler."""
+
+    def __init__(
+        self,
+        *,
+        max_model_len: int,
+        page_size: int,
+        min_chunk: int,
+        max_chunk: int,
+        allowed_chunk_sizes: list[int] | None,
+        profile_num_history_points: int,
+        profile_repeats: int,
+        search_depth: int,
+        beam_width: int,
+        profile_file: str | None,
+        metadata: dict[str, Any],
+    ) -> None:
+        self.max_model_len = max_model_len
+        self.page_size = page_size
+        self.alignment = max(page_size, 64)
+        self.min_chunk = min_chunk
+        self.max_chunk = max_chunk
+        self.allowed_chunk_sizes = self._resolve_allowed_chunk_sizes(allowed_chunk_sizes)
+        self.history_sizes = generate_history_sizes(
+            max_model_len=max_model_len,
+            num_points=profile_num_history_points,
+            alignment=self.alignment,
+        )
+        self.profile_repeats = profile_repeats
+        self.search_depth = search_depth
+        self.beam_width = beam_width
+        self.profile_file = profile_file
+        self.metadata = metadata
+        self.table: ChunkLatencyTable | None = None
+        self.optimizer: ChunkBeamSearch | None = None
 
     @property
     def is_ready(self) -> bool:
-        return self._profiling_done and self.predictor.is_ready
+        return self.optimizer is not None
 
-    @property
-    def history_ready(self) -> bool:
-        return self.is_ready and self.predictor.with_history_ready
+    def initialize(self, model_executor: Any) -> None:
+        if self.profile_file is not None and Path(self.profile_file).exists():
+            try:
+                self._set_table(ChunkLatencyTable.from_json_file(self.profile_file))
+                logger.info("[ProfilingChunk] Loaded latency table from %s", self.profile_file)
+                return
+            except Exception as e:
+                logger.warning(
+                    "[ProfilingChunk] Failed to load profiling file %s: %s. "
+                    "Reprofiling.",
+                    self.profile_file,
+                    e,
+                )
 
-    def predict_chunk_size(self, num_computed_tokens: int, target_time: float) -> int | None:
-        """Predict optimal chunk size for given history length."""
-        if not self.is_ready:
+        if model_executor is None:
+            logger.warning("[ProfilingChunk] No model_executor provided, skipping profiling")
+            return
+
+        profiler = FullForwardChunkProfiler(model_executor=model_executor, metadata=self.metadata)
+        table = profiler.profile(
+            history_sizes=self.history_sizes,
+            chunk_sizes=self.allowed_chunk_sizes,
+            repeats=self.profile_repeats,
+            max_model_len=self.max_model_len,
+        )
+        self._set_table(table)
+        if self.profile_file is not None:
+            try:
+                table.to_json_file(self.profile_file)
+                logger.info("[ProfilingChunk] Saved latency table to %s", self.profile_file)
+            except Exception as e:
+                logger.warning(
+                    "[ProfilingChunk] Failed to write profiling file %s: %s",
+                    self.profile_file,
+                    e,
+                )
+
+    def select_next_chunk(
+        self,
+        *,
+        history: int,
+        remaining_prompt_tokens: int,
+        token_budget: int,
+        pp_size: int,
+    ) -> int | None:
+        if self.optimizer is None:
             return None
-
-        # NOTE(gjc): We found that the FIA operator has abnormal performance
-        # when processing multiple request groups in a batch, so the target_latency
-        # feature is temporarily fixed. It will be enabled again after the
-        # issues with the FIA operator are resolved. Therefore, in multi-request
-        # concurrent scenarios, there is still room for performance improvement in CPP.
-        # self.predictor.target_latency = target_time
-
-        if not self.history_ready:
-            predict_func = self.predictor.predict
+        chunk = self.optimizer.select_next_chunk(
+            history=history,
+            remaining_prompt_tokens=remaining_prompt_tokens,
+            token_budget=token_budget,
+            pp_size=pp_size,
+        )
+        if chunk is not None:
+            return chunk
+        fallback = self.optimizer.fallback_chunk(
+            history=history,
+            remaining_prompt_tokens=remaining_prompt_tokens,
+            token_budget=token_budget,
+        )
+        if fallback is None:
+            logger.warning(
+                "[ProfilingChunk] Optimizer could not find a valid chunk for "
+                "history=%d, remaining=%d, token_budget=%d",
+                history,
+                remaining_prompt_tokens,
+                token_budget,
+            )
         else:
-            predict_func = self.predictor.predict_with_history
-        return predict_func(
-            num_computed_tokens=num_computed_tokens, base_chunk_size=self.base_chunk_size, page_size=self.page_size
+            logger.warning(
+                "[ProfilingChunk] Falling back to chunk=%d for history=%d",
+                fallback,
+                history,
+            )
+        return fallback
+
+    def _set_table(self, table: ChunkLatencyTable) -> None:
+        table.validate()
+        if not table.has_usable_entry():
+            raise ValueError("profiling table has no usable latency entries")
+        self.table = table
+        self.allowed_chunk_sizes = table.chunk_sizes
+        self.optimizer = ChunkBeamSearch(
+            table=table,
+            allowed_chunk_sizes=table.chunk_sizes,
+            search_depth=self.search_depth,
+            beam_width=self.beam_width,
         )
 
-    def predict_time(self, num_new_tokens: int, num_computed_tokens: int) -> float:
-        """Get the consumed time of scheduled reqs for time_budget."""
-        if not self.is_ready:
-            return 0.0
-
-        if not self.history_ready:
-            predict_func = self.predictor.get_time
+    def _resolve_allowed_chunk_sizes(self, configured: list[int] | None) -> list[int]:
+        if configured is not None:
+            chunk_sizes = sorted(set(configured))
         else:
-            predict_func = self.predictor.get_time_with_history
-        return predict_func(query_len=num_new_tokens, num_computed_tokens=num_computed_tokens)
+            chunk_sizes = generate_allowed_chunk_sizes(
+                min_chunk=self.min_chunk,
+                max_chunk=self.max_chunk,
+                alignment=self.alignment,
+            )
 
-    def record_batch_execution_time(self, request_chunks: list, elapsed_time: float) -> bool:
-        """Record batch execution time for online model refinement.
-
-        Accumulates (x1, x2, x3, time_ms) data points and re-fits the
-        history-aware model once enough points are collected.
-
-        Args:
-            request_chunks: List of (chunk_size, num_computed_tokens) per request
-            elapsed_time: Total elapsed time in seconds
-        """
-        x1 = x2 = x3 = 0
-        for chunk, hist in request_chunks:
-            x1 += (chunk + hist) * chunk
-            x2 += chunk + hist
-            x3 += 1
-        self.chunked_fit_data.append([x1, x2, x3, elapsed_time * 1000])
-        if not self.predictor.fit_chunk(self.chunked_fit_data):
-            return False
-
-        self.predictor.with_history_ready = True
-        return True
+        if not chunk_sizes:
+            raise ValueError("profiling_chunk_config produced no allowed chunk sizes")
+        for chunk_size in chunk_sizes:
+            if chunk_size <= 0:
+                raise ValueError("allowed chunk sizes must be positive")
+            if chunk_size < self.min_chunk or chunk_size > self.max_chunk:
+                raise ValueError(
+                    "allowed chunk size %d is outside [%d, %d]"
+                    % (chunk_size, self.min_chunk, self.max_chunk)
+                )
+            if chunk_size % self.alignment != 0:
+                raise ValueError(
+                    "allowed chunk size %d must be aligned to %d"
+                    % (chunk_size, self.alignment)
+                )
+        return chunk_sizes

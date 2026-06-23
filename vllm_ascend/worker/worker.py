@@ -811,67 +811,95 @@ class NPUWorker(WorkerBase):
         return self.model_runner.get_model()
 
     @torch.inference_mode()
-    def profile_prefill_latency(self, num_tokens: int) -> float:
+    def profile_prefill_latency(
+        self,
+        history_tokens: int,
+        chunk_tokens: int,
+        repeats: int = 3,
+    ) -> dict:
         """
-        Profile prefill latency for a given number of tokens.
+        Profile continuation prefill latency for a given history and chunk.
 
         This runs a real model forward pass and measures the execution time.
-        Used for profiling-based dynamic chunk sizing.
+        Used for lookup-table dynamic chunk sizing.
 
         In PP (Pipeline Parallelism) mode:
         - All workers execute the forward pass to stay synchronized
-        - Only the timing from PP0 (first rank) is meaningful for scheduling
-        - PP0 includes all the pipeline stages' latency when using async scheduling
+        - The scheduler collects worker timings through collective_rpc
+        - Root scheduling uses the maximum participating-rank timing when
+          multiple worker results are returned
 
         Args:
-            num_tokens: Number of tokens to profile
+            history_tokens: Existing KV-cache history length
+            chunk_tokens: Number of new query tokens to profile
+            repeats: Number of measured executions after warm-up
 
         Returns:
-            Latency in milliseconds
+            A dictionary containing measured run latencies and their median.
         """
-        import time
-
         # Clamp to valid range
-        num_tokens = min(num_tokens, self.scheduler_config.max_num_batched_tokens)
-        num_tokens = max(num_tokens, 1)
+        max_model_len = self.model_config.max_model_len
+        history_tokens = max(int(history_tokens), 0)
+        chunk_tokens = min(int(chunk_tokens), self.scheduler_config.max_num_batched_tokens)
+        chunk_tokens = max(chunk_tokens, 1)
+        seq_len = min(history_tokens + chunk_tokens, max_model_len)
+        history_tokens = max(seq_len - chunk_tokens, 0)
+        repeats = max(int(repeats), 1)
 
-        # Synchronize all devices before timing
-        # This ensures clean measurement in PP/TP scenarios
+        # Warm up the exact shape so graph compilation or one-time setup does
+        # not contaminate measured samples.
+        torch.npu.synchronize()
+        self.model_runner._dummy_run(
+            num_tokens=chunk_tokens,
+            force_attention=True,
+            profile_cpp=True,
+            profile_seq_lens=seq_len,
+            profile_history_len=history_tokens,
+        )
         torch.npu.synchronize()
 
-        # In PP mode, we still run on all ranks to keep them synchronized
-        # but only the first rank's timing is used for scheduling decisions
-        is_first_pp_rank = get_pp_group().is_first_rank
+        latencies_ms = []
+        for _ in range(repeats):
+            torch.npu.synchronize()
+            start_event = torch.npu.Event(enable_timing=True)
+            end_event = torch.npu.Event(enable_timing=True)
+            start_event.record()
+            self.model_runner._dummy_run(
+                num_tokens=chunk_tokens,
+                force_attention=True,
+                profile_cpp=True,
+                profile_seq_lens=seq_len,
+                profile_history_len=history_tokens,
+            )
+            end_event.record()
+            torch.npu.synchronize()
+            latencies_ms.append(float(start_event.elapsed_time(end_event)))
 
-        start = time.perf_counter()
-
-        # Run real model forward with force_attention=True
-        # This ensures attention is actually executed, not skipped.
-        # Without force_attention, attn_metadata may be None and attention
-        # won't run, making profiling results inaccurate.
-        # _dummy_run handles PP internally (intermediate tensors, etc.)
-        self.model_runner._dummy_run(
-            num_tokens=num_tokens,
-            force_attention=True,  # Critical: ensure attention is executed
-            profile_cpp=True,
+        sorted_latencies = sorted(latencies_ms)
+        mid = len(sorted_latencies) // 2
+        median_ms = (
+            sorted_latencies[mid]
+            if len(sorted_latencies) % 2
+            else (sorted_latencies[mid - 1] + sorted_latencies[mid]) / 2.0
         )
 
-        # Synchronize after forward to ensure NPU operations complete
-        torch.npu.synchronize()
-
-        latency_ms = (time.perf_counter() - start) * 1000
-
         # Log for debugging in PP mode
-        if not is_first_pp_rank:
+        if not get_pp_group().is_first_rank:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    "[ProfilingChunk] PP rank %d: profiled %d tokens, latency=%.2f ms (not used)",
+                    "[ProfilingChunk] PP rank %d: profiled history=%d, chunk=%d, median=%.2f ms",
                     get_pp_group().rank_in_group,
-                    num_tokens,
-                    latency_ms,
+                    history_tokens,
+                    chunk_tokens,
+                    median_ms,
                 )
 
-        return latency_ms
+        return {
+            "history_tokens": history_tokens,
+            "chunk_tokens": chunk_tokens,
+            "runs_ms": latencies_ms,
+            "median_ms": float(median_ms),
+        }
 
     def get_kv_connector_handshake_metadata(
         self,
