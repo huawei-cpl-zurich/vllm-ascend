@@ -15,10 +15,20 @@
 import torch
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.ops.triton.triton_utils import get_aicore_num, init_device_properties_triton
+
 QUEST_BLOCK_SELECT_BLOCK_SIZE = 128
 QUEST_BLOCK_SELECT_HEAD_DIM = 128
 QUEST_BLOCK_SELECT_MAX_MMBPR = 6
 QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS = 64
+QUEST_BLOCK_SELECT_SCORE_PAGE_TILE = 16
+
+
+def _cdiv(x: int, y: int) -> int:
+    triton_cdiv = getattr(triton, "cdiv", None)
+    if triton_cdiv is not None:
+        return triton_cdiv(x, y)
+    return (x + y - 1) // y
 
 
 def _next_power_of_2(value: int) -> int:
@@ -35,61 +45,70 @@ def _quest_score_pages_kernel(
     metadata_block_tables,
     seq_lens,
     page_scores,
+    num_score_tiles,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     max_metadata_blocks_per_request: tl.constexpr,
     max_pages: tl.constexpr,
+    num_page_tiles: tl.constexpr,
     USE_FIXED_ANCHORS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    PAGE_TILE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
+    num_programs = tl.num_programs(axis=0)
 
-    page_idx = pid % max_pages
-    batch_head_idx = pid // max_pages
-    batch_idx = batch_head_idx // num_heads
-    query_head_idx = batch_head_idx - batch_idx * num_heads
+    for score_tile_idx in range(pid, num_score_tiles, num_programs):
+        page_tile_idx = score_tile_idx % num_page_tiles
+        batch_head_idx = score_tile_idx // num_page_tiles
+        batch_idx = batch_head_idx // num_heads
+        query_head_idx = batch_head_idx - batch_idx * num_heads
 
-    score_offset = batch_head_idx * max_pages + page_idx
-    seq_len = tl.load(seq_lens + batch_idx).to(tl.int32)
-    valid_page_count = tl.where(seq_len > 0, (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
-    valid_page_count = tl.minimum(valid_page_count, max_pages)
-    if page_idx >= valid_page_count:
-        tl.store(page_scores + score_offset, -float("inf"))
-        return
+        page_offsets = page_tile_idx * PAGE_TILE + tl.arange(0, PAGE_TILE)
+        page_mask = page_offsets < max_pages
+        score_offsets = batch_head_idx * max_pages + page_offsets
 
-    query_heads_per_kv_head = num_heads // num_kv_heads
-    kv_head_idx = query_head_idx // query_heads_per_kv_head
-    meta_block = page_idx // BLOCK_SIZE
-    page_offset = page_idx - meta_block * BLOCK_SIZE
+        seq_len = tl.load(seq_lens + batch_idx).to(tl.int32)
+        valid_page_count = tl.where(seq_len > 0, (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
+        valid_page_count = tl.minimum(valid_page_count, max_pages)
+        valid_page_mask = page_mask & (page_offsets < valid_page_count)
 
-    meta_block_id = tl.load(
-        metadata_block_tables + batch_idx * max_metadata_blocks_per_request + meta_block,
-    ).to(tl.int32)
+        query_heads_per_kv_head = num_heads // num_kv_heads
+        kv_head_idx = query_head_idx // query_heads_per_kv_head
+        meta_blocks = page_offsets // BLOCK_SIZE
+        page_offsets_in_block = page_offsets - meta_blocks * BLOCK_SIZE
 
-    dim_offsets = tl.arange(0, HEAD_DIM)
-    query_offset = batch_head_idx * HEAD_DIM + dim_offsets
-    metadata_stride = BLOCK_SIZE * num_kv_heads * HEAD_DIM
-    metadata_offset = (
-        meta_block_id * metadata_stride
-        + page_offset * num_kv_heads * HEAD_DIM
-        + kv_head_idx * HEAD_DIM
-        + dim_offsets
-    )
+        meta_block_ids = tl.load(
+            metadata_block_tables + batch_idx * max_metadata_blocks_per_request + meta_blocks,
+            mask=page_mask,
+            other=0,
+        ).to(tl.int32)
 
-    query_values = tl.load(query + query_offset).to(tl.float32)
-    max_values = tl.load(maxblocks + metadata_offset).to(tl.float32)
-    min_values = tl.load(minblocks + metadata_offset).to(tl.float32)
+        dim_offsets = tl.arange(0, HEAD_DIM)
+        query_offset = batch_head_idx * HEAD_DIM + dim_offsets
+        metadata_stride = BLOCK_SIZE * num_kv_heads * HEAD_DIM
+        metadata_offset = (
+            meta_block_ids[:, None] * metadata_stride
+            + page_offsets_in_block[:, None] * num_kv_heads * HEAD_DIM
+            + kv_head_idx * HEAD_DIM
+            + dim_offsets[None, :]
+        )
 
-    max_products = query_values * max_values
-    min_products = query_values * min_values
-    score = tl.sum(tl.maximum(max_products, min_products), axis=0)
+        query_values = tl.load(query + query_offset).to(tl.float32)
+        max_values = tl.load(maxblocks + metadata_offset, mask=valid_page_mask[:, None], other=0.0).to(tl.float32)
+        min_values = tl.load(minblocks + metadata_offset, mask=valid_page_mask[:, None], other=0.0).to(tl.float32)
 
-    if USE_FIXED_ANCHORS:
-        is_anchor = (page_idx == 0) | (page_idx == valid_page_count - 1)
-        score = tl.where(is_anchor, float("inf"), score)
+        max_products = query_values[None, :] * max_values
+        min_products = query_values[None, :] * min_values
+        scores = tl.sum(tl.maximum(max_products, min_products), axis=1)
 
-    tl.store(page_scores + score_offset, score)
+        if USE_FIXED_ANCHORS:
+            is_anchor = (page_offsets == 0) | (page_offsets == valid_page_count - 1)
+            scores = tl.where(is_anchor, float("inf"), scores)
+
+        scores = tl.where(valid_page_mask, scores, -float("inf"))
+        tl.store(page_scores + score_offsets, scores, mask=page_mask)
 
 
 @triton.jit
@@ -97,6 +116,7 @@ def _quest_select_topk_kernel(
     page_scores,
     seq_lens,
     selected_indices,
+    num_batch_heads,
     num_heads: tl.constexpr,
     k: tl.constexpr,
     k_pad: tl.constexpr,
@@ -104,39 +124,41 @@ def _quest_select_topk_kernel(
     pages_pad: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    batch_head_idx = tl.program_id(axis=0)
-    batch_idx = batch_head_idx // num_heads
-
-    seq_len = tl.load(seq_lens + batch_idx).to(tl.int32)
-    valid_page_count = tl.where(seq_len > 0, (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
-    valid_page_count = tl.minimum(valid_page_count, max_pages)
-
-    out_base = batch_head_idx * k
+    pid = tl.program_id(axis=0)
+    num_programs = tl.num_programs(axis=0)
     rank_offsets = tl.arange(0, k_pad)
     rank_mask = rank_offsets < k
 
-    if valid_page_count <= 0:
-        tl.store(selected_indices + out_base + rank_offsets, 0, mask=rank_mask)
-        return
-
-    if k >= valid_page_count:
-        sequential = tl.where(rank_offsets < valid_page_count, rank_offsets, 0)
-        tl.store(selected_indices + out_base + rank_offsets, sequential.to(tl.int32), mask=rank_mask)
-        return
-
     page_offsets = tl.arange(0, pages_pad)
     page_mask = page_offsets < max_pages
-    scores = tl.load(
-        page_scores + batch_head_idx * max_pages + page_offsets,
-        mask=page_mask,
-        other=-float("inf"),
-    )
-    scores = tl.where(page_offsets < valid_page_count, scores, -float("inf"))
 
-    for out_idx in range(0, k):
-        best_page = tl.argmax(scores, axis=0).to(tl.int32)
-        tl.store(selected_indices + out_base + out_idx, best_page)
-        scores = tl.where(page_offsets == best_page, -float("inf"), scores)
+    for batch_head_idx in range(pid, num_batch_heads, num_programs):
+        batch_idx = batch_head_idx // num_heads
+
+        seq_len = tl.load(seq_lens + batch_idx).to(tl.int32)
+        valid_page_count = tl.where(seq_len > 0, (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
+        valid_page_count = tl.minimum(valid_page_count, max_pages)
+
+        out_base = batch_head_idx * k
+
+        if valid_page_count <= 0:
+            tl.store(selected_indices + out_base + rank_offsets, 0, mask=rank_mask)
+        else:
+            if k >= valid_page_count:
+                sequential = tl.where(rank_offsets < valid_page_count, rank_offsets, 0)
+                tl.store(selected_indices + out_base + rank_offsets, sequential.to(tl.int32), mask=rank_mask)
+            else:
+                scores = tl.load(
+                    page_scores + batch_head_idx * max_pages + page_offsets,
+                    mask=page_mask,
+                    other=-float("inf"),
+                )
+                scores = tl.where(page_offsets < valid_page_count, scores, -float("inf"))
+
+                for out_idx in range(0, k):
+                    best_page = tl.argmax(scores, axis=0).to(tl.int32)
+                    tl.store(selected_indices + out_base + out_idx, best_page)
+                    scores = tl.where(page_offsets == best_page, -float("inf"), scores)
 
 
 def _validate_quest_block_select_paged_inputs(
@@ -251,6 +273,13 @@ def quest_block_select_paged_out_triton(
     num_batch_heads = batch_size * num_heads
     if num_batch_heads == 0:
         return output
+    score_page_tile = min(QUEST_BLOCK_SELECT_SCORE_PAGE_TILE, _next_power_of_2(max_pages))
+    num_page_tiles = _cdiv(max_pages, score_page_tile)
+    num_score_tiles = num_batch_heads * num_page_tiles
+    init_device_properties_triton()
+    num_cores = get_aicore_num()
+    num_score_programs = min(num_score_tiles, num_cores)
+    num_select_programs = min(num_batch_heads, num_cores)
 
     page_scores = torch.empty(
         (num_batch_heads, max_pages),
@@ -258,25 +287,29 @@ def quest_block_select_paged_out_triton(
         device=query.device,
     )
 
-    _quest_score_pages_kernel[(num_batch_heads * max_pages,)](
+    _quest_score_pages_kernel[(num_score_programs,)](
         query,
         maxblocks,
         minblocks,
         metadata_block_tables,
         seq_lens,
         page_scores,
+        num_score_tiles,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         max_metadata_blocks_per_request=max_metadata_blocks_per_request,
         max_pages=max_pages,
+        num_page_tiles=num_page_tiles,
         USE_FIXED_ANCHORS=tokens_since_metadata_update >= 0,
         BLOCK_SIZE=QUEST_BLOCK_SELECT_BLOCK_SIZE,
         HEAD_DIM=QUEST_BLOCK_SELECT_HEAD_DIM,
+        PAGE_TILE=score_page_tile,
     )
-    _quest_select_topk_kernel[(num_batch_heads,)](
+    _quest_select_topk_kernel[(num_select_programs,)](
         page_scores,
         seq_lens,
         output,
+        num_batch_heads,
         num_heads=num_heads,
         k=k,
         k_pad=k_pad,
