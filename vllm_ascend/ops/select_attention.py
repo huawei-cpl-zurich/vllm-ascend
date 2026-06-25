@@ -15,6 +15,7 @@
 #
 
 import torch
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.utils import enable_custom_op
 
@@ -28,6 +29,20 @@ def quest_prefill_metadata(
     maxblocks: torch.Tensor,
     minblocks: torch.Tensor,
 ) -> None:
+    if HAS_TRITON:
+        from vllm_ascend.ops.triton.quest_prefill_metadata import quest_prefill_metadata_triton
+
+        quest_prefill_metadata_triton(
+            k_cache,
+            block_tables,
+            refresh_start_seq_lens,
+            refresh_end_seq_lens,
+            metadata_block_tables,
+            maxblocks,
+            minblocks,
+        )
+        return
+
     enable_custom_op()
     torch.ops._C_ascend.npu_quest_prefill_metadata(
         k_cache,
