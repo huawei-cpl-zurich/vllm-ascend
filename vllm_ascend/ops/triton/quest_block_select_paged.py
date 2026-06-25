@@ -19,8 +19,6 @@ QUEST_BLOCK_SELECT_BLOCK_SIZE = 128
 QUEST_BLOCK_SELECT_HEAD_DIM = 128
 QUEST_BLOCK_SELECT_MAX_MMBPR = 6
 QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS = 64
-QUEST_MIN_SCORE = -3.4028235e38
-QUEST_MAX_SCORE = 3.4028235e38
 
 
 def _next_power_of_2(value: int) -> int:
@@ -57,7 +55,7 @@ def _quest_score_pages_kernel(
     valid_page_count = tl.where(seq_len > 0, (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
     valid_page_count = tl.minimum(valid_page_count, max_pages)
     if page_idx >= valid_page_count:
-        tl.store(page_scores + score_offset, QUEST_MIN_SCORE)
+        tl.store(page_scores + score_offset, -float("inf"))
         return
 
     query_heads_per_kv_head = num_heads // num_kv_heads
@@ -89,7 +87,7 @@ def _quest_score_pages_kernel(
 
     if USE_FIXED_ANCHORS:
         is_anchor = (page_idx == 0) | (page_idx == valid_page_count - 1)
-        score = tl.where(is_anchor, QUEST_MAX_SCORE, score)
+        score = tl.where(is_anchor, float("inf"), score)
 
     tl.store(page_scores + score_offset, score)
 
@@ -131,14 +129,14 @@ def _quest_select_topk_kernel(
     scores = tl.load(
         page_scores + batch_head_idx * max_pages + page_offsets,
         mask=page_mask,
-        other=QUEST_MIN_SCORE,
+        other=-float("inf"),
     )
-    scores = tl.where(page_offsets < valid_page_count, scores, QUEST_MIN_SCORE)
+    scores = tl.where(page_offsets < valid_page_count, scores, -float("inf"))
 
     for out_idx in range(0, k):
         best_page = tl.argmax(scores, axis=0).to(tl.int32)
         tl.store(selected_indices + out_base + out_idx, best_page)
-        scores = tl.where(page_offsets == best_page, QUEST_MIN_SCORE, scores)
+        scores = tl.where(page_offsets == best_page, -float("inf"), scores)
 
 
 def _validate_quest_block_select_paged_inputs(
