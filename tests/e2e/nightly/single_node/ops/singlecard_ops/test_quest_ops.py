@@ -187,8 +187,8 @@ def _make_prefill_metadata_case(dtype: torch.dtype):
     k_cache = torch.randn(
         (num_kv_blocks, BLOCK_SIZE, num_kv_heads, HEAD_DIM),
         generator=generator,
-        dtype=torch.float32,
-    ).to(dtype)
+        dtype=dtype,
+    )
     block_tables = torch.empty((batch_size, max_pages), dtype=torch.int32)
     block_tables[0, :] = torch.arange(10, 10 + max_pages, dtype=torch.int32)
     block_tables[1, :] = torch.arange(200, 200 + max_pages, dtype=torch.int32)
@@ -223,17 +223,17 @@ def _make_block_select_case(dtype: torch.dtype):
     num_metadata_blocks = 8
     generator = torch.Generator(device="cpu").manual_seed(456)
 
-    query = torch.randn((batch_size, num_heads, HEAD_DIM), generator=generator, dtype=torch.float32).to(dtype)
+    query = torch.randn((batch_size, num_heads, HEAD_DIM), generator=generator, dtype=dtype)
     maxblocks = torch.randn(
         (num_metadata_blocks, BLOCK_SIZE, num_kv_heads, HEAD_DIM),
         generator=generator,
-        dtype=torch.float32,
-    ).to(dtype)
+        dtype=dtype,
+    )
     minblocks = torch.randn(
         (num_metadata_blocks, BLOCK_SIZE, num_kv_heads, HEAD_DIM),
         generator=generator,
-        dtype=torch.float32,
-    ).to(dtype)
+        dtype=dtype,
+    )
     metadata_block_tables = torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7]], dtype=torch.int32)
     # The final row covers k=9/13 with k < valid_page_count < ceil8(k).
     seq_lens = torch.tensor(
