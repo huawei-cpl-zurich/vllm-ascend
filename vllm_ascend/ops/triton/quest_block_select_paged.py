@@ -15,13 +15,14 @@
 import torch
 from vllm.triton_utils import tl, triton
 
-from vllm_ascend.ops.triton.triton_utils import get_aicore_num, get_element, init_device_properties_triton
+from vllm_ascend.ops.triton.triton_utils import get_aicore_num, init_device_properties_triton
 
 QUEST_BLOCK_SELECT_BLOCK_SIZE = 128
 QUEST_BLOCK_SELECT_HEAD_DIM = 128
 QUEST_BLOCK_SELECT_MAX_MMBPR = 6
 QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS = 64
-QUEST_BLOCK_SELECT_PAGE_TILE = 16
+QUEST_BLOCK_SELECT_PAGE_TILE = 128
+QUEST_BLOCK_SELECT_HEAD_TILE = 64
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -38,81 +39,92 @@ def _next_power_of_2(value: int) -> int:
 
 
 @triton.jit
-def _update_topk(
-    top_scores,
-    top_indices,
-    rank_offsets,
-    rank_mask,
-    candidate_score,
-    candidate_page,
-    candidate_valid,
-):
-    active_scores = tl.where(rank_mask, top_scores, float("inf"))
-    worst_score = tl.min(active_scores, axis=0)
-    worst_page = tl.max(
-        tl.where((top_scores == worst_score) & rank_mask, top_indices, -1),
-        axis=0,
-    )
-    worst_rank = tl.argmax(
-        tl.where(
-            (top_scores == worst_score) & (top_indices == worst_page) & rank_mask,
-            1,
-            0,
-        ),
-        axis=0,
-    )
-
-    is_better = (candidate_score > worst_score) | (
-        (candidate_score == worst_score) & (candidate_page < worst_page)
-    )
-    should_replace = candidate_valid & is_better
-    replace_mask = rank_offsets == worst_rank
-    top_scores = tl.where(should_replace & replace_mask, candidate_score, top_scores)
-    top_indices = tl.where(should_replace & replace_mask, candidate_page, top_indices)
-    return top_scores, top_indices
-
-
-@triton.jit
-def _store_sorted_topk(
-    selected_indices,
-    out_base,
-    top_scores,
-    top_indices,
-    rank_mask,
-    k: tl.constexpr,
-    max_pages: tl.constexpr,
-):
-    for out_idx in range(0, k):
-        best_score = tl.max(tl.where(rank_mask, top_scores, -float("inf")), axis=0)
-        best_page = tl.min(
-            tl.where((top_scores == best_score) & rank_mask, top_indices, max_pages),
-            axis=0,
-        ).to(tl.int32)
-        tl.store(selected_indices + out_base + out_idx, best_page)
-
-        remove_mask = (top_scores == best_score) & (top_indices == best_page) & rank_mask
-        top_scores = tl.where(remove_mask, -float("inf"), top_scores)
-
-
-@triton.jit
-def _quest_select_fused_kernel(
+def _quest_score_pages_kernel(
     query,
     maxblocks,
     minblocks,
     metadata_block_tables,
     seq_lens,
-    selected_indices,
-    num_batch_heads,
+    page_scores,
+    num_score_tiles,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     max_metadata_blocks_per_request: tl.constexpr,
     USE_FIXED_ANCHORS: tl.constexpr,
-    k: tl.constexpr,
-    k_pad: tl.constexpr,
     max_pages: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PAGE_TILE: tl.constexpr,
+    HEAD_TILE: tl.constexpr,
+):
+    core_idx = tl.program_id(axis=0)
+    wave_idx = tl.program_id(axis=1)
+    num_cores = tl.num_programs(axis=0)
+    score_tile_idx = wave_idx * num_cores + core_idx
+    if score_tile_idx >= num_score_tiles:
+        return
+
+    batch_head_idx = score_tile_idx // max_metadata_blocks_per_request
+    meta_block = score_tile_idx - batch_head_idx * max_metadata_blocks_per_request
+    batch_idx = batch_head_idx // num_heads
+    query_head_idx = batch_head_idx - batch_idx * num_heads
+
+    seq_len = tl.load(seq_lens + batch_idx).to(tl.int32)
+    valid_page_count = tl.where(seq_len > 0, (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
+    valid_page_count = tl.minimum(valid_page_count, max_pages)
+
+    query_heads_per_kv_head = num_heads // num_kv_heads
+    kv_head_idx = query_head_idx // query_heads_per_kv_head
+    metadata_stride = BLOCK_SIZE * num_kv_heads * HEAD_DIM
+
+    page_offsets_in_block = tl.arange(0, PAGE_TILE)
+    page_offsets = meta_block * BLOCK_SIZE + page_offsets_in_block
+    page_mask = page_offsets < valid_page_count
+
+    meta_block_id = tl.load(
+        metadata_block_tables + batch_idx * max_metadata_blocks_per_request + meta_block,
+    ).to(tl.int32)
+    scores = tl.full([PAGE_TILE], 0.0, tl.float32)
+
+    for head_start in range(0, HEAD_DIM, HEAD_TILE):
+        dim_offsets = head_start + tl.arange(0, HEAD_TILE)
+        query_values = tl.load(query + batch_head_idx * HEAD_DIM + dim_offsets).to(tl.float32)
+        use_max = query_values >= 0.0
+        metadata_offset = (
+            meta_block_id * metadata_stride
+            + page_offsets_in_block[:, None] * num_kv_heads * HEAD_DIM
+            + kv_head_idx * HEAD_DIM
+            + dim_offsets[None, :]
+        )
+
+        metadata_ptr = tl.where(
+            use_max[None, :],
+            maxblocks + metadata_offset,
+            minblocks + metadata_offset,
+        )
+        metadata_values = tl.load(metadata_ptr, mask=page_mask[:, None], other=0.0).to(tl.float32)
+        scores += tl.sum(query_values[None, :] * metadata_values, axis=1)
+
+    if USE_FIXED_ANCHORS:
+        is_anchor = (page_offsets == 0) | (page_offsets == valid_page_count - 1)
+        scores = tl.where(is_anchor, float("inf"), scores)
+
+    scores = tl.where(page_mask, scores, -float("inf"))
+    tl.store(page_scores + batch_head_idx * max_pages + page_offsets, scores, mask=page_offsets < max_pages)
+
+
+@triton.jit
+def _quest_select_topk_kernel(
+    page_scores,
+    seq_lens,
+    selected_indices,
+    num_batch_heads,
+    num_heads: tl.constexpr,
+    k: tl.constexpr,
+    k_pad: tl.constexpr,
+    max_pages: tl.constexpr,
+    pages_pad: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     core_idx = tl.program_id(axis=0)
     wave_idx = tl.program_id(axis=1)
@@ -122,16 +134,14 @@ def _quest_select_fused_kernel(
         return
 
     batch_idx = batch_head_idx // num_heads
-    query_head_idx = batch_head_idx - batch_idx * num_heads
-    out_base = batch_head_idx * k
-
     rank_offsets = tl.arange(0, k_pad)
     rank_mask = rank_offsets < k
-    dim_offsets = tl.arange(0, HEAD_DIM)
 
     seq_len = tl.load(seq_lens + batch_idx).to(tl.int32)
     valid_page_count = tl.where(seq_len > 0, (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
     valid_page_count = tl.minimum(valid_page_count, max_pages)
+
+    out_base = batch_head_idx * k
 
     if valid_page_count <= 0:
         tl.store(selected_indices + out_base + rank_offsets, 0, mask=rank_mask)
@@ -142,76 +152,19 @@ def _quest_select_fused_kernel(
         tl.store(selected_indices + out_base + rank_offsets, sequential.to(tl.int32), mask=rank_mask)
         return
 
-    query_heads_per_kv_head = num_heads // num_kv_heads
-    kv_head_idx = query_head_idx // query_heads_per_kv_head
-    metadata_stride = BLOCK_SIZE * num_kv_heads * HEAD_DIM
-
-    query_values = tl.load(query + batch_head_idx * HEAD_DIM + dim_offsets).to(tl.float32)
-    use_max = query_values >= 0.0
-
-    top_scores = tl.full([k_pad], -float("inf"), tl.float32)
-    top_indices = tl.full([k_pad], 0, tl.int32)
-
-    for page_start in range(0, max_pages, PAGE_TILE):
-        page_offsets = page_start + tl.arange(0, PAGE_TILE)
-        page_mask = page_offsets < valid_page_count
-        meta_blocks = page_offsets // BLOCK_SIZE
-        page_offsets_in_block = page_offsets - meta_blocks * BLOCK_SIZE
-
-        meta_block_ids = tl.load(
-            metadata_block_tables + batch_idx * max_metadata_blocks_per_request + meta_blocks,
-            mask=page_offsets < max_pages,
-            other=0,
-        ).to(tl.int32)
-        metadata_offset = (
-            meta_block_ids[:, None] * metadata_stride
-            + page_offsets_in_block[:, None] * num_kv_heads * HEAD_DIM
-            + kv_head_idx * HEAD_DIM
-            + dim_offsets[None, :]
-        )
-
-        max_values = tl.load(
-            maxblocks + metadata_offset,
-            mask=page_mask[:, None] & use_max[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        min_values = tl.load(
-            minblocks + metadata_offset,
-            mask=page_mask[:, None] & (query_values[None, :] < 0.0),
-            other=0.0,
-        ).to(tl.float32)
-        metadata_values = max_values + min_values
-        scores = tl.sum(query_values[None, :] * metadata_values, axis=1)
-
-        if USE_FIXED_ANCHORS:
-            is_anchor = (page_offsets == 0) | (page_offsets == valid_page_count - 1)
-            scores = tl.where(is_anchor, float("inf"), scores)
-
-        scores = tl.where(page_mask, scores, -float("inf"))
-
-        for tile_offset in range(0, PAGE_TILE):
-            candidate_score = get_element(scores, (tile_offset,))
-            candidate_page = get_element(page_offsets, (tile_offset,)).to(tl.int32)
-            candidate_valid = candidate_page < valid_page_count
-            top_scores, top_indices = _update_topk(
-                top_scores,
-                top_indices,
-                rank_offsets,
-                rank_mask,
-                candidate_score,
-                candidate_page,
-                candidate_valid,
-            )
-
-    _store_sorted_topk(
-        selected_indices,
-        out_base,
-        top_scores,
-        top_indices,
-        rank_mask,
-        k,
-        max_pages,
+    page_offsets = tl.arange(0, pages_pad)
+    page_mask = page_offsets < max_pages
+    scores = tl.load(
+        page_scores + batch_head_idx * max_pages + page_offsets,
+        mask=page_mask,
+        other=-float("inf"),
     )
+    scores = tl.where(page_offsets < valid_page_count, scores, -float("inf"))
+
+    for out_idx in range(0, k):
+        best_page = tl.argmax(scores, axis=0).to(tl.int32)
+        tl.store(selected_indices + out_base + out_idx, best_page)
+        scores = tl.where(page_offsets == best_page, -float("inf"), scores)
 
 
 def _validate_quest_block_select_paged_inputs(
@@ -321,33 +274,54 @@ def quest_block_select_paged_out_triton(
     )
 
     max_pages = max_metadata_blocks_per_request * QUEST_BLOCK_SELECT_BLOCK_SIZE
+    pages_pad = _next_power_of_2(max_pages)
     k_pad = _next_power_of_2(k)
     num_batch_heads = batch_size * num_heads
     if num_batch_heads == 0:
         return output
     init_device_properties_triton()
     num_cores = get_aicore_num()
-    core_dim = min(num_batch_heads, num_cores)
-    grid = (core_dim, _cdiv(num_batch_heads, core_dim))
+    num_score_tiles = num_batch_heads * max_metadata_blocks_per_request
+    score_core_dim = min(num_score_tiles, num_cores)
+    select_core_dim = min(num_batch_heads, num_cores)
+    score_grid = (score_core_dim, _cdiv(num_score_tiles, score_core_dim))
+    select_grid = (select_core_dim, _cdiv(num_batch_heads, select_core_dim))
 
-    _quest_select_fused_kernel[grid](
+    page_scores = torch.empty(
+        (num_batch_heads, max_pages),
+        dtype=torch.float32,
+        device=query.device,
+    )
+
+    _quest_score_pages_kernel[score_grid](
         query,
         maxblocks,
         minblocks,
         metadata_block_tables,
         seq_lens,
-        output,
-        num_batch_heads,
+        page_scores,
+        num_score_tiles,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         max_metadata_blocks_per_request=max_metadata_blocks_per_request,
         USE_FIXED_ANCHORS=tokens_since_metadata_update >= 0,
-        k=k,
-        k_pad=k_pad,
         max_pages=max_pages,
         BLOCK_SIZE=QUEST_BLOCK_SELECT_BLOCK_SIZE,
         HEAD_DIM=QUEST_BLOCK_SELECT_HEAD_DIM,
         PAGE_TILE=QUEST_BLOCK_SELECT_PAGE_TILE,
+        HEAD_TILE=QUEST_BLOCK_SELECT_HEAD_TILE,
+    )
+    _quest_select_topk_kernel[select_grid](
+        page_scores,
+        seq_lens,
+        output,
+        num_batch_heads,
+        num_heads=num_heads,
+        k=k,
+        k_pad=k_pad,
+        max_pages=max_pages,
+        pages_pad=pages_pad,
+        BLOCK_SIZE=QUEST_BLOCK_SELECT_BLOCK_SIZE,
     )
     return output
 
