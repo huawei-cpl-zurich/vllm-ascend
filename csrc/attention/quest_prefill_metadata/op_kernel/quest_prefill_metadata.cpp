@@ -385,6 +385,7 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
     GM_ADDR workspace,
     GM_ADDR tiling)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     (void)workspace;
     QUEST_PREFILL_METADATA_COPY_TILING_DATA(QuestPrefillMetadataTilingData, tiling);
 
