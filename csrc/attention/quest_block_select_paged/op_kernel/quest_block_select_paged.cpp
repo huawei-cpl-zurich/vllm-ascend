@@ -96,7 +96,8 @@ public:
         int32_t head_dim,
         int32_t max_metadata_blocks_per_request,
         int32_t tokens_since_metadata_update,
-        int32_t k)
+        int32_t k,
+        int32_t output_stride)
     {
         AscendC::SetAtomicNone();
 
@@ -108,8 +109,11 @@ public:
         max_metadata_blocks_per_request_ = max_metadata_blocks_per_request;
         tokens_since_metadata_update_ = tokens_since_metadata_update;
         k_ = k;
+        output_stride_ = output_stride;
         ASSERT(k_ <= static_cast<int32_t>(QUEST_MAX_SELECTED_BLOCKS) &&
                "quest_block_select_paged requires k <= 64.");
+        ASSERT(output_stride_ >= k_ &&
+               "quest_block_select_paged requires output_stride >= k.");
         head_dim_storage_blocks_ =
             NUM_DATA_BLOCKS(head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
         inter_kv_head_stride_blocks_ = NUM_DATA_BLOCKS(
@@ -170,7 +174,7 @@ public:
             int32_t kv_head_idx = query_head_idx / query_heads_per_kv_head;
 
             int32_t query_offset = batch_idx * num_heads_ * head_dim_ + query_head_idx * head_dim_;
-            int32_t output_offset = batch_head_idx * k_;
+            int32_t output_offset = batch_head_idx * output_stride_;
 
             int32_t seq_len = seq_lens_gm_.GetValue(batch_idx);
             int32_t valid_page_count = seq_len > 0 ? DIV_ROUNDUP(seq_len, block_size_) : 0;
@@ -486,6 +490,7 @@ private:
     int32_t max_metadata_blocks_per_request_;
     int32_t tokens_since_metadata_update_;
     int32_t k_;
+    int32_t output_stride_;
     uint16_t head_dim_storage_blocks_;
     uint16_t inter_kv_head_stride_blocks_;
     int32_t metadata_block_stride_elems_;
@@ -516,7 +521,8 @@ __aicore__ inline void RunQuestBlockSelectPaged(
         static_cast<int32_t>(tiling_data->headDim),
         static_cast<int32_t>(tiling_data->maxMetadataBlocksPerRequest),
         tiling_data->tokensSinceMetadataUpdate,
-        static_cast<int32_t>(tiling_data->k));
+        static_cast<int32_t>(tiling_data->k),
+        static_cast<int32_t>(tiling_data->outputStride));
     op.Process();
 }
 

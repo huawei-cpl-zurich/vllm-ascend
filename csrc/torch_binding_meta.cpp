@@ -36,6 +36,7 @@
 namespace vllm_ascend {
 namespace meta {
 const int64_t INT4_NUMS_IN_INT32 = 8;
+constexpr int64_t QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS = 64;
 
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask_meta(
@@ -422,6 +423,10 @@ at::Tensor npu_quest_block_select_paged_meta(
     (void)metadata_block_tables;
     (void)seq_lens;
     TORCH_CHECK(k > 0, "k must be positive.");
+    TORCH_CHECK(k <= QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS,
+                "quest_block_select_paged supports at most ",
+                QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS,
+                " selected blocks, got ", k, ".");
     TORCH_CHECK(tokens_since_metadata_update == -1 || k >= 2,
                 "quest_block_select_paged requires k >= 2 when fixed anchors are enabled.");
     return at::empty(
@@ -443,7 +448,14 @@ at::Tensor &npu_quest_block_select_paged_out_meta(
     (void)minblocks;
     (void)metadata_block_tables;
     (void)seq_lens;
-    (void)tokens_since_metadata_update;
+    const int64_t k = out.size(2);
+    TORCH_CHECK(k > 0, "k must be positive.");
+    TORCH_CHECK(k <= QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS,
+                "quest_block_select_paged supports at most ",
+                QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS,
+                " selected blocks, got ", k, ".");
+    TORCH_CHECK(tokens_since_metadata_update == -1 || k >= 2,
+                "quest_block_select_paged requires k >= 2 when fixed anchors are enabled.");
     return out;
 }
 

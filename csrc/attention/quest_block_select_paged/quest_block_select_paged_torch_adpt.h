@@ -30,6 +30,7 @@ inline void check_quest_block_select_paged_common(
     const at::Tensor &metadata_block_tables,
     const at::Tensor &seq_lens,
     const at::Tensor &output,
+    int64_t k,
     int64_t tokens_since_metadata_update)
 {
     TORCH_CHECK(query.dim() == 3, "query must be 3D.");
@@ -54,7 +55,7 @@ inline void check_quest_block_select_paged_common(
     const int64_t head_dim = query.size(2);
     const int64_t block_size = maxblocks.size(1);
     const int64_t num_kv_heads = maxblocks.size(2);
-    const int64_t output_k = output.size(2);
+    const int64_t output_stride = output.size(2);
 
     TORCH_CHECK(head_dim == QUEST_BLOCK_SELECT_HEAD_DIM,
                 "quest_block_select_paged requires head_dim == 128, got ", head_dim);
@@ -71,12 +72,14 @@ inline void check_quest_block_select_paged_common(
                 "Batch size mismatch between query and seq_lens.");
     TORCH_CHECK(output.size(0) == batch_size && output.size(1) == num_heads,
                 "selected_indices must have shape [B, H, k].");
-    TORCH_CHECK(output_k > 0, "k must be positive.");
-    TORCH_CHECK(output_k <= QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS,
+    TORCH_CHECK(k > 0, "k must be positive.");
+    TORCH_CHECK(k <= QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS,
                 "quest_block_select_paged supports at most ",
                 QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS,
-                " selected blocks, got ", output_k, ".");
-    TORCH_CHECK(tokens_since_metadata_update == -1 || output_k >= 2,
+                " selected blocks, got ", k, ".");
+    TORCH_CHECK(output_stride >= k,
+                "selected_indices.shape[2] must be >= k.");
+    TORCH_CHECK(tokens_since_metadata_update == -1 || k >= 2,
                 "quest_block_select_paged requires k >= 2 when fixed anchors are enabled.");
     TORCH_CHECK(num_heads % num_kv_heads == 0,
                 "num_heads must be divisible by num_kv_heads.");
@@ -116,6 +119,7 @@ inline at::Tensor npu_quest_block_select_paged(
         metadata_block_tables,
         seq_lens,
         output,
+        k,
         tokens_since_metadata_update);
 
     EXEC_NPU_CMD(
@@ -125,6 +129,7 @@ inline at::Tensor npu_quest_block_select_paged(
         minblocks,
         metadata_block_tables,
         seq_lens,
+        k,
         tokens_since_metadata_update,
         output);
 
@@ -140,6 +145,7 @@ inline at::Tensor &npu_quest_block_select_paged_out(
     at::Tensor &output,
     int64_t tokens_since_metadata_update)
 {
+    const int64_t k = output.size(2);
     check_quest_block_select_paged_common(
         query,
         maxblocks,
@@ -147,6 +153,7 @@ inline at::Tensor &npu_quest_block_select_paged_out(
         metadata_block_tables,
         seq_lens,
         output,
+        k,
         tokens_since_metadata_update);
 
     EXEC_NPU_CMD(
@@ -156,6 +163,7 @@ inline at::Tensor &npu_quest_block_select_paged_out(
         minblocks,
         metadata_block_tables,
         seq_lens,
+        k,
         tokens_since_metadata_update,
         output);
     return output;

@@ -22,7 +22,8 @@ constexpr uint32_t MAXBLOCKS_INDEX = 1;
 constexpr uint32_t MINBLOCKS_INDEX = 2;
 constexpr uint32_t METADATA_BLOCK_TABLES_INDEX = 3;
 constexpr uint32_t SEQ_LENS_INDEX = 4;
-constexpr uint32_t ATTR_TOKENS_SINCE_METADATA_UPDATE_INDEX = 0;
+constexpr uint32_t ATTR_K_INDEX = 0;
+constexpr uint32_t ATTR_TOKENS_SINCE_METADATA_UPDATE_INDEX = 1;
 constexpr uint32_t QUERY_DIM_NUM = 3;
 constexpr uint32_t BLOCKS_DIM_NUM = 4;
 constexpr uint32_t TABLE_DIM_NUM = 2;
@@ -99,7 +100,7 @@ static ge::graphStatus QuestBlockSelectPagedTilingFunc(gert::TilingContext *cont
     const int64_t num_kv_heads = maxblocks_storage.GetDim(DIM_2);
     const int64_t metadata_head_dim = maxblocks_storage.GetDim(DIM_3);
     const int64_t max_metadata_blocks_per_request = metadata_block_tables_storage.GetDim(DIM_1);
-    const int64_t selected_k = selected_indices_storage.GetDim(DIM_2);
+    const int64_t output_stride = selected_indices_storage.GetDim(DIM_2);
 
     OPS_ERR_IF(batch_size < 0 || num_metadata_blocks < 0,
                OPS_LOG_E(context->GetNodeName(), "Tensor dimensions must be non-negative."),
@@ -135,16 +136,21 @@ static ge::graphStatus QuestBlockSelectPagedTilingFunc(gert::TilingContext *cont
                    num_metadata_blocks / batch_size < max_metadata_blocks_per_request,
                OPS_LOG_E(context->GetNodeName(), "metadata tensors are too small for metadata_block_tables."),
                return ge::GRAPH_FAILED);
-    OPS_ERR_IF(selected_k <= 0 || selected_k > QUEST_MAX_SELECTED_BLOCKS,
-               OPS_LOG_E(context->GetNodeName(), "selected_indices.shape[2] must be in (0, 64]."),
+    const auto attrs = context->GetAttrs();
+    OPS_LOG_E_IF_NULL(context, attrs, return ge::GRAPH_FAILED);
+    const int64_t *selected_k = attrs->GetInt(ATTR_K_INDEX);
+    OPS_LOG_E_IF_NULL(context, selected_k, return ge::GRAPH_FAILED);
+    OPS_ERR_IF(*selected_k <= 0 || *selected_k > QUEST_MAX_SELECTED_BLOCKS,
+               OPS_LOG_E(context->GetNodeName(), "k must be in (0, 64]."),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF(output_stride < *selected_k,
+               OPS_LOG_E(context->GetNodeName(), "selected_indices.shape[2] must be >= k."),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(batch_size > QUEST_TILING_UINT32_MAX || num_heads > QUEST_TILING_UINT32_MAX ||
-                   num_kv_heads > QUEST_TILING_UINT32_MAX,
+                   num_kv_heads > QUEST_TILING_UINT32_MAX || output_stride > QUEST_TILING_UINT32_MAX,
                OPS_LOG_E(context->GetNodeName(), "Tensor dimensions exceed QUEST tiling range."),
                return ge::GRAPH_FAILED);
 
-    const auto attrs = context->GetAttrs();
-    OPS_LOG_E_IF_NULL(context, attrs, return ge::GRAPH_FAILED);
     const int64_t *tokens_since_metadata_update =
         attrs->GetInt(ATTR_TOKENS_SINCE_METADATA_UPDATE_INDEX);
     OPS_LOG_E_IF_NULL(context, tokens_since_metadata_update, return ge::GRAPH_FAILED);
@@ -153,7 +159,7 @@ static ge::graphStatus QuestBlockSelectPagedTilingFunc(gert::TilingContext *cont
                OPS_LOG_E(context->GetNodeName(),
                          "tokens_since_metadata_update must be -1 or in [0, block_size]."),
                return ge::GRAPH_FAILED);
-    OPS_ERR_IF(*tokens_since_metadata_update != -1 && selected_k < 2,
+    OPS_ERR_IF(*tokens_since_metadata_update != -1 && *selected_k < 2,
                OPS_LOG_E(context->GetNodeName(),
                          "QUEST block selection requires k >= 2 when fixed anchors are enabled."),
                return ge::GRAPH_FAILED);
@@ -166,7 +172,8 @@ static ge::graphStatus QuestBlockSelectPagedTilingFunc(gert::TilingContext *cont
     tiling.set_headDim(static_cast<uint32_t>(head_dim));
     tiling.set_maxMetadataBlocksPerRequest(
         static_cast<uint32_t>(max_metadata_blocks_per_request));
-    tiling.set_k(static_cast<uint32_t>(selected_k));
+    tiling.set_k(static_cast<uint32_t>(*selected_k));
+    tiling.set_outputStride(static_cast<uint32_t>(output_stride));
     tiling.set_tokensSinceMetadataUpdate(
         static_cast<int32_t>(*tokens_since_metadata_update));
 

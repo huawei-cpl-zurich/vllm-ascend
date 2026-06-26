@@ -217,10 +217,10 @@ def _make_prefill_metadata_case(dtype: torch.dtype):
 
 
 def _make_block_select_case(dtype: torch.dtype):
-    batch_size = 3
+    batch_size = 4
     num_heads = 4
     num_kv_heads = 2
-    num_metadata_blocks = 6
+    num_metadata_blocks = 8
     generator = torch.Generator(device="cpu").manual_seed(456)
 
     query = torch.randn((batch_size, num_heads, HEAD_DIM), generator=generator, dtype=torch.float32).to(dtype)
@@ -234,8 +234,12 @@ def _make_block_select_case(dtype: torch.dtype):
         generator=generator,
         dtype=torch.float32,
     ).to(dtype)
-    metadata_block_tables = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32)
-    seq_lens = torch.tensor([0, 5 * BLOCK_SIZE - 3, 130 * BLOCK_SIZE + 7], dtype=torch.int32)
+    metadata_block_tables = torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7]], dtype=torch.int32)
+    # The final row covers k=9/13 with k < valid_page_count < ceil8(k).
+    seq_lens = torch.tensor(
+        [0, 5 * BLOCK_SIZE - 3, 130 * BLOCK_SIZE + 7, 14 * BLOCK_SIZE - 3],
+        dtype=torch.int32,
+    )
     return query, maxblocks, minblocks, metadata_block_tables, seq_lens
 
 
