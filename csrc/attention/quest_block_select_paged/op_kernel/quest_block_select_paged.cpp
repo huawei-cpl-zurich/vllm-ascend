@@ -73,10 +73,10 @@ class KernelQuestBlockSelectPaged {
         AscendC::LocalTensor<ComputeT> maxblock;
         AscendC::LocalTensor<ComputeT> minblock;
         AscendC::LocalTensor<ComputeT> block_scores;
-        AscendC::LocalTensor<ComputeT> accumulated_scores;
+        AscendC::LocalTensor<ComputeT> topk_pairs;
         AscendC::LocalTensor<uint32_t> selected_indices;
-        AscendC::LocalTensor<ComputeT> tmp_concat;
-        AscendC::LocalTensor<ComputeT> concat;
+        AscendC::LocalTensor<ComputeT> merge_tmp;
+        AscendC::LocalTensor<ComputeT> sorted_block_pairs;
         AscendC::LocalTensor<uint32_t> index_local;
         AscendC::LocalTensor<ComputeT> sort_tmp;
     };
@@ -135,33 +135,32 @@ public:
             NUM_UB_BYTES(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t reduced_buf_size =
             NUM_UB_BYTES(block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t accumulated_scores_size = NUM_UB_BYTES(
-            max_metadata_blocks_per_request_ * block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
+        uint32_t topk_pairs_size = NUM_UB_BYTES(
+            QUEST_MAX_SELECTED_BLOCKS * NUM_SORT_PAIR_ELEMS * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t selected_indices_buf_size = NUM_UB_BYTES(
             DIV_ROUNDUP(k_, NUM_SORT_PAIRS_PER_REPEAT) * NUM_SORT_PAIRS_PER_REPEAT *
             static_cast<int32_t>(sizeof(uint32_t)));
-        uint32_t tmp_concat_buf_size = NUM_UB_BYTES(
-            max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
+        uint32_t merge_tmp_buf_size = NUM_UB_BYTES(
+            (QUEST_MAX_SELECTED_BLOCKS + block_size_) * NUM_SORT_PAIR_ELEMS *
             static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t concat_buf_size = NUM_UB_BYTES(
-            (max_metadata_blocks_per_request_ * block_size_ +
-             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE) *
+        uint32_t sorted_block_pairs_buf_size = NUM_UB_BYTES(
+            block_size_ * NUM_SORT_PAIR_ELEMS *
             static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t index_local_buf_size =
-            NUM_UB_BYTES(max_metadata_blocks_per_request_ * block_size_ *
+            NUM_UB_BYTES(block_size_ *
                          static_cast<int32_t>(sizeof(uint32_t)));
         uint32_t sort_tmp_buf_size = NUM_UB_BYTES(
-            max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
+            block_size_ * REGION_SIZE *
             static_cast<int32_t>(sizeof(ComputeT)));
 
         pipe_.InitBuffer(query_buf_, query_buf_size);
         pipe_.InitBuffer(maxblock_buf_, block_buf_size);
         pipe_.InitBuffer(minblock_buf_, block_buf_size);
         pipe_.InitBuffer(block_scores_buf_, reduced_buf_size);
-        pipe_.InitBuffer(accumulated_scores_buf_, accumulated_scores_size);
+        pipe_.InitBuffer(topk_pairs_buf_, topk_pairs_size);
         pipe_.InitBuffer(selected_indices_buf_, selected_indices_buf_size);
-        pipe_.InitBuffer(tmp_concat_buf_, tmp_concat_buf_size);
-        pipe_.InitBuffer(concat_buf_, concat_buf_size);
+        pipe_.InitBuffer(merge_tmp_buf_, merge_tmp_buf_size);
+        pipe_.InitBuffer(sorted_block_pairs_buf_, sorted_block_pairs_buf_size);
         pipe_.InitBuffer(index_local_buf_, index_local_buf_size);
         pipe_.InitBuffer(sort_tmp_buf_, sort_tmp_buf_size);
     }
@@ -193,11 +192,13 @@ public:
                     k_);
             } else {
                 int32_t num_meta_blocks_in_request = DIV_ROUNDUP(valid_page_count, block_size_);
-                int32_t sort_element_count = DIV_ROUNDUP(valid_page_count, 32) * 32;
 
                 LoadQuery(tensors, query_offset);
-                DuplicateAccumulatedScores(tensors, sort_element_count);
+                bool has_topk = false;
 
+                // Keep only the best k value/index pairs resident in UB. Each
+                // metadata block is sorted independently, then merged into the
+                // resident top-k list following the Lightning sparse top-k path.
                 for (int32_t meta_block = 0; meta_block < num_meta_blocks_in_request; meta_block++) {
                     int32_t meta_block_id = metadata_block_tables_gm_.GetValue(
                         batch_idx * max_metadata_blocks_per_request_ + meta_block);
@@ -205,17 +206,19 @@ public:
                         meta_block_id * metadata_block_stride_elems_ + kv_head_idx * head_dim_;
 
                     ScoreMetadataBlock(tensors, meta_block_offset);
-                    CopyScoresToAccumulated(
+                    int32_t sort_element_count = PrepareBlockScoresForTopK(
                         tensors,
                         valid_page_count,
                         meta_block,
-                        num_meta_blocks_in_request);
+                        use_fixed_anchors);
+                    SortBlockScores(tensors, meta_block * block_size_, sort_element_count);
+                    MergeBlockTopK(tensors, sort_element_count, has_topk);
+                    has_topk = true;
                 }
 
-                if (likely(use_fixed_anchors)) {
-                    PinAnchorScores(tensors, valid_page_count);
+                if (likely(has_topk)) {
+                    ExtractTopKIndices(tensors);
                 }
-                SortAndGatherTopK(tensors, sort_element_count);
             }
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
@@ -244,10 +247,10 @@ private:
             maxblock_buf_.Get<ComputeT>(),
             minblock_buf_.Get<ComputeT>(),
             block_scores_buf_.Get<ComputeT>(),
-            accumulated_scores_buf_.Get<ComputeT>(),
+            topk_pairs_buf_.Get<ComputeT>(),
             selected_indices_buf_.Get<uint32_t>(),
-            tmp_concat_buf_.Get<ComputeT>(),
-            concat_buf_.Get<ComputeT>(),
+            merge_tmp_buf_.Get<ComputeT>(),
+            sorted_block_pairs_buf_.Get<ComputeT>(),
             index_local_buf_.Get<uint32_t>(),
             sort_tmp_buf_.Get<ComputeT>()};
     }
@@ -275,15 +278,40 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void DuplicateAccumulatedScores(
+    __aicore__ inline int32_t PrepareBlockScoresForTopK(
         LocalTensors &tensors,
-        int32_t sort_element_count)
+        int32_t valid_page_count,
+        int32_t meta_block,
+        bool use_fixed_anchors)
     {
-        AscendC::Duplicate(
-            tensors.accumulated_scores,
-            static_cast<ComputeT>(QUEST_MIN_SCORE),
-            sort_element_count);
-        AscendC::PipeBarrier<PIPE_V>();
+        int32_t start_page = meta_block * block_size_;
+        int32_t pages_in_meta_block = MIN(valid_page_count - start_page, block_size_);
+        int32_t sort_element_count = DIV_ROUNDUP(pages_in_meta_block, NUM_SORT_PAIRS_PER_REPEAT) *
+                                     NUM_SORT_PAIRS_PER_REPEAT;
+        int32_t invalid_page_count = sort_element_count - pages_in_meta_block;
+        if (invalid_page_count > 0) {
+            AscendC::Duplicate(
+                tensors.block_scores[pages_in_meta_block],
+                static_cast<ComputeT>(QUEST_MIN_SCORE),
+                invalid_page_count);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        if (likely(use_fixed_anchors)) {
+            bool wrote_anchor_score = false;
+            if (start_page == 0) {
+                tensors.block_scores.SetValue(0, static_cast<ComputeT>(QUEST_MAX_SCORE));
+                wrote_anchor_score = true;
+            }
+            int32_t last_page = valid_page_count - 1;
+            if (last_page >= start_page && last_page < start_page + block_size_) {
+                tensors.block_scores.SetValue(last_page - start_page, static_cast<ComputeT>(QUEST_MAX_SCORE));
+                wrote_anchor_score = true;
+            }
+            if (wrote_anchor_score) {
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
+        return sort_element_count;
     }
 
     __aicore__ inline void ScoreMetadataBlock(
@@ -388,79 +416,59 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void CopyScoresToAccumulated(
+    __aicore__ inline void SortBlockScores(
         LocalTensors &tensors,
-        int32_t valid_page_count,
-        int32_t meta_block,
-        int32_t num_meta_blocks_in_request)
-    {
-        int32_t start_page = meta_block * block_size_;
-        int32_t pages_in_meta_block = MIN(valid_page_count - start_page, block_size_);
-        if (pages_in_meta_block <= 0) {
-            return;
-        }
-
-        uint64_t mask = NUM_FLOAT_ELEMS_PER_VECTOR;
-        uint64_t masks_per_head_dim = head_dim_ / mask;
-        for (int32_t sub_meta_block_id = 0; sub_meta_block_id < static_cast<int32_t>(masks_per_head_dim);
-             sub_meta_block_id++) {
-            int32_t block_scores_offset = sub_meta_block_id * NUM_FLOAT_ELEMS_PER_VECTOR;
-            int32_t pages_remaining = pages_in_meta_block - block_scores_offset;
-            if (pages_remaining <= 0) {
-                break;
-            }
-
-            int32_t accumulated_offset = meta_block * block_size_ + block_scores_offset;
-            AscendC::Copy(
-                tensors.accumulated_scores[accumulated_offset],
-                tensors.block_scores[block_scores_offset],
-                static_cast<uint64_t>(MIN(pages_remaining, NUM_FLOAT_ELEMS_PER_VECTOR)),
-                1,
-                {1, 1, 8, 8});
-            if (meta_block < num_meta_blocks_in_request - 1) {
-                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
-            }
-        }
-    }
-
-    __aicore__ inline void PinAnchorScores(LocalTensors &tensors, int32_t valid_page_count)
-    {
-        if (valid_page_count <= 0) {
-            return;
-        }
-
-        tensors.accumulated_scores.SetValue(0, static_cast<ComputeT>(QUEST_MAX_SCORE));
-        tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(QUEST_MAX_SCORE));
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline void SortAndGatherTopK(
-        LocalTensors &tensors,
+        int32_t start_page,
         int32_t sort_element_count)
     {
         uint32_t repeat_times = sort_element_count / 32;
 
         ArithProgression(
             tensors.index_local,
-            static_cast<int32_t>(0),
+            start_page,
             static_cast<int32_t>(1),
             static_cast<uint32_t>(sort_element_count));
 
-        AscendC::Concat(
-            tensors.concat,
-            tensors.accumulated_scores,
-            tensors.tmp_concat,
-            repeat_times);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Sort<ComputeT, true>(
-            tensors.maxblock,
-            tensors.concat,
+            tensors.sorted_block_pairs,
+            tensors.block_scores,
             tensors.index_local,
             tensors.sort_tmp,
             repeat_times);
         AscendC::PipeBarrier<PIPE_V>();
+    }
 
+    __aicore__ inline void MergeBlockTopK(
+        LocalTensors &tensors,
+        int32_t sort_element_count,
+        bool has_topk)
+    {
+        if (!has_topk) {
+            AscendC::DataCopy(tensors.topk_pairs, tensors.sorted_block_pairs, k_ * NUM_SORT_PAIR_ELEMS);
+            AscendC::PipeBarrier<PIPE_V>();
+            return;
+        }
+
+        AscendC::MrgSort4Info params;
+        params.elementLengths[0] = k_;
+        params.elementLengths[1] = sort_element_count;
+        params.elementLengths[2] = 0;
+        params.elementLengths[3] = 0;
+        params.ifExhaustedSuspension = (k_ == sort_element_count);
+        params.validBit = 0b0011;
+        params.repeatTimes = 1;
+
+        AscendC::MrgSortSrcList<ComputeT> src_list;
+        src_list.src1 = tensors.topk_pairs;
+        src_list.src2 = tensors.sorted_block_pairs;
+        AscendC::MrgSort<ComputeT>(tensors.merge_tmp, src_list, params);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::DataCopy(tensors.topk_pairs, tensors.merge_tmp, k_ * NUM_SORT_PAIR_ELEMS);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void ExtractTopKIndices(LocalTensors &tensors)
+    {
         AscendC::GatherMaskParams gather_mask_params;
         gather_mask_params.repeatTimes = static_cast<uint8_t>(
             DIV_ROUNDUP(k_ * static_cast<int32_t>(sizeof(ComputeT)) * NUM_SORT_PAIR_ELEMS,
@@ -473,7 +481,7 @@ private:
         uint8_t src1_pattern = QUEST_GATHER_INDEX_PATTERN;
         AscendC::GatherMask(
             tensors.selected_indices,
-            tensors.maxblock.template ReinterpretCast<uint32_t>(),
+            tensors.topk_pairs.template ReinterpretCast<uint32_t>(),
             src1_pattern,
             false,
             static_cast<uint32_t>(0),
@@ -488,10 +496,10 @@ private:
     VecBufT maxblock_buf_;
     VecBufT minblock_buf_;
     VecBufT block_scores_buf_;
-    VecBufT accumulated_scores_buf_;
+    VecBufT topk_pairs_buf_;
     VecBufT selected_indices_buf_;
-    VecBufT tmp_concat_buf_;
-    VecBufT concat_buf_;
+    VecBufT merge_tmp_buf_;
+    VecBufT sorted_block_pairs_buf_;
     VecBufT index_local_buf_;
     VecBufT sort_tmp_buf_;
 
