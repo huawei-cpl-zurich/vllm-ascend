@@ -15,7 +15,6 @@
 #
 
 import torch
-from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.utils import enable_custom_op
 
@@ -29,20 +28,6 @@ def quest_prefill_metadata(
     maxblocks: torch.Tensor,
     minblocks: torch.Tensor,
 ) -> None:
-    if HAS_TRITON:
-        from vllm_ascend.ops.triton.quest_prefill_metadata import quest_prefill_metadata_triton
-
-        quest_prefill_metadata_triton(
-            k_cache,
-            block_tables,
-            refresh_start_seq_lens,
-            refresh_end_seq_lens,
-            metadata_block_tables,
-            maxblocks,
-            minblocks,
-        )
-        return
-
     enable_custom_op()
     torch.ops._C_ascend.npu_quest_prefill_metadata(
         k_cache,
@@ -64,19 +49,6 @@ def quest_block_select_paged(
     k: int,
     tokens_since_metadata_update: int = -1,
 ) -> torch.Tensor:
-    if HAS_TRITON:
-        from vllm_ascend.ops.triton.quest_block_select_paged import quest_block_select_paged_triton
-
-        return quest_block_select_paged_triton(
-            query,
-            maxblocks,
-            minblocks,
-            metadata_block_tables,
-            seq_lens,
-            k,
-            tokens_since_metadata_update,
-        )
-
     enable_custom_op()
     return torch.ops._C_ascend.npu_quest_block_select_paged(
         query,
@@ -98,19 +70,6 @@ def quest_block_select_paged_out(
     out: torch.Tensor,
     tokens_since_metadata_update: int = -1,
 ) -> torch.Tensor:
-    if HAS_TRITON:
-        from vllm_ascend.ops.triton.quest_block_select_paged import quest_block_select_paged_out_triton
-
-        return quest_block_select_paged_out_triton(
-            query,
-            maxblocks,
-            minblocks,
-            metadata_block_tables,
-            seq_lens,
-            out,
-            tokens_since_metadata_update,
-        )
-
     enable_custom_op()
     return torch.ops._C_ascend.npu_quest_block_select_paged_out(
         query,
