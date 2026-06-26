@@ -75,8 +75,6 @@ class KernelQuestBlockSelectPaged {
         AscendC::LocalTensor<ComputeT> block_scores;
         AscendC::LocalTensor<ComputeT> accumulated_scores;
         AscendC::LocalTensor<uint32_t> selected_indices;
-        AscendC::LocalTensor<ComputeT> tmp_concat;
-        AscendC::LocalTensor<ComputeT> concat;
         AscendC::LocalTensor<uint32_t> index_local;
         AscendC::LocalTensor<ComputeT> sort_tmp;
     };
@@ -140,13 +138,6 @@ public:
         uint32_t selected_indices_buf_size = NUM_UB_BYTES(
             DIV_ROUNDUP(k_, NUM_SORT_PAIRS_PER_REPEAT) * NUM_SORT_PAIRS_PER_REPEAT *
             static_cast<int32_t>(sizeof(uint32_t)));
-        uint32_t tmp_concat_buf_size = NUM_UB_BYTES(
-            max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
-            static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t concat_buf_size = NUM_UB_BYTES(
-            (max_metadata_blocks_per_request_ * block_size_ +
-             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE) *
-            static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t index_local_buf_size =
             NUM_UB_BYTES(max_metadata_blocks_per_request_ * block_size_ *
                          static_cast<int32_t>(sizeof(uint32_t)));
@@ -160,8 +151,6 @@ public:
         pipe_.InitBuffer(block_scores_buf_, reduced_buf_size);
         pipe_.InitBuffer(accumulated_scores_buf_, accumulated_scores_size);
         pipe_.InitBuffer(selected_indices_buf_, selected_indices_buf_size);
-        pipe_.InitBuffer(tmp_concat_buf_, tmp_concat_buf_size);
-        pipe_.InitBuffer(concat_buf_, concat_buf_size);
         pipe_.InitBuffer(index_local_buf_, index_local_buf_size);
         pipe_.InitBuffer(sort_tmp_buf_, sort_tmp_buf_size);
     }
@@ -208,8 +197,7 @@ public:
                     CopyScoresToAccumulated(
                         tensors,
                         valid_page_count,
-                        meta_block,
-                        num_meta_blocks_in_request);
+                        meta_block);
                 }
 
                 if (likely(use_fixed_anchors)) {
@@ -246,8 +234,6 @@ private:
             block_scores_buf_.Get<ComputeT>(),
             accumulated_scores_buf_.Get<ComputeT>(),
             selected_indices_buf_.Get<uint32_t>(),
-            tmp_concat_buf_.Get<ComputeT>(),
-            concat_buf_.Get<ComputeT>(),
             index_local_buf_.Get<uint32_t>(),
             sort_tmp_buf_.Get<ComputeT>()};
     }
@@ -356,6 +342,8 @@ private:
             block_size_,
             mul_repeat_params);
 
+        // Max consumes the vector Mul outputs from both metadata bounds.
+        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Max(tensors.maxblock, tensors.maxblock, tensors.minblock, block_size_ * head_dim_);
 
         AscendC::RepeatReduceSum(
@@ -391,8 +379,7 @@ private:
     __aicore__ inline void CopyScoresToAccumulated(
         LocalTensors &tensors,
         int32_t valid_page_count,
-        int32_t meta_block,
-        int32_t num_meta_blocks_in_request)
+        int32_t meta_block)
     {
         int32_t start_page = meta_block * block_size_;
         int32_t pages_in_meta_block = MIN(valid_page_count - start_page, block_size_);
@@ -417,11 +404,8 @@ private:
                 static_cast<uint64_t>(MIN(pages_remaining, NUM_FLOAT_ELEMS_PER_VECTOR)),
                 1,
                 {1, 1, 8, 8});
-            if (meta_block < num_meta_blocks_in_request - 1) {
-                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
-            }
         }
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void PinAnchorScores(LocalTensors &tensors, int32_t valid_page_count)
@@ -447,15 +431,9 @@ private:
             static_cast<int32_t>(1),
             static_cast<uint32_t>(sort_element_count));
 
-        AscendC::Concat(
-            tensors.concat,
-            tensors.accumulated_scores,
-            tensors.tmp_concat,
-            repeat_times);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Sort<ComputeT, true>(
             tensors.maxblock,
-            tensors.concat,
+            tensors.accumulated_scores,
             tensors.index_local,
             tensors.sort_tmp,
             repeat_times);
@@ -490,8 +468,6 @@ private:
     VecBufT block_scores_buf_;
     VecBufT accumulated_scores_buf_;
     VecBufT selected_indices_buf_;
-    VecBufT tmp_concat_buf_;
-    VecBufT concat_buf_;
     VecBufT index_local_buf_;
     VecBufT sort_tmp_buf_;
 
