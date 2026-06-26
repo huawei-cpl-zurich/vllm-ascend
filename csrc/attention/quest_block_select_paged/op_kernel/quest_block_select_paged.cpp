@@ -548,7 +548,6 @@ extern "C" __global__ __aicore__ void quest_block_select_paged(
     GM_ADDR workspace,
     GM_ADDR tiling)
 {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     (void)workspace;
     QUEST_BLOCK_SELECT_PAGED_COPY_TILING_DATA(QuestBlockSelectPagedTilingData, tiling);
 
