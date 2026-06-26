@@ -307,10 +307,6 @@ private:
             block_size_ * head_dim_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
-        // Back-to-back vector ops below reuse maxblock/minblock as both inputs
-        // and outputs. The V-pipe barriers make those RAW/WAW dependencies
-        // explicit; MTE event flags only order GM/UB transfers.
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Mul(
             tensors.maxblock,
             tensors.query,
@@ -325,7 +321,6 @@ private:
             NUM_FLOAT_ELEMS_PER_VECTOR,
             block_size_,
             mul_repeat_params);
-        AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::DataCopy(input_storage_lt, minblocks_gm_[meta_block_offset], gm_ub_cp);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
@@ -335,7 +330,6 @@ private:
             input_storage_lt,
             AscendC::RoundMode::CAST_NONE,
             block_size_ * head_dim_);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Mul(
             tensors.minblock,
             tensors.query,
@@ -350,10 +344,8 @@ private:
             NUM_FLOAT_ELEMS_PER_VECTOR,
             block_size_,
             mul_repeat_params);
-        AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::Max(tensors.maxblock, tensors.maxblock, tensors.minblock, block_size_ * head_dim_);
-        AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::RepeatReduceSum(
             tensors.minblock,
@@ -414,7 +406,6 @@ private:
                 static_cast<uint64_t>(MIN(pages_remaining, NUM_FLOAT_ELEMS_PER_VECTOR)),
                 1,
                 {1, 1, 8, 8});
-            AscendC::PipeBarrier<PIPE_V>();
             if (meta_block < num_meta_blocks_in_request - 1) {
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
@@ -444,7 +435,6 @@ private:
             static_cast<int32_t>(0),
             static_cast<int32_t>(1),
             static_cast<uint32_t>(sort_element_count));
-        AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::Concat(
             tensors.concat,
@@ -458,13 +448,11 @@ private:
             tensors.index_local,
             tensors.sort_tmp,
             repeat_times);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Extract(
             tensors.selected_values,
             tensors.selected_indices,
             tensors.maxblock,
             repeat_times);
-        AscendC::PipeBarrier<PIPE_V>();
     }
 
     AscendC::TPipe pipe_;
