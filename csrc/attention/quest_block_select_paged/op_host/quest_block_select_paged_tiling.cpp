@@ -28,6 +28,7 @@ constexpr uint32_t BLOCKS_DIM_NUM = 4;
 constexpr uint32_t TABLE_DIM_NUM = 2;
 constexpr uint32_t SEQ_LEN_DIM_NUM = 1;
 constexpr uint32_t OUTPUT_DIM_NUM = 3;
+constexpr int64_t SELECTED_INDICES_K_ALIGNMENT = 8;
 constexpr uint32_t DIM_0 = 0;
 constexpr uint32_t DIM_1 = 1;
 constexpr uint32_t DIM_2 = 2;
@@ -83,6 +84,9 @@ static ge::graphStatus QuestBlockSelectPagedTilingFunc(gert::TilingContext *cont
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(selected_indices_storage.GetDimNum() != OUTPUT_DIM_NUM,
                OPS_LOG_E(context->GetNodeName(), "selected_indices must be 3D."),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF(selected_indices_storage.GetDim(DIM_2) % SELECTED_INDICES_K_ALIGNMENT != 0,
+               OPS_LOG_E(context->GetNodeName(), "selected_indices.shape[2] must be a multiple of 8."),
                return ge::GRAPH_FAILED);
 
     const auto attrs = context->GetAttrs();

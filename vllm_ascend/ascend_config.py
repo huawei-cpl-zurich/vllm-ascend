@@ -577,6 +577,8 @@ class QuestDecodeConfig:
     Configuration Object for quest_decode_config from additional_config.
     """
 
+    TOPK_PAGES_ALIGNMENT = 8
+
     def __init__(self, quest_decode_config: dict | None = None):
         quest_decode_config = quest_decode_config or {}
         if not isinstance(quest_decode_config, dict):
@@ -587,6 +589,11 @@ class QuestDecodeConfig:
         if self.enable:
             if not isinstance(topk_pages, int) or topk_pages < 2:
                 raise ValueError("quest_decode_config.topk_pages must be an integer >= 2 when QUEST is enabled.")
+            if topk_pages % self.TOPK_PAGES_ALIGNMENT != 0:
+                raise ValueError(
+                    "quest_decode_config.topk_pages must be a multiple of "
+                    f"{self.TOPK_PAGES_ALIGNMENT} when QUEST is enabled."
+                )
         self.topk_pages = topk_pages or 0
 
 

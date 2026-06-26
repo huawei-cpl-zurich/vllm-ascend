@@ -19,6 +19,7 @@
 #define NUM_SORT_PAIR_ELEMS 2
 #define QUEST_GATHER_INDEX_PATTERN 2
 #define QUEST_MAX_SELECTED_BLOCKS 64
+#define QUEST_SELECTED_INDICES_ALIGNMENT 8
 #define DIV_ROUNDUP(x, y) (((x) + (y)-1) / (y))
 #define DIV_ROUNDUP_MUL(bytes, bytes_per_block) (DIV_ROUNDUP(bytes, bytes_per_block) * (bytes_per_block))
 #define NUM_UB_BYTES(bytes) (DIV_ROUNDUP_MUL(bytes, BYTES_UB_BLOCK))
@@ -112,6 +113,8 @@ public:
         k_ = k;
         ASSERT(k_ <= static_cast<int32_t>(QUEST_MAX_SELECTED_BLOCKS) &&
                "quest_block_select_paged requires k <= 64.");
+        ASSERT(k_ % static_cast<int32_t>(QUEST_SELECTED_INDICES_ALIGNMENT) == 0 &&
+               "quest_block_select_paged requires k to be a multiple of 8.");
         head_dim_storage_blocks_ =
             NUM_DATA_BLOCKS(head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
         inter_kv_head_stride_blocks_ = NUM_DATA_BLOCKS(

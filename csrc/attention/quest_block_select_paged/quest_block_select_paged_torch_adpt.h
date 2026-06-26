@@ -24,6 +24,8 @@ constexpr int64_t QUEST_BLOCK_SELECT_MAX_MMBPR = 6;
 constexpr int64_t QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS = 64;
 constexpr int64_t QUEST_INDICES_BYTES = 4;
 constexpr int64_t QUEST_DATA_BLOCK_BYTES = 32;
+constexpr int64_t QUEST_BLOCK_SELECT_K_ALIGNMENT =
+    QUEST_DATA_BLOCK_BYTES / QUEST_INDICES_BYTES;
 
 inline int64_t round_k_for_quest(int64_t k)
 {
@@ -100,7 +102,9 @@ inline void check_quest_block_select_paged_common(
                 "tokens_since_metadata_update must be -1 or in [0, block_size].");
     if (require_aligned_output) {
         TORCH_CHECK(output_k == round_k_for_quest(output_k),
-                    "The last dimension of the output tensor must be aligned to 8 int32 values.");
+                    "The last dimension of the output tensor must be a multiple of ",
+                    QUEST_BLOCK_SELECT_K_ALIGNMENT,
+                    " int32 values.");
     }
 }
 } // namespace
@@ -121,9 +125,12 @@ inline at::Tensor npu_quest_block_select_paged(
                 " selected blocks, got ", k, ".");
     TORCH_CHECK(tokens_since_metadata_update == -1 || k >= 2,
                 "quest_block_select_paged requires k >= 2 when fixed anchors are enabled.");
-    const int64_t rounded_k = round_k_for_quest(k);
+    TORCH_CHECK(k == round_k_for_quest(k),
+                "quest_block_select_paged requires k to be a multiple of ",
+                QUEST_BLOCK_SELECT_K_ALIGNMENT,
+                ".");
     at::Tensor output = at::empty(
-        {query.size(0), query.size(1), rounded_k},
+        {query.size(0), query.size(1), k},
         query.options().dtype(at::kInt));
     check_quest_block_select_paged_common(
         query,
@@ -133,7 +140,7 @@ inline at::Tensor npu_quest_block_select_paged(
         seq_lens,
         output,
         tokens_since_metadata_update,
-        false);
+        true);
 
     EXEC_NPU_CMD(
         aclnnQuestBlockSelectPaged,
@@ -145,9 +152,6 @@ inline at::Tensor npu_quest_block_select_paged(
         tokens_since_metadata_update,
         output);
 
-    if (rounded_k != k) {
-        output = output.slice(/*dim=*/2, /*start=*/0, /*end=*/k);
-    }
     return output;
 }
 
