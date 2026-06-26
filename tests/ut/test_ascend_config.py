@@ -80,6 +80,40 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_quest_decode_config_accepts_non_aligned_topk_pages(self, mock_fix_incompatible_config):
+        for topk_pages in (9, 13, 15):
+            clear_ascend_config()
+            test_vllm_config = VllmConfig()
+            test_vllm_config.additional_config = {
+                "quest_decode_config": {
+                    "enable": True,
+                    "topk_pages": topk_pages,
+                }
+            }
+
+            quest_decode_config = init_ascend_config(test_vllm_config).quest_decode_config
+
+            self.assertTrue(quest_decode_config.enable)
+            self.assertEqual(quest_decode_config.topk_pages, topk_pages)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_quest_decode_config_rejects_invalid_enabled_topk_pages(self, mock_fix_incompatible_config):
+        for topk_pages in (None, 0, 1, "8", 8.0):
+            clear_ascend_config()
+            test_vllm_config = VllmConfig()
+            test_vllm_config.additional_config = {
+                "quest_decode_config": {
+                    "enable": True,
+                    "topk_pages": topk_pages,
+                }
+            }
+
+            with self.assertRaises(ValueError):
+                init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
     def test_init_ascend_config_enable_npugraph_ex(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
