@@ -19,7 +19,6 @@
 #define NUM_SORT_PAIR_ELEMS 2
 #define QUEST_GATHER_INDEX_PATTERN 2
 #define QUEST_MAX_SELECTED_BLOCKS 64
-#define QUEST_SELECTED_INDICES_ALIGNMENT 8
 #define DIV_ROUNDUP(x, y) (((x) + (y)-1) / (y))
 #define DIV_ROUNDUP_MUL(bytes, bytes_per_block) (DIV_ROUNDUP(bytes, bytes_per_block) * (bytes_per_block))
 #define NUM_UB_BYTES(bytes) (DIV_ROUNDUP_MUL(bytes, BYTES_UB_BLOCK))
@@ -113,14 +112,11 @@ public:
         k_ = k;
         ASSERT(k_ <= static_cast<int32_t>(QUEST_MAX_SELECTED_BLOCKS) &&
                "quest_block_select_paged requires k <= 64.");
-        ASSERT(k_ % static_cast<int32_t>(QUEST_SELECTED_INDICES_ALIGNMENT) == 0 &&
-               "quest_block_select_paged requires k to be a multiple of 8.");
         head_dim_storage_blocks_ =
             NUM_DATA_BLOCKS(head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
         inter_kv_head_stride_blocks_ = NUM_DATA_BLOCKS(
             (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
         metadata_block_stride_elems_ = block_size_ * num_kv_heads_ * head_dim_;
-        selected_indices_copy_blocks_ = NUM_DATA_BLOCKS(k_ * static_cast<int32_t>(sizeof(int32_t)));
 
         query_gm_.SetGlobalBuffer((__gm__ StorageT *)query);
         maxblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)maxblocks);
@@ -224,8 +220,16 @@ public:
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
-            auto indices_copy_params = AscendC::DataCopyParams(1, selected_indices_copy_blocks_, 0, 0);
-            AscendC::DataCopy(selected_indices_gm_[output_offset], tensors.selected_indices, indices_copy_params);
+            AscendC::DataCopyExtParams indices_copy_params{
+                1,
+                static_cast<uint32_t>(k_ * static_cast<int32_t>(sizeof(uint32_t))),
+                0,
+                0,
+                0};
+            AscendC::DataCopyPad(
+                selected_indices_gm_[output_offset],
+                tensors.selected_indices,
+                indices_copy_params);
             // The selected_indices UB buffer is reused on the next loop iteration.
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
@@ -508,7 +512,6 @@ private:
     int32_t k_;
     uint16_t head_dim_storage_blocks_;
     uint16_t inter_kv_head_stride_blocks_;
-    uint16_t selected_indices_copy_blocks_;
     int32_t metadata_block_stride_elems_;
 };
 

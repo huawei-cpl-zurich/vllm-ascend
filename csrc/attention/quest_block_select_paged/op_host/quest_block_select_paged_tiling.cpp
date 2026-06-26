@@ -28,7 +28,6 @@ constexpr uint32_t BLOCKS_DIM_NUM = 4;
 constexpr uint32_t TABLE_DIM_NUM = 2;
 constexpr uint32_t SEQ_LEN_DIM_NUM = 1;
 constexpr uint32_t OUTPUT_DIM_NUM = 3;
-constexpr int64_t SELECTED_INDICES_K_ALIGNMENT = 8;
 constexpr int64_t QUEST_BLOCK_SIZE = 128;
 constexpr int64_t QUEST_HEAD_DIM = 128;
 constexpr int64_t QUEST_MAX_SELECTED_BLOCKS = 64;
@@ -138,9 +137,6 @@ static ge::graphStatus QuestBlockSelectPagedTilingFunc(gert::TilingContext *cont
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(selected_k <= 0 || selected_k > QUEST_MAX_SELECTED_BLOCKS,
                OPS_LOG_E(context->GetNodeName(), "selected_indices.shape[2] must be in (0, 64]."),
-               return ge::GRAPH_FAILED);
-    OPS_ERR_IF(selected_k % SELECTED_INDICES_K_ALIGNMENT != 0,
-               OPS_LOG_E(context->GetNodeName(), "selected_indices.shape[2] must be a multiple of 8."),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(batch_size > QUEST_TILING_UINT32_MAX || num_heads > QUEST_TILING_UINT32_MAX ||
                    num_kv_heads > QUEST_TILING_UINT32_MAX,

@@ -22,18 +22,6 @@ constexpr int64_t QUEST_BLOCK_SELECT_BLOCK_SIZE = 128;
 constexpr int64_t QUEST_BLOCK_SELECT_HEAD_DIM = 128;
 constexpr int64_t QUEST_BLOCK_SELECT_MAX_MMBPR = 6;
 constexpr int64_t QUEST_BLOCK_SELECT_MAX_SELECTED_BLOCKS = 64;
-constexpr int64_t QUEST_INDICES_BYTES = 4;
-constexpr int64_t QUEST_DATA_BLOCK_BYTES = 32;
-constexpr int64_t QUEST_BLOCK_SELECT_K_ALIGNMENT =
-    QUEST_DATA_BLOCK_BYTES / QUEST_INDICES_BYTES;
-
-inline int64_t round_k_for_quest(int64_t k)
-{
-    const int64_t rounded_bytes =
-        ((k * QUEST_INDICES_BYTES + QUEST_DATA_BLOCK_BYTES - 1) / QUEST_DATA_BLOCK_BYTES) *
-        QUEST_DATA_BLOCK_BYTES;
-    return rounded_bytes / QUEST_INDICES_BYTES;
-}
 
 inline void check_quest_block_select_paged_common(
     const at::Tensor &query,
@@ -42,8 +30,7 @@ inline void check_quest_block_select_paged_common(
     const at::Tensor &metadata_block_tables,
     const at::Tensor &seq_lens,
     const at::Tensor &output,
-    int64_t tokens_since_metadata_update,
-    bool require_aligned_output)
+    int64_t tokens_since_metadata_update)
 {
     TORCH_CHECK(query.dim() == 3, "query must be 3D.");
     TORCH_CHECK(maxblocks.dim() == 4, "maxblocks must be 4D.");
@@ -100,12 +87,6 @@ inline void check_quest_block_select_paged_common(
                     (tokens_since_metadata_update >= 0 &&
                      tokens_since_metadata_update <= block_size),
                 "tokens_since_metadata_update must be -1 or in [0, block_size].");
-    if (require_aligned_output) {
-        TORCH_CHECK(output_k == round_k_for_quest(output_k),
-                    "The last dimension of the output tensor must be a multiple of ",
-                    QUEST_BLOCK_SELECT_K_ALIGNMENT,
-                    " int32 values.");
-    }
 }
 } // namespace
 
@@ -125,10 +106,6 @@ inline at::Tensor npu_quest_block_select_paged(
                 " selected blocks, got ", k, ".");
     TORCH_CHECK(tokens_since_metadata_update == -1 || k >= 2,
                 "quest_block_select_paged requires k >= 2 when fixed anchors are enabled.");
-    TORCH_CHECK(k == round_k_for_quest(k),
-                "quest_block_select_paged requires k to be a multiple of ",
-                QUEST_BLOCK_SELECT_K_ALIGNMENT,
-                ".");
     at::Tensor output = at::empty(
         {query.size(0), query.size(1), k},
         query.options().dtype(at::kInt));
@@ -139,8 +116,7 @@ inline at::Tensor npu_quest_block_select_paged(
         metadata_block_tables,
         seq_lens,
         output,
-        tokens_since_metadata_update,
-        true);
+        tokens_since_metadata_update);
 
     EXEC_NPU_CMD(
         aclnnQuestBlockSelectPaged,
@@ -171,8 +147,7 @@ inline at::Tensor &npu_quest_block_select_paged_out(
         metadata_block_tables,
         seq_lens,
         output,
-        tokens_since_metadata_update,
-        true);
+        tokens_since_metadata_update);
 
     EXEC_NPU_CMD(
         aclnnQuestBlockSelectPaged,
