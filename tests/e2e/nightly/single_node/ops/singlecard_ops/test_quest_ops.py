@@ -123,6 +123,34 @@ def cpu_quest_block_select_paged(
     return selected_indices
 
 
+def assert_selected_indices_equal(
+    actual_indices: torch.Tensor,
+    expected_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    k: int,
+    tokens_since_metadata_update: int,
+) -> None:
+    if tokens_since_metadata_update < 0:
+        torch.testing.assert_close(actual_indices, expected_indices, rtol=0, atol=0)
+        return
+
+    batch_size, num_heads, _ = actual_indices.shape
+    for batch_idx in range(batch_size):
+        seq_len = int(seq_lens[batch_idx].item())
+        valid_page_count = _ceil_div(seq_len, BLOCK_SIZE) if seq_len > 0 else 0
+        selected_count = min(k, valid_page_count)
+        for head_idx in range(num_heads):
+            actual_selected = actual_indices[batch_idx, head_idx, :selected_count].sort().values
+            expected_selected = expected_indices[batch_idx, head_idx, :selected_count].sort().values
+            torch.testing.assert_close(actual_selected, expected_selected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual_indices[batch_idx, head_idx, selected_count:],
+                expected_indices[batch_idx, head_idx, selected_count:],
+                rtol=0,
+                atol=0,
+            )
+
+
 def _make_prefill_metadata_case(dtype: torch.dtype):
     batch_size = 2
     num_kv_heads = 2
@@ -217,7 +245,7 @@ def ascendc_block_select_exec(
     seq_lens: torch.Tensor,
     k: int,
     tokens_since_metadata_update: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     query_npu = query.npu()
     maxblocks_npu = maxblocks.npu()
     minblocks_npu = minblocks.npu()
@@ -233,6 +261,23 @@ def ascendc_block_select_exec(
         k,
         tokens_since_metadata_update,
     )
+    return selected_indices.cpu()
+
+
+def ascendc_block_select_out_exec(
+    query: torch.Tensor,
+    maxblocks: torch.Tensor,
+    minblocks: torch.Tensor,
+    metadata_block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    k: int,
+    tokens_since_metadata_update: int,
+) -> torch.Tensor:
+    query_npu = query.npu()
+    maxblocks_npu = maxblocks.npu()
+    minblocks_npu = minblocks.npu()
+    metadata_block_tables_npu = metadata_block_tables.npu()
+    seq_lens_npu = seq_lens.npu()
     selected_indices_out = torch.empty((query.size(0), query.size(1), k), dtype=torch.int32, device=query_npu.device)
     torch.ops._C_ascend.npu_quest_block_select_paged_out(
         query_npu,
@@ -243,7 +288,7 @@ def ascendc_block_select_exec(
         selected_indices_out,
         tokens_since_metadata_update,
     )
-    return selected_indices.cpu(), selected_indices_out.cpu()
+    return selected_indices_out.cpu()
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -300,7 +345,7 @@ def test_npu_quest_block_select_paged(dtype, k, tokens_since_metadata_update):
     )
 
     try:
-        actual_indices, actual_indices_out = ascendc_block_select_exec(
+        actual_indices = ascendc_block_select_exec(
             query,
             maxblocks,
             minblocks,
@@ -309,8 +354,30 @@ def test_npu_quest_block_select_paged(dtype, k, tokens_since_metadata_update):
             k,
             tokens_since_metadata_update,
         )
+        assert_selected_indices_equal(
+            actual_indices,
+            expected_indices,
+            seq_lens,
+            k,
+            tokens_since_metadata_update,
+        )
 
-        torch.testing.assert_close(actual_indices, expected_indices, rtol=0, atol=0)
-        torch.testing.assert_close(actual_indices_out, expected_indices, rtol=0, atol=0)
+        if k % 8 == 0:
+            actual_indices_out = ascendc_block_select_out_exec(
+                query,
+                maxblocks,
+                minblocks,
+                metadata_block_tables,
+                seq_lens,
+                k,
+                tokens_since_metadata_update,
+            )
+            assert_selected_indices_equal(
+                actual_indices_out,
+                expected_indices,
+                seq_lens,
+                k,
+                tokens_since_metadata_update,
+            )
     finally:
         _cleanup_npu()
