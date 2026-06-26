@@ -13,13 +13,19 @@
 
 #define BYTES_UB_BLOCK 32
 #define BYTES_DATA_BLOCK 32
+#define BYTES_VECTOR_REPEAT 256
 #define NUM_FLOAT_ELEMS_PER_VECTOR 64
+#define NUM_SORT_PAIRS_PER_REPEAT 32
+#define NUM_SORT_PAIR_ELEMS 2
+#define QUEST_GATHER_INDEX_PATTERN 2
+#define QUEST_MAX_SELECTED_BLOCKS 64
 #define DIV_ROUNDUP(x, y) (((x) + (y)-1) / (y))
 #define DIV_ROUNDUP_MUL(bytes, bytes_per_block) (DIV_ROUNDUP(bytes, bytes_per_block) * (bytes_per_block))
 #define NUM_UB_BYTES(bytes) (DIV_ROUNDUP_MUL(bytes, BYTES_UB_BLOCK))
 #define NUM_DATA_BLOCKS(bytes) (DIV_ROUNDUP(bytes, BYTES_DATA_BLOCK))
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
-#define MINFLOAT -3.4028235e38f
+#define QUEST_MIN_SCORE -3.4028235e38f
+#define QUEST_MAX_SCORE 3.4028235e38f
 
 constexpr uint32_t REGION_PROPOSAL_DATA_SIZE_FLOAT_V220 = 2;
 
@@ -28,53 +34,15 @@ using namespace AscendC;
 // QuestBlockSelectPagedTilingData is generated from the op_host tiling
 // definition. The kernel must not redeclare it locally.
 
-__aicore__ inline void quest_apply_anchor_selection(
-    LocalTensor<uint32_t> &selected_indices_lt,
-    LocalTensor<uint32_t> &candidate_indices_lt,
-    int32_t valid_page_count,
-    int32_t k)
+__aicore__ inline void quest_zero_indices(
+    LocalTensor<uint32_t> indices_lt,
+    int32_t count)
 {
-    if (valid_page_count <= 0 || k <= 0) {
+    if (count <= 0) {
         return;
     }
-
-    int32_t num_selected_pages = MIN(k, valid_page_count);
-    if (num_selected_pages <= 0) {
-        return;
-    }
-
-    uint32_t last_anchor = static_cast<uint32_t>(valid_page_count - 1);
-    if (unlikely(num_selected_pages <= 2)) {
-        for (int32_t idx = 0; idx < k; ++idx) {
-            selected_indices_lt.SetValue(idx, 0U);
-        }
-        if (num_selected_pages == 1) {
-            selected_indices_lt.SetValue(0, last_anchor);
-        } else {
-            selected_indices_lt.SetValue(0, 0U);
-            selected_indices_lt.SetValue(1, last_anchor);
-        }
-        return;
-    }
-
-    for (int32_t idx = 0; idx < k; ++idx) {
-        candidate_indices_lt.SetValue(idx, selected_indices_lt.GetValue(idx));
-        selected_indices_lt.SetValue(idx, 0U);
-    }
-
-    selected_indices_lt.SetValue(0, 0U);
-    selected_indices_lt.SetValue(1, last_anchor);
-
-    int32_t output_idx = 2;
-    for (int32_t idx = 0; idx < k && output_idx < num_selected_pages; ++idx) {
-        uint32_t page_idx = candidate_indices_lt.GetValue(idx);
-        if (page_idx == 0U || page_idx == last_anchor ||
-            page_idx >= static_cast<uint32_t>(valid_page_count)) {
-            continue;
-        }
-        selected_indices_lt.SetValue(output_idx, page_idx);
-        output_idx++;
-    }
+    Duplicate(indices_lt, static_cast<uint32_t>(0), count);
+    AscendC::PipeBarrier<PIPE_V>();
 }
 
 __aicore__ inline void quest_apply_sequential_selection(
@@ -83,11 +51,14 @@ __aicore__ inline void quest_apply_sequential_selection(
     int32_t k)
 {
     int32_t num_selected_pages = valid_page_count > 0 ? MIN(k, valid_page_count) : 0;
-    for (int32_t idx = 0; idx < num_selected_pages; ++idx) {
-        selected_indices_lt.SetValue(idx, static_cast<uint32_t>(idx));
-    }
-    for (int32_t idx = num_selected_pages; idx < k; ++idx) {
-        selected_indices_lt.SetValue(idx, 0U);
+    quest_zero_indices(selected_indices_lt, k);
+    if (num_selected_pages > 0) {
+        ArithProgression(
+            selected_indices_lt,
+            static_cast<int32_t>(0),
+            static_cast<int32_t>(1),
+            static_cast<uint32_t>(num_selected_pages));
+        AscendC::PipeBarrier<PIPE_V>();
     }
 }
 
@@ -104,9 +75,6 @@ class KernelQuestBlockSelectPaged {
         AscendC::LocalTensor<ComputeT> block_scores;
         AscendC::LocalTensor<ComputeT> accumulated_scores;
         AscendC::LocalTensor<uint32_t> selected_indices;
-        AscendC::LocalTensor<ComputeT> selected_values;
-        AscendC::LocalTensor<ComputeT> tmp_concat;
-        AscendC::LocalTensor<ComputeT> concat;
         AscendC::LocalTensor<uint32_t> index_local;
         AscendC::LocalTensor<ComputeT> sort_tmp;
     };
@@ -140,6 +108,13 @@ public:
         max_metadata_blocks_per_request_ = max_metadata_blocks_per_request;
         tokens_since_metadata_update_ = tokens_since_metadata_update;
         k_ = k;
+        ASSERT(k_ <= static_cast<int32_t>(QUEST_MAX_SELECTED_BLOCKS) &&
+               "quest_block_select_paged requires k <= 64.");
+        head_dim_storage_blocks_ =
+            NUM_DATA_BLOCKS(head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
+        inter_kv_head_stride_blocks_ = NUM_DATA_BLOCKS(
+            (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
+        metadata_block_stride_elems_ = block_size_ * num_kv_heads_ * head_dim_;
 
         query_gm_.SetGlobalBuffer((__gm__ StorageT *)query);
         maxblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)maxblocks);
@@ -160,16 +135,9 @@ public:
             NUM_UB_BYTES(block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t accumulated_scores_size = NUM_UB_BYTES(
             max_metadata_blocks_per_request_ * block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t selected_indices_buf_size = NUM_UB_BYTES(k_ * static_cast<int32_t>(sizeof(uint32_t)));
-        uint32_t selected_values_buf_size =
-            NUM_UB_BYTES(k_ * static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t tmp_concat_buf_size = NUM_UB_BYTES(
-            max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
-            static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t concat_buf_size = NUM_UB_BYTES(
-            (max_metadata_blocks_per_request_ * block_size_ +
-             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE) *
-            static_cast<int32_t>(sizeof(ComputeT)));
+        uint32_t selected_indices_buf_size = NUM_UB_BYTES(
+            DIV_ROUNDUP(k_, NUM_SORT_PAIRS_PER_REPEAT) * NUM_SORT_PAIRS_PER_REPEAT *
+            static_cast<int32_t>(sizeof(uint32_t)));
         uint32_t index_local_buf_size =
             NUM_UB_BYTES(max_metadata_blocks_per_request_ * block_size_ *
                          static_cast<int32_t>(sizeof(uint32_t)));
@@ -183,9 +151,6 @@ public:
         pipe_.InitBuffer(block_scores_buf_, reduced_buf_size);
         pipe_.InitBuffer(accumulated_scores_buf_, accumulated_scores_size);
         pipe_.InitBuffer(selected_indices_buf_, selected_indices_buf_size);
-        pipe_.InitBuffer(selected_values_buf_, selected_values_buf_size);
-        pipe_.InitBuffer(tmp_concat_buf_, tmp_concat_buf_size);
-        pipe_.InitBuffer(concat_buf_, concat_buf_size);
         pipe_.InitBuffer(index_local_buf_, index_local_buf_size);
         pipe_.InitBuffer(sort_tmp_buf_, sort_tmp_buf_size);
     }
@@ -210,15 +175,9 @@ public:
             int32_t seq_len = seq_lens_gm_.GetValue(batch_idx);
             int32_t valid_page_count = seq_len > 0 ? DIV_ROUNDUP(seq_len, block_size_) : 0;
             bool use_fixed_anchors = tokens_since_metadata_update_ >= 0;
-            if (unlikely(valid_page_count <= 0 || (!use_fixed_anchors && k_ >= valid_page_count))) {
+            if (unlikely(valid_page_count <= 0 || k_ >= valid_page_count)) {
                 quest_apply_sequential_selection(
                     tensors.selected_indices,
-                    valid_page_count,
-                    k_);
-            } else if (unlikely(use_fixed_anchors && valid_page_count <= 2)) {
-                quest_apply_anchor_selection(
-                    tensors.selected_indices,
-                    tensors.index_local,
                     valid_page_count,
                     k_);
             } else {
@@ -232,37 +191,36 @@ public:
                     int32_t meta_block_id = metadata_block_tables_gm_.GetValue(
                         batch_idx * max_metadata_blocks_per_request_ + meta_block);
                     int32_t meta_block_offset =
-                        meta_block_id * block_size_ * num_kv_heads_ * head_dim_ + kv_head_idx * head_dim_;
+                        meta_block_id * metadata_block_stride_elems_ + kv_head_idx * head_dim_;
 
                     ScoreMetadataBlock(tensors, meta_block_offset);
                     CopyScoresToAccumulated(
                         tensors,
                         valid_page_count,
-                        meta_block,
-                        num_meta_blocks_in_request);
+                        meta_block);
                 }
 
                 if (likely(use_fixed_anchors)) {
-                    // Anchors are inserted after sorting; mask their scores so
-                    // the remaining slots are selected only from interior pages.
-                    MaskAnchorScores(tensors, valid_page_count);
+                    PinAnchorScores(tensors, valid_page_count);
                 }
-                SortAndExtract(tensors, sort_element_count);
-
-                if (likely(use_fixed_anchors)) {
-                    quest_apply_anchor_selection(
-                        tensors.selected_indices,
-                        tensors.index_local,
-                        valid_page_count,
-                        k_);
-                }
+                SortAndGatherTopK(tensors, sort_element_count);
             }
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
-            uint16_t indices_copy_block_len = NUM_DATA_BLOCKS(k_ * static_cast<int32_t>(sizeof(int32_t)));
-            auto indices_copy_params = AscendC::DataCopyParams(1, indices_copy_block_len, 0, 0);
-            AscendC::DataCopy(selected_indices_gm_[output_offset], tensors.selected_indices, indices_copy_params);
+            AscendC::DataCopyExtParams indices_copy_params{
+                1,
+                static_cast<uint32_t>(k_ * static_cast<int32_t>(sizeof(uint32_t))),
+                0,
+                0,
+                0};
+            AscendC::DataCopyPad(
+                selected_indices_gm_[output_offset],
+                tensors.selected_indices,
+                indices_copy_params);
+            // The selected_indices UB buffer is reused on the next loop iteration.
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
         }
     }
 
@@ -276,9 +234,6 @@ private:
             block_scores_buf_.Get<ComputeT>(),
             accumulated_scores_buf_.Get<ComputeT>(),
             selected_indices_buf_.Get<uint32_t>(),
-            selected_values_buf_.Get<ComputeT>(),
-            tmp_concat_buf_.Get<ComputeT>(),
-            concat_buf_.Get<ComputeT>(),
             index_local_buf_.Get<uint32_t>(),
             sort_tmp_buf_.Get<ComputeT>()};
     }
@@ -312,7 +267,7 @@ private:
     {
         AscendC::Duplicate(
             tensors.accumulated_scores,
-            static_cast<ComputeT>(MINFLOAT),
+            static_cast<ComputeT>(QUEST_MIN_SCORE),
             sort_element_count);
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -325,11 +280,8 @@ private:
             input_storage_buf_.Get<StorageT>(block_size_ * head_dim_);
         AscendC::DataCopyParams gm_ub_cp;
         gm_ub_cp.blockCount = block_size_;
-        gm_ub_cp.blockLen =
-            DIV_ROUNDUP(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_DATA_BLOCK);
-        gm_ub_cp.srcStride = DIV_ROUNDUP(
-            (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
-            BYTES_DATA_BLOCK);
+        gm_ub_cp.blockLen = head_dim_storage_blocks_;
+        gm_ub_cp.srcStride = inter_kv_head_stride_blocks_;
         gm_ub_cp.dstStride = 0;
 
         uint64_t mask = NUM_FLOAT_ELEMS_PER_VECTOR;
@@ -390,6 +342,8 @@ private:
             block_size_,
             mul_repeat_params);
 
+        // Max consumes the vector Mul outputs from both metadata bounds.
+        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Max(tensors.maxblock, tensors.maxblock, tensors.minblock, block_size_ * head_dim_);
 
         AscendC::RepeatReduceSum(
@@ -425,8 +379,7 @@ private:
     __aicore__ inline void CopyScoresToAccumulated(
         LocalTensors &tensors,
         int32_t valid_page_count,
-        int32_t meta_block,
-        int32_t num_meta_blocks_in_request)
+        int32_t meta_block)
     {
         int32_t start_page = meta_block * block_size_;
         int32_t pages_in_meta_block = MIN(valid_page_count - start_page, block_size_);
@@ -451,51 +404,60 @@ private:
                 static_cast<uint64_t>(MIN(pages_remaining, NUM_FLOAT_ELEMS_PER_VECTOR)),
                 1,
                 {1, 1, 8, 8});
-            if (meta_block < num_meta_blocks_in_request - 1) {
-                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
-            }
         }
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void MaskAnchorScores(LocalTensors &tensors, int32_t valid_page_count)
+    __aicore__ inline void PinAnchorScores(LocalTensors &tensors, int32_t valid_page_count)
     {
         if (valid_page_count <= 0) {
             return;
         }
 
-        tensors.accumulated_scores.SetValue(0, static_cast<ComputeT>(MINFLOAT));
-        tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(MINFLOAT));
+        tensors.accumulated_scores.SetValue(0, static_cast<ComputeT>(QUEST_MAX_SCORE));
+        tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(QUEST_MAX_SCORE));
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void SortAndExtract(
+    __aicore__ inline void SortAndGatherTopK(
         LocalTensors &tensors,
         int32_t sort_element_count)
     {
         uint32_t repeat_times = sort_element_count / 32;
 
-        for (uint32_t idx = 0; idx < static_cast<uint32_t>(sort_element_count); idx++) {
-            tensors.index_local.SetValue(idx, idx);
-        }
+        ArithProgression(
+            tensors.index_local,
+            static_cast<int32_t>(0),
+            static_cast<int32_t>(1),
+            static_cast<uint32_t>(sort_element_count));
 
-        AscendC::Concat(
-            tensors.concat,
-            tensors.accumulated_scores,
-            tensors.tmp_concat,
-            repeat_times);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Sort<ComputeT, true>(
             tensors.maxblock,
-            tensors.concat,
+            tensors.accumulated_scores,
             tensors.index_local,
             tensors.sort_tmp,
             repeat_times);
-        AscendC::Extract(
-            tensors.selected_values,
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::GatherMaskParams gather_mask_params;
+        gather_mask_params.repeatTimes = static_cast<uint8_t>(
+            DIV_ROUNDUP(k_ * static_cast<int32_t>(sizeof(ComputeT)) * NUM_SORT_PAIR_ELEMS,
+                        BYTES_VECTOR_REPEAT));
+        gather_mask_params.src0BlockStride = 1;
+        gather_mask_params.src0RepeatStride = BYTES_VECTOR_REPEAT / BYTES_DATA_BLOCK;
+        gather_mask_params.src1RepeatStride = 0;
+
+        uint64_t rsvd_cnt = 0;
+        uint8_t src1_pattern = QUEST_GATHER_INDEX_PATTERN;
+        AscendC::GatherMask(
             tensors.selected_indices,
-            tensors.maxblock,
-            repeat_times);
+            tensors.maxblock.template ReinterpretCast<uint32_t>(),
+            src1_pattern,
+            false,
+            static_cast<uint32_t>(0),
+            gather_mask_params,
+            rsvd_cnt);
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     AscendC::TPipe pipe_;
@@ -506,9 +468,6 @@ private:
     VecBufT block_scores_buf_;
     VecBufT accumulated_scores_buf_;
     VecBufT selected_indices_buf_;
-    VecBufT selected_values_buf_;
-    VecBufT tmp_concat_buf_;
-    VecBufT concat_buf_;
     VecBufT index_local_buf_;
     VecBufT sort_tmp_buf_;
 
@@ -527,6 +486,9 @@ private:
     int32_t max_metadata_blocks_per_request_;
     int32_t tokens_since_metadata_update_;
     int32_t k_;
+    uint16_t head_dim_storage_blocks_;
+    uint16_t inter_kv_head_stride_blocks_;
+    int32_t metadata_block_stride_elems_;
 };
 
 template <typename StorageT>

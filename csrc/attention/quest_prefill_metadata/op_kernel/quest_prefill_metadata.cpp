@@ -10,7 +10,8 @@
 
 /*******************************************************************************
  *  quest_prefill_metadata_kernel - vector-core, 1 core = (batch, head)
- *  Loads each KV-block ONCE, keeps copy, reduces min & max logarithmically
+ *  Loads each KV page once, then reduces complete 128-token pages with vector
+ *  Max/Min instructions into one metadata row per page.
  *******************************************************************************/
 #include "kernel_operator.h"
 #include "quest_prefill_metadata_tilingkey.h"
@@ -20,6 +21,8 @@ constexpr int32_t DOUBLEBUFFER = 2;
 constexpr int32_t BYTES_UB_BLOCK = 32;
 constexpr int32_t BYTES_DATA_BLOCK = 32;
 constexpr int32_t BF16_METADATA_REDUCE_CHUNK_TOKENS = 64;
+constexpr int32_t QUEST_METADATA_PAGE_SIZE = 128;
+constexpr int32_t QUEST_METADATA_HEAD_DIM = 128;
 constexpr uint64_t FP32_VECTOR_MASK = 64;
 
 inline __aicore__ int32_t ceilDiv(int32_t x, int32_t d) { return (x + d - 1) / d; }
@@ -66,6 +69,16 @@ public:
         head_dim_ = head_dim;
         max_kv_blocks_per_request_ = max_kv_blocks_per_request;
         max_metadata_blocks_per_request_ = max_metadata_blocks_per_request;
+        ASSERT(block_size_ == QUEST_METADATA_PAGE_SIZE && "QUEST metadata expects 128-token pages.");
+        ASSERT(head_dim_ == QUEST_METADATA_HEAD_DIM && "QUEST metadata expects head_dim == 128.");
+
+        head_dim_storage_blocks_ =
+            ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_DATA_BLOCK);
+        inter_kv_head_stride_blocks_ = ceilDiv(
+            (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
+            BYTES_DATA_BLOCK);
+        page_stride_elems_ = block_size_ * num_kv_heads_ * head_dim_;
+        metadata_page_stride_elems_ = num_kv_heads_ * head_dim_;
 
         k_cache_gm_.SetGlobalBuffer((__gm__ StorageT *)k_cache);
         block_tables_gm_.SetGlobalBuffer((__gm__ int32_t *)block_tables);
@@ -140,16 +153,13 @@ public:
                     int32_t kv_block_id = block_tables_gm_.GetValue(
                         request_idx * max_kv_blocks_per_request_ + logical_page);
                     int32_t kv_block_offset_gm =
-                        (kv_block_id * block_size_ * num_kv_heads_ * head_dim_) + head_idx * head_dim_;
+                        (kv_block_id * page_stride_elems_) + head_idx * head_dim_;
 
                     LocalTensor<StorageT> k_block_lt = k_block_in_q_.AllocTensor<StorageT>();
                     DataCopyParams gm_ub_cp;
                     gm_ub_cp.blockCount = tokens_to_reduce;
-                    gm_ub_cp.blockLen =
-                        ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_DATA_BLOCK);
-                    gm_ub_cp.srcStride = ceilDiv(
-                        (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
-                        BYTES_DATA_BLOCK);
+                    gm_ub_cp.blockLen = head_dim_storage_blocks_;
+                    gm_ub_cp.srcStride = inter_kv_head_stride_blocks_;
                     gm_ub_cp.dstStride = 0;
                     DataCopy(k_block_lt, k_cache_gm_[kv_block_offset_gm], gm_ub_cp);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
@@ -186,19 +196,19 @@ public:
                 int32_t meta_block_id = metadata_block_tables_gm_.GetValue(
                     request_idx * max_metadata_blocks_per_request_ + meta_block);
                 int32_t meta_offset =
-                    (meta_block_id * block_size_ * num_kv_heads_ * head_dim_) +
-                    first_page * num_kv_heads_ * head_dim_ + head_idx * head_dim_;
+                    (meta_block_id * page_stride_elems_) +
+                    first_page * metadata_page_stride_elems_ + head_idx * head_dim_;
 
                 DataCopyParams ub_gm_cp;
                 ub_gm_cp.blockCount = rows_to_write;
-                ub_gm_cp.blockLen =
-                    ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_UB_BLOCK);
+                ub_gm_cp.blockLen = head_dim_storage_blocks_;
                 ub_gm_cp.srcStride = 0;
-                ub_gm_cp.dstStride = ceilDiv(
-                    (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
-                    BYTES_UB_BLOCK);
+                ub_gm_cp.dstStride = inter_kv_head_stride_blocks_;
                 DataCopy(maxblocks_gm_[meta_offset], max_lt, ub_gm_cp);
                 DataCopy(minblocks_gm_[meta_offset], min_lt, ub_gm_cp);
+                // max_lt and min_lt are returned to the queue immediately after the GM writes.
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
 
                 max_out_q_.FreeTensor(max_lt);
                 min_out_q_.FreeTensor(min_lt);
@@ -218,8 +228,10 @@ private:
             CopyRepeatParams ub_ub_cp = {1, 1, 8, 8};
             LocalTensor<ComputeT> work_lt = work_calc_buf_.Get<ComputeT>();
             Copy(work_lt, k_block_lt, mask, tokens_to_reduce, ub_ub_cp);
-            ReduceTokenDim<ComputeT, isMax>(work_lt, tokens_to_reduce * head_dim_);
+            AscendC::PipeBarrier<PIPE_V>();
+            ReduceTokenRows<ComputeT, isMax>(work_lt, tokens_to_reduce);
             Copy(out_lt, work_lt, mask, 1, ub_ub_cp);
+            AscendC::PipeBarrier<PIPE_V>();
         } else {
             ReduceCastBlockToOutput<isMax>(out_lt, k_block_lt, tokens_to_reduce);
         }
@@ -249,7 +261,7 @@ private:
                 RoundMode::CAST_NONE,
                 chunk_tokens * head_dim_);
             AscendC::PipeBarrier<PIPE_V>();
-            ReduceTokenDim<ComputeT, isMax>(chunk_lt, chunk_tokens * head_dim_);
+            ReduceTokenRows<ComputeT, isMax>(chunk_lt, chunk_tokens);
 
             if (token_offset == 0) {
                 CopyRow<ComputeT>(acc_lt, chunk_lt);
@@ -262,6 +274,18 @@ private:
         }
 
         Cast(out_lt, acc_lt, RoundMode::CAST_RINT, head_dim_);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    template <typename ElementT, bool isMax>
+    __aicore__ inline void ReduceActiveRows(LocalTensor<ElementT> vec_lt, int32_t keep_rows)
+    {
+        int32_t reduce_elements = keep_rows * head_dim_;
+        if constexpr (isMax) {
+            Max(vec_lt[0], vec_lt[0], vec_lt[reduce_elements], reduce_elements);
+        } else {
+            Min(vec_lt[0], vec_lt[0], vec_lt[reduce_elements], reduce_elements);
+        }
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -278,35 +302,24 @@ private:
     }
 
     template <typename ElementT, bool isMax>
-    __aicore__ inline void ReduceTokenDim(LocalTensor<ElementT> vec_lt, int32_t initial_length)
+    __aicore__ inline void ReduceTokenRows(LocalTensor<ElementT> vec_lt, int32_t token_rows)
     {
-        if (initial_length != block_size_ * head_dim_) {
-            AscendC::PipeBarrier<PIPE_V>();
+        // QUEST only reduces full 128-token pages, or two 64-token BF16 chunks.
+        // This keeps the hot reduction path as fixed vector stages instead of a
+        // scalar-controlled generic reduction loop.
+        ASSERT((token_rows == QUEST_METADATA_PAGE_SIZE ||
+                token_rows == BF16_METADATA_REDUCE_CHUNK_TOKENS) &&
+               "QUEST metadata reduction only supports 128-row pages or 64-row chunks.");
+
+        if (token_rows == QUEST_METADATA_PAGE_SIZE) {
+            ReduceActiveRows<ElementT, isMax>(vec_lt, 64);
         }
-
-        int32_t len = initial_length;
-        while (len > head_dim_) {
-            int32_t num_vec = len / head_dim_;
-            int32_t pair_vec = num_vec >> 1;
-            int32_t has_tail = num_vec & 1;
-            int32_t reduce_len = pair_vec * head_dim_;
-
-            if (reduce_len > 0) {
-                if (isMax) {
-                    Max(vec_lt[0], vec_lt[0], vec_lt[reduce_len], reduce_len);
-                } else {
-                    Min(vec_lt[0], vec_lt[0], vec_lt[reduce_len], reduce_len);
-                }
-            }
-
-            if (has_tail) {
-                CopyRow<ElementT>(vec_lt[reduce_len], vec_lt[(num_vec - 1) * head_dim_]);
-                reduce_len += head_dim_;
-            }
-
-            len = reduce_len;
-            AscendC::PipeBarrier<PIPE_V>();
-        }
+        ReduceActiveRows<ElementT, isMax>(vec_lt, 32);
+        ReduceActiveRows<ElementT, isMax>(vec_lt, 16);
+        ReduceActiveRows<ElementT, isMax>(vec_lt, 8);
+        ReduceActiveRows<ElementT, isMax>(vec_lt, 4);
+        ReduceActiveRows<ElementT, isMax>(vec_lt, 2);
+        ReduceActiveRows<ElementT, isMax>(vec_lt, 1);
     }
 
     TPipe pipe_;
@@ -329,6 +342,10 @@ private:
     int32_t head_dim_;
     int32_t max_kv_blocks_per_request_;
     int32_t max_metadata_blocks_per_request_;
+    int32_t head_dim_storage_blocks_;
+    int32_t inter_kv_head_stride_blocks_;
+    int32_t page_stride_elems_;
+    int32_t metadata_page_stride_elems_;
 };
 
 template <typename StorageT, typename ComputeT>
