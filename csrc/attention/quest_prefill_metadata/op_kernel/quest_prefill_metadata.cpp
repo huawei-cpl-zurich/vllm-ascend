@@ -206,6 +206,9 @@ public:
                 ub_gm_cp.dstStride = inter_kv_head_stride_blocks_;
                 DataCopy(maxblocks_gm_[meta_offset], max_lt, ub_gm_cp);
                 DataCopy(minblocks_gm_[meta_offset], min_lt, ub_gm_cp);
+                // max_lt and min_lt are returned to the queue immediately after the GM writes.
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
 
                 max_out_q_.FreeTensor(max_lt);
                 min_out_q_.FreeTensor(min_lt);

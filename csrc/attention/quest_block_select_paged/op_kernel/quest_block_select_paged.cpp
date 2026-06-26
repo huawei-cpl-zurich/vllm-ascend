@@ -226,6 +226,9 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
             auto indices_copy_params = AscendC::DataCopyParams(1, selected_indices_copy_blocks_, 0, 0);
             AscendC::DataCopy(selected_indices_gm_[output_offset], tensors.selected_indices, indices_copy_params);
+            // The selected_indices UB buffer is reused on the next loop iteration.
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
         }
     }
 
