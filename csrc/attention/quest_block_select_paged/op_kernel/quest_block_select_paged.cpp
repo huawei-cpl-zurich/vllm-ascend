@@ -15,6 +15,7 @@
 #define BYTES_DATA_BLOCK 32
 #define BYTES_VECTOR_REPEAT 256
 #define NUM_FLOAT_ELEMS_PER_VECTOR 64
+#define NUM_FLOAT_ELEMS_PER_DATA_BLOCK 8
 #define NUM_SORT_PAIRS_PER_REPEAT 32
 #define NUM_SORT_PAIR_ELEMS 2
 #define QUEST_GATHER_INDEX_PATTERN 2
@@ -439,10 +440,21 @@ private:
             return;
         }
 
+        int32_t aligned_start =
+            valid_page_count / NUM_FLOAT_ELEMS_PER_DATA_BLOCK * NUM_FLOAT_ELEMS_PER_DATA_BLOCK;
+        int32_t valid_prefix = valid_page_count - aligned_start;
+        int32_t masked_span = sort_element_count - aligned_start;
+        uint64_t mask[2] = {
+            (UINT64_MAX << valid_prefix) & (UINT64_MAX >> (64 - masked_span)),
+            0};
+
         AscendC::Duplicate(
-            tensors.accumulated_scores[valid_page_count],
+            tensors.accumulated_scores[aligned_start],
             static_cast<ComputeT>(QUEST_MIN_SCORE),
-            tail_count);
+            mask,
+            1,
+            1,
+            8);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
