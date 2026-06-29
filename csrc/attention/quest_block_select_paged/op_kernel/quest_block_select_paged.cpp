@@ -62,6 +62,13 @@ __aicore__ inline void quest_apply_sequential_selection(
             static_cast<QuestPageIndexT>(1),
             num_selected_pages);
         AscendC::PipeBarrier<PIPE_V>();
+        if (num_selected_pages < k) {
+            Duplicate(
+                selected_indices_lt[num_selected_pages],
+                static_cast<QuestPageIndexT>(0),
+                k - num_selected_pages);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
     }
 }
 
