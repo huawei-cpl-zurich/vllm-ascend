@@ -62,6 +62,13 @@ __aicore__ inline void quest_apply_sequential_selection(
             static_cast<int32_t>(num_selected_pages));
         AscendC::PipeBarrier<PIPE_V>();
     }
+    if (num_selected_pages < k) {
+        Duplicate(
+            selected_indices_lt[num_selected_pages],
+            static_cast<QuestPageIndexT>(0),
+            k - num_selected_pages);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
 }
 
 template <typename StorageT>
@@ -207,6 +214,7 @@ public:
                         meta_block);
                 }
 
+                MaskInvalidTailScores(tensors, valid_page_count, sort_element_count);
                 if (likely(use_fixed_anchors)) {
                     PinAnchorScores(tensors, valid_page_count);
                 }
@@ -423,6 +431,25 @@ private:
 
         tensors.accumulated_scores.SetValue(0, static_cast<ComputeT>(QUEST_MAX_SCORE));
         tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(QUEST_MAX_SCORE));
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void MaskInvalidTailScores(
+        LocalTensors &tensors,
+        int32_t valid_page_count,
+        int32_t sort_element_count)
+    {
+        int32_t tail_count = sort_element_count - valid_page_count;
+        if (tail_count <= 0) {
+            return;
+        }
+
+        AscendC::Duplicate(
+            tensors.accumulated_scores[valid_page_count],
+            static_cast<ComputeT>(QUEST_MIN_SCORE),
+            tail_count);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
