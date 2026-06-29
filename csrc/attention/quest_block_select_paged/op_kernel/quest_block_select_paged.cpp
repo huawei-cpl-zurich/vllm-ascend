@@ -27,6 +27,10 @@
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define QUEST_MIN_SCORE -3.4028235e38f
 #define QUEST_MAX_SCORE 3.4028235e38f
+#define QUEST_DEBUG_PRINTF 1
+#define QUEST_DEBUG_PRINT_VALUES 16
+#define QUEST_DEBUG_PRINT_SCORE_VALUES 8
+#define QUEST_DEBUG_PRINT_EVERY_BATCH_HEADS 64
 
 constexpr uint32_t REGION_PROPOSAL_DATA_SIZE_FLOAT_V220 = 2;
 
@@ -175,6 +179,7 @@ public:
         int32_t query_heads_per_kv_head = num_heads_ / num_kv_heads_;
 
         LocalTensors tensors = GetLocalTensors();
+        DebugPrintKernelConfig(num_blocks, num_batch_heads);
 
         for (int32_t batch_head_idx = AscendC::GetBlockIdx(); batch_head_idx < num_batch_heads;
              batch_head_idx += num_blocks) {
@@ -188,14 +193,28 @@ public:
             int32_t seq_len = seq_lens_gm_.GetValue(batch_idx);
             int32_t valid_page_count = seq_len > 0 ? DIV_ROUNDUP(seq_len, block_size_) : 0;
             bool use_fixed_anchors = tokens_since_metadata_update_ >= 0;
+            DebugPrintRowStart(
+                batch_head_idx,
+                batch_idx,
+                query_head_idx,
+                kv_head_idx,
+                seq_len,
+                valid_page_count,
+                output_offset,
+                use_fixed_anchors);
             if (unlikely(valid_page_count <= 0 || k_ >= valid_page_count)) {
                 quest_apply_sequential_selection(
                     tensors.selected_indices,
                     valid_page_count,
                     k_);
+                DebugPrintIndices("sequential", batch_head_idx, tensors.selected_indices, k_);
             } else {
                 int32_t num_meta_blocks_in_request = DIV_ROUNDUP(valid_page_count, block_size_);
                 int32_t sort_element_count = DIV_ROUNDUP(valid_page_count, 32) * 32;
+                DebugPrintSortShape(
+                    batch_head_idx,
+                    num_meta_blocks_in_request,
+                    sort_element_count);
 
                 LoadQuery(tensors, query_offset);
                 DuplicateAccumulatedScores(tensors, sort_element_count);
@@ -207,17 +226,44 @@ public:
                         meta_block_id * metadata_block_stride_elems_ + kv_head_idx * head_dim_;
 
                     ScoreMetadataBlock(tensors, meta_block_offset);
+                    DebugPrintScores(
+                        "block_scores",
+                        batch_head_idx,
+                        meta_block,
+                        tensors.block_scores,
+                        MIN(valid_page_count - meta_block * block_size_, block_size_));
                     CopyScoresToAccumulated(
                         tensors,
                         valid_page_count,
                         meta_block);
+                    DebugPrintAccumulatedScores(
+                        "accumulated_after_copy",
+                        batch_head_idx,
+                        valid_page_count,
+                        sort_element_count,
+                        tensors.accumulated_scores);
                 }
 
                 MaskInvalidTailScores(tensors, valid_page_count, sort_element_count);
+                DebugPrintAccumulatedScores(
+                    "after_tail_mask",
+                    batch_head_idx,
+                    valid_page_count,
+                    sort_element_count,
+                    tensors.accumulated_scores);
                 if (likely(use_fixed_anchors)) {
                     PinAnchorScores(tensors, valid_page_count);
+                    DebugPrintAccumulatedScores(
+                        "after_anchor_pin",
+                        batch_head_idx,
+                        valid_page_count,
+                        sort_element_count,
+                        tensors.accumulated_scores);
                 }
-                SortAndGatherTopK(tensors, sort_element_count);
+                SortAndGatherTopK(
+                    tensors,
+                    sort_element_count,
+                    batch_head_idx);
             }
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
@@ -251,6 +297,238 @@ private:
             tmp_concat_buf_.Get<ComputeT>(),
             index_local_buf_.Get<QuestSortIndexT>(),
             sort_tmp_buf_.Get<ComputeT>()};
+    }
+
+    __aicore__ inline bool DebugShouldPrint(int32_t batch_head_idx)
+    {
+#if QUEST_DEBUG_PRINTF
+        return AscendC::GetBlockIdx() == 0 &&
+               (batch_head_idx < QUEST_DEBUG_PRINT_EVERY_BATCH_HEADS ||
+                batch_head_idx % QUEST_DEBUG_PRINT_EVERY_BATCH_HEADS == 0);
+#else
+        (void)batch_head_idx;
+        return false;
+#endif
+    }
+
+    __aicore__ inline void DebugPrintKernelConfig(
+        int32_t num_blocks,
+        int32_t num_batch_heads)
+    {
+#if QUEST_DEBUG_PRINTF
+        if (AscendC::GetBlockIdx() != 0) {
+            return;
+        }
+        printf(
+            "[quest_select][config] block_idx=%d num_blocks=%d batch_heads=%d "
+            "batch=%d heads=%d kv_heads=%d block=%d head_dim=%d mmbpr=%d "
+            "k=%d stride=%d tokens_since=%d\n",
+            AscendC::GetBlockIdx(),
+            num_blocks,
+            num_batch_heads,
+            batch_size_,
+            num_heads_,
+            num_kv_heads_,
+            block_size_,
+            head_dim_,
+            max_metadata_blocks_per_request_,
+            k_,
+            output_stride_,
+            tokens_since_metadata_update_);
+#else
+        (void)num_blocks;
+        (void)num_batch_heads;
+#endif
+    }
+
+    __aicore__ inline void DebugPrintRowStart(
+        int32_t batch_head_idx,
+        int32_t batch_idx,
+        int32_t query_head_idx,
+        int32_t kv_head_idx,
+        int32_t seq_len,
+        int32_t valid_page_count,
+        int32_t output_offset,
+        bool use_fixed_anchors)
+    {
+#if QUEST_DEBUG_PRINTF
+        if (!DebugShouldPrint(batch_head_idx)) {
+            return;
+        }
+        printf(
+            "[quest_select][row] bh=%d batch=%d qh=%d kvh=%d seq=%d "
+            "valid_pages=%d output_offset=%d anchors=%d\n",
+            batch_head_idx,
+            batch_idx,
+            query_head_idx,
+            kv_head_idx,
+            seq_len,
+            valid_page_count,
+            output_offset,
+            static_cast<int32_t>(use_fixed_anchors));
+#else
+        (void)batch_head_idx;
+        (void)batch_idx;
+        (void)query_head_idx;
+        (void)kv_head_idx;
+        (void)seq_len;
+        (void)valid_page_count;
+        (void)output_offset;
+        (void)use_fixed_anchors;
+#endif
+    }
+
+    __aicore__ inline void DebugPrintSortShape(
+        int32_t batch_head_idx,
+        int32_t num_meta_blocks_in_request,
+        int32_t sort_element_count)
+    {
+#if QUEST_DEBUG_PRINTF
+        if (!DebugShouldPrint(batch_head_idx)) {
+            return;
+        }
+        printf(
+            "[quest_select][sort_shape] bh=%d meta_blocks=%d sort_count=%d repeat=%d\n",
+            batch_head_idx,
+            num_meta_blocks_in_request,
+            sort_element_count,
+            sort_element_count / 32);
+#else
+        (void)batch_head_idx;
+        (void)num_meta_blocks_in_request;
+        (void)sort_element_count;
+#endif
+    }
+
+    __aicore__ inline void DebugSyncLocalToScalar()
+    {
+#if QUEST_DEBUG_PRINTF
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+#endif
+    }
+
+    __aicore__ inline void DebugPrintScores(
+        const char *stage,
+        int32_t batch_head_idx,
+        int32_t meta_block,
+        AscendC::LocalTensor<ComputeT> scores,
+        int32_t count)
+    {
+#if QUEST_DEBUG_PRINTF
+        if (!DebugShouldPrint(batch_head_idx)) {
+            return;
+        }
+        DebugSyncLocalToScalar();
+        int32_t print_count = MIN(count, QUEST_DEBUG_PRINT_SCORE_VALUES);
+        printf(
+            "[quest_select][%s] bh=%d meta=%d count=%d first:",
+            stage,
+            batch_head_idx,
+            meta_block,
+            count);
+        for (int32_t idx = 0; idx < print_count; ++idx) {
+            printf(" %d:%.6f", idx, scores.GetValue(idx));
+        }
+        printf("\n");
+#else
+        (void)stage;
+        (void)batch_head_idx;
+        (void)meta_block;
+        (void)scores;
+        (void)count;
+#endif
+    }
+
+    __aicore__ inline void DebugPrintAccumulatedScores(
+        const char *stage,
+        int32_t batch_head_idx,
+        int32_t valid_page_count,
+        int32_t sort_element_count,
+        AscendC::LocalTensor<ComputeT> scores)
+    {
+#if QUEST_DEBUG_PRINTF
+        if (!DebugShouldPrint(batch_head_idx)) {
+            return;
+        }
+        DebugSyncLocalToScalar();
+        int32_t first_count = MIN(valid_page_count, QUEST_DEBUG_PRINT_SCORE_VALUES);
+        printf(
+            "[quest_select][%s] bh=%d valid=%d sort=%d first:",
+            stage,
+            batch_head_idx,
+            valid_page_count,
+            sort_element_count);
+        for (int32_t idx = 0; idx < first_count; ++idx) {
+            printf(" %d:%.6f", idx, scores.GetValue(idx));
+        }
+        if (valid_page_count > 0) {
+            int32_t last_idx = valid_page_count - 1;
+            printf(" last %d:%.6f", last_idx, scores.GetValue(last_idx));
+        }
+        if (valid_page_count < sort_element_count) {
+            printf(" tail %d:%.6f", valid_page_count, scores.GetValue(valid_page_count));
+        }
+        printf("\n");
+#else
+        (void)stage;
+        (void)batch_head_idx;
+        (void)valid_page_count;
+        (void)sort_element_count;
+        (void)scores;
+#endif
+    }
+
+    __aicore__ inline void DebugPrintSortedPairs(
+        int32_t batch_head_idx,
+        AscendC::LocalTensor<ComputeT> sorted_pairs)
+    {
+#if QUEST_DEBUG_PRINTF
+        if (!DebugShouldPrint(batch_head_idx)) {
+            return;
+        }
+        DebugSyncLocalToScalar();
+        AscendC::LocalTensor<QuestSortIndexT> sorted_raw =
+            sorted_pairs.template ReinterpretCast<QuestSortIndexT>();
+        int32_t print_count = MIN(k_, QUEST_DEBUG_PRINT_VALUES);
+        printf("[quest_select][sorted_pairs] bh=%d first:", batch_head_idx);
+        for (int32_t idx = 0; idx < print_count; ++idx) {
+            printf(
+                " %d:(score=%.6f,idx=%u)",
+                idx,
+                sorted_pairs.GetValue(idx * 2),
+                sorted_raw.GetValue(idx * 2 + 1));
+        }
+        printf("\n");
+#else
+        (void)batch_head_idx;
+        (void)sorted_pairs;
+#endif
+    }
+
+    __aicore__ inline void DebugPrintIndices(
+        const char *stage,
+        int32_t batch_head_idx,
+        AscendC::LocalTensor<QuestPageIndexT> indices,
+        int32_t count)
+    {
+#if QUEST_DEBUG_PRINTF
+        if (!DebugShouldPrint(batch_head_idx)) {
+            return;
+        }
+        DebugSyncLocalToScalar();
+        int32_t print_count = MIN(count, QUEST_DEBUG_PRINT_VALUES);
+        printf("[quest_select][%s] bh=%d selected:", stage, batch_head_idx);
+        for (int32_t idx = 0; idx < print_count; ++idx) {
+            printf(" %d", indices.GetValue(idx));
+        }
+        printf("\n");
+#else
+        (void)stage;
+        (void)batch_head_idx;
+        (void)indices;
+        (void)count;
+#endif
     }
 
     __aicore__ inline void LoadQuery(
@@ -466,7 +744,8 @@ private:
 
     __aicore__ inline void SortAndGatherTopK(
         LocalTensors &tensors,
-        int32_t sort_element_count)
+        int32_t sort_element_count,
+        int32_t batch_head_idx)
     {
         uint32_t repeat_times = sort_element_count / 32;
 
@@ -491,6 +770,7 @@ private:
             tensors.sort_tmp,
             repeat_times);
         AscendC::PipeBarrier<PIPE_V>();
+        DebugPrintSortedPairs(batch_head_idx, tensors.maxblock);
 
         AscendC::GatherMaskParams gather_mask_params;
         gather_mask_params.repeatTimes = static_cast<uint8_t>(
@@ -511,6 +791,7 @@ private:
             gather_mask_params,
             rsvd_cnt);
         AscendC::PipeBarrier<PIPE_V>();
+        DebugPrintIndices("selected_after_gather", batch_head_idx, tensors.selected_indices, k_);
     }
 
     AscendC::TPipe pipe_;
