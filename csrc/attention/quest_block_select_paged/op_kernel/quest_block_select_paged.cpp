@@ -78,6 +78,8 @@ class KernelQuestBlockSelectPaged {
         AscendC::LocalTensor<ComputeT> block_scores;
         AscendC::LocalTensor<ComputeT> accumulated_scores;
         AscendC::LocalTensor<QuestPageIndexT> selected_indices;
+        AscendC::LocalTensor<ComputeT> tmp_concat;
+        AscendC::LocalTensor<ComputeT> concat;
         // Sort requires uint32_t index lanes; page IDs stay int32_t everywhere else.
         AscendC::LocalTensor<QuestSortIndexT> index_local;
         AscendC::LocalTensor<ComputeT> sort_tmp;
@@ -146,6 +148,13 @@ public:
         uint32_t selected_indices_buf_size = NUM_UB_BYTES(
             DIV_ROUNDUP(k_, NUM_SORT_PAIRS_PER_REPEAT) * NUM_SORT_PAIRS_PER_REPEAT *
             static_cast<int32_t>(sizeof(QuestPageIndexT)));
+        uint32_t tmp_concat_buf_size = NUM_UB_BYTES(
+            max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
+            static_cast<int32_t>(sizeof(ComputeT)));
+        uint32_t concat_buf_size = NUM_UB_BYTES(
+            (max_metadata_blocks_per_request_ * block_size_ +
+             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE) *
+            static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t index_local_buf_size =
             NUM_UB_BYTES(max_metadata_blocks_per_request_ * block_size_ *
                          static_cast<int32_t>(sizeof(QuestSortIndexT)));
@@ -159,6 +168,8 @@ public:
         pipe_.InitBuffer(block_scores_buf_, reduced_buf_size);
         pipe_.InitBuffer(accumulated_scores_buf_, accumulated_scores_size);
         pipe_.InitBuffer(selected_indices_buf_, selected_indices_buf_size);
+        pipe_.InitBuffer(tmp_concat_buf_, tmp_concat_buf_size);
+        pipe_.InitBuffer(concat_buf_, concat_buf_size);
         pipe_.InitBuffer(index_local_buf_, index_local_buf_size);
         pipe_.InitBuffer(sort_tmp_buf_, sort_tmp_buf_size);
     }
@@ -243,6 +254,8 @@ private:
             block_scores_buf_.Get<ComputeT>(),
             accumulated_scores_buf_.Get<ComputeT>(),
             selected_indices_buf_.Get<QuestPageIndexT>(),
+            tmp_concat_buf_.Get<ComputeT>(),
+            concat_buf_.Get<ComputeT>(),
             index_local_buf_.Get<QuestSortIndexT>(),
             sort_tmp_buf_.Get<ComputeT>()};
     }
@@ -470,9 +483,16 @@ private:
             static_cast<QuestPageIndexT>(1),
             sort_element_count);
 
+        AscendC::Concat(
+            tensors.concat,
+            tensors.accumulated_scores,
+            tensors.tmp_concat,
+            repeat_times);
+        AscendC::PipeBarrier<PIPE_V>();
+
         AscendC::Sort<ComputeT, true>(
             tensors.maxblock,
-            tensors.accumulated_scores,
+            tensors.concat,
             tensors.index_local,
             tensors.sort_tmp,
             repeat_times);
@@ -507,6 +527,8 @@ private:
     VecBufT block_scores_buf_;
     VecBufT accumulated_scores_buf_;
     VecBufT selected_indices_buf_;
+    VecBufT tmp_concat_buf_;
+    VecBufT concat_buf_;
     VecBufT index_local_buf_;
     VecBufT sort_tmp_buf_;
 
