@@ -15,9 +15,7 @@
 #define BYTES_DATA_BLOCK 32
 #define NUM_FLOAT_ELEMS_PER_VECTOR 64
 #define NUM_INT32_ELEMS_PER_VECTOR 64
-#define NUM_FLOAT_ELEMS_PER_DATA_BLOCK 8
 #define NUM_PAGE_INDEX_ELEMS_PER_DATA_BLOCK 8
-#define NUM_SORT_PAIRS_PER_REPEAT 32
 #define QUEST_MAX_SELECTED_BLOCKS 64
 #define DIV_ROUNDUP(x, y) (((x) + (y)-1) / (y))
 #define DIV_ROUNDUP_MUL(bytes, bytes_per_block) (DIV_ROUNDUP(bytes, bytes_per_block) * (bytes_per_block))
@@ -163,11 +161,8 @@ public:
             NUM_UB_BYTES(block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t accumulated_scores_size = NUM_UB_BYTES(
             max_metadata_blocks_per_request_ * block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t selected_element_count =
-            DIV_ROUNDUP(k_, NUM_SORT_PAIRS_PER_REPEAT) * NUM_SORT_PAIRS_PER_REPEAT;
         uint32_t selected_indices_buf_size = NUM_UB_BYTES(
-            selected_element_count *
-            static_cast<int32_t>(sizeof(QuestPageIndexT)));
+            k_ * static_cast<int32_t>(sizeof(QuestPageIndexT)));
         uint32_t tmp_concat_buf_size = NUM_UB_BYTES(
             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
             static_cast<int32_t>(sizeof(ComputeT)));
@@ -234,7 +229,6 @@ public:
                         meta_block);
                 }
 
-                MaskInvalidTailScores(tensors, valid_page_count, sort_element_count);
                 if (likely(use_fixed_anchors)) {
                     PinAnchorScores(tensors, valid_page_count);
                 }
@@ -454,34 +448,6 @@ private:
         tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(QUEST_MAX_SCORE));
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline void MaskInvalidTailScores(
-        LocalTensors &tensors,
-        int32_t valid_page_count,
-        int32_t sort_element_count)
-    {
-        int32_t tail_count = sort_element_count - valid_page_count;
-        if (tail_count <= 0) {
-            return;
-        }
-
-        int32_t aligned_start =
-            valid_page_count / NUM_FLOAT_ELEMS_PER_DATA_BLOCK * NUM_FLOAT_ELEMS_PER_DATA_BLOCK;
-        int32_t valid_prefix = valid_page_count - aligned_start;
-        int32_t masked_span = sort_element_count - aligned_start;
-        uint64_t mask[2] = {
-            (UINT64_MAX << valid_prefix) & (UINT64_MAX >> (64 - masked_span)),
-            0};
-
-        AscendC::Duplicate(
-            tensors.accumulated_scores[aligned_start],
-            static_cast<ComputeT>(QUEST_MIN_SCORE),
-            mask,
-            1,
-            1,
-            8);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
