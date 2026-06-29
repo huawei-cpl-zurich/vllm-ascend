@@ -55,8 +55,8 @@ __aicore__ inline void quest_apply_sequential_selection(
     if (num_selected_pages > 0) {
         ArithProgression(
             selected_indices_lt,
-            static_cast<int32_t>(0),
-            static_cast<int32_t>(1),
+            static_cast<uint32_t>(0),
+            static_cast<uint32_t>(1),
             static_cast<uint32_t>(num_selected_pages));
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -431,8 +431,8 @@ private:
 
         ArithProgression(
             tensors.index_local,
-            static_cast<int32_t>(0),
-            static_cast<int32_t>(1),
+            static_cast<uint32_t>(0),
+            static_cast<uint32_t>(1),
             static_cast<uint32_t>(sort_element_count));
 
         AscendC::Sort<ComputeT, true>(
