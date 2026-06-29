@@ -188,11 +188,33 @@ public:
             int32_t seq_len = seq_lens_gm_.GetValue(batch_idx);
             int32_t valid_page_count = seq_len > 0 ? DIV_ROUNDUP(seq_len, block_size_) : 0;
             bool use_fixed_anchors = tokens_since_metadata_update_ >= 0;
+            if (AscendC::GetBlockIdx() == 0) {
+                printf("[quest_dbg] row bh=%d batch=%d qh=%d kvh=%d seq=%d valid=%d k=%d anchors=%d\n",
+                       batch_head_idx,
+                       batch_idx,
+                       query_head_idx,
+                       kv_head_idx,
+                       seq_len,
+                       valid_page_count,
+                       k_,
+                       static_cast<int32_t>(use_fixed_anchors));
+            }
             if (unlikely(valid_page_count <= 0 || k_ >= valid_page_count)) {
                 quest_apply_sequential_selection(
                     tensors.selected_indices,
                     valid_page_count,
                     k_);
+                if (AscendC::GetBlockIdx() == 0) {
+                    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+                    printf("[quest_dbg] sequential selected:");
+                    for (int32_t idx = 0; idx < MIN(k_, 16); ++idx) {
+                        printf(" %d", tensors.selected_indices.GetValue(idx));
+                    }
+                    printf("\n");
+                    AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
+                    AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
+                }
             } else {
                 int32_t num_meta_blocks_in_request = DIV_ROUNDUP(valid_page_count, block_size_);
                 int32_t sort_element_count = DIV_ROUNDUP(valid_page_count, 32) * 32;
@@ -214,10 +236,36 @@ public:
                 }
 
                 MaskInvalidTailScores(tensors, valid_page_count, sort_element_count);
+                if (AscendC::GetBlockIdx() == 0) {
+                    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+                    printf("[quest_dbg] after_tail_mask scores:");
+                    for (int32_t idx = 0; idx < MIN(valid_page_count, 8); ++idx) {
+                        printf(" %d:%f", idx, tensors.accumulated_scores.GetValue(idx));
+                    }
+                    printf(" last=%d:%f", valid_page_count - 1,
+                           tensors.accumulated_scores.GetValue(valid_page_count - 1));
+                    if (valid_page_count < sort_element_count) {
+                        printf(" tail=%d:%f", valid_page_count,
+                               tensors.accumulated_scores.GetValue(valid_page_count));
+                    }
+                    printf("\n");
+                    AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
+                    AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
+                }
                 if (likely(use_fixed_anchors)) {
                     PinAnchorScores(tensors, valid_page_count);
+                    if (AscendC::GetBlockIdx() == 0) {
+                        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+                        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+                        printf("[quest_dbg] after_anchor_pin first=%f last=%f\n",
+                               tensors.accumulated_scores.GetValue(0),
+                               tensors.accumulated_scores.GetValue(valid_page_count - 1));
+                        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
+                        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
+                    }
                 }
-                SortAndGatherTopK(tensors, sort_element_count);
+                SortAndGatherTopK(tensors, sort_element_count, batch_head_idx);
             }
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
@@ -466,7 +514,8 @@ private:
 
     __aicore__ inline void SortAndGatherTopK(
         LocalTensors &tensors,
-        int32_t sort_element_count)
+        int32_t sort_element_count,
+        int32_t batch_head_idx)
     {
         uint32_t repeat_times = sort_element_count / 32;
 
@@ -491,6 +540,23 @@ private:
             tensors.sort_tmp,
             repeat_times);
         AscendC::PipeBarrier<PIPE_V>();
+        if (AscendC::GetBlockIdx() == 0) {
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+            AscendC::LocalTensor<QuestSortIndexT> sorted_raw =
+                tensors.maxblock.template ReinterpretCast<QuestSortIndexT>();
+            printf("[quest_dbg] sorted bh=%d:", batch_head_idx);
+            for (int32_t idx = 0; idx < MIN(k_, 16); ++idx) {
+                printf(" %d:(f=%f,u0=%u,u1=%u)",
+                       idx,
+                       tensors.maxblock.GetValue(idx * 2),
+                       sorted_raw.GetValue(idx * 2),
+                       sorted_raw.GetValue(idx * 2 + 1));
+            }
+            printf("\n");
+            AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
+            AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
+        }
 
         AscendC::GatherMaskParams gather_mask_params;
         gather_mask_params.repeatTimes = static_cast<uint8_t>(
@@ -511,6 +577,17 @@ private:
             gather_mask_params,
             rsvd_cnt);
         AscendC::PipeBarrier<PIPE_V>();
+        if (AscendC::GetBlockIdx() == 0) {
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+            printf("[quest_dbg] selected:");
+            for (int32_t idx = 0; idx < MIN(k_, 16); ++idx) {
+                printf(" %d", tensors.selected_indices.GetValue(idx));
+            }
+            printf("\n");
+            AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
+            AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
+        }
     }
 
     AscendC::TPipe pipe_;
