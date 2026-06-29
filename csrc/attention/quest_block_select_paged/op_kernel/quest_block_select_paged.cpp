@@ -55,18 +55,11 @@ __aicore__ inline void quest_apply_sequential_selection(
     int32_t num_selected_pages = valid_page_count > 0 ? MIN(k, valid_page_count) : 0;
     quest_zero_indices(selected_indices_lt, k);
     if (num_selected_pages > 0) {
-        ArithProgression(
+        Arange<QuestPageIndexT>(
             selected_indices_lt,
             static_cast<QuestPageIndexT>(0),
             static_cast<QuestPageIndexT>(1),
-            static_cast<int32_t>(num_selected_pages));
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-    if (num_selected_pages < k) {
-        Duplicate(
-            selected_indices_lt[num_selected_pages],
-            static_cast<QuestPageIndexT>(0),
-            k - num_selected_pages);
+            num_selected_pages);
         AscendC::PipeBarrier<PIPE_V>();
     }
 }
@@ -459,11 +452,11 @@ private:
     {
         uint32_t repeat_times = sort_element_count / 32;
 
-        ArithProgression(
+        Arange<QuestPageIndexT>(
             tensors.index_local.template ReinterpretCast<QuestPageIndexT>(),
             static_cast<QuestPageIndexT>(0),
             static_cast<QuestPageIndexT>(1),
-            static_cast<int32_t>(sort_element_count));
+            sort_element_count);
 
         AscendC::Sort<ComputeT, true>(
             tensors.maxblock,
