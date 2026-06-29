@@ -16,6 +16,7 @@
 #define BYTES_VECTOR_REPEAT 256
 #define NUM_FLOAT_ELEMS_PER_VECTOR 64
 #define NUM_FLOAT_ELEMS_PER_DATA_BLOCK 8
+#define NUM_PAGE_INDEX_ELEMS_PER_DATA_BLOCK 8
 #define NUM_SORT_PAIRS_PER_REPEAT 32
 #define NUM_SORT_PAIR_ELEMS 2
 #define QUEST_GATHER_INDEX_PATTERN 2
@@ -63,10 +64,23 @@ __aicore__ inline void quest_apply_sequential_selection(
             num_selected_pages);
         AscendC::PipeBarrier<PIPE_V>();
         if (num_selected_pages < k) {
+            int32_t aligned_start =
+                num_selected_pages / NUM_PAGE_INDEX_ELEMS_PER_DATA_BLOCK *
+                NUM_PAGE_INDEX_ELEMS_PER_DATA_BLOCK;
+            int32_t valid_tail = num_selected_pages - aligned_start;
+            int32_t tail_count = k - aligned_start;
+            uint64_t active_tail_mask =
+                tail_count >= 64 ? ~0ULL : ((1ULL << tail_count) - 1ULL);
+            uint64_t valid_prefix_mask =
+                valid_tail == 0 ? 0ULL : ((1ULL << valid_tail) - 1ULL);
+            uint64_t mask[2] = {active_tail_mask & ~valid_prefix_mask, 0};
             Duplicate(
-                selected_indices_lt[num_selected_pages],
+                selected_indices_lt[aligned_start],
                 static_cast<QuestPageIndexT>(0),
-                k - num_selected_pages);
+                mask,
+                1,
+                1,
+                0);
             AscendC::PipeBarrier<PIPE_V>();
         }
     }
