@@ -35,18 +35,18 @@ using namespace AscendC;
 // definition. The kernel must not redeclare it locally.
 
 __aicore__ inline void quest_zero_indices(
-    LocalTensor<uint32_t> indices_lt,
+    LocalTensor<int32_t> indices_lt,
     int32_t count)
 {
     if (count <= 0) {
         return;
     }
-    Duplicate(indices_lt, static_cast<uint32_t>(0), count);
+    Duplicate(indices_lt, static_cast<int32_t>(0), count);
     AscendC::PipeBarrier<PIPE_V>();
 }
 
 __aicore__ inline void quest_apply_sequential_selection(
-    LocalTensor<uint32_t> &selected_indices_lt,
+    LocalTensor<int32_t> &selected_indices_lt,
     int32_t valid_page_count,
     int32_t k)
 {
@@ -55,9 +55,9 @@ __aicore__ inline void quest_apply_sequential_selection(
     if (num_selected_pages > 0) {
         ArithProgression(
             selected_indices_lt,
-            static_cast<uint32_t>(0),
-            static_cast<uint32_t>(1),
-            static_cast<uint32_t>(num_selected_pages));
+            static_cast<int32_t>(0),
+            static_cast<int32_t>(1),
+            static_cast<int32_t>(num_selected_pages));
         AscendC::PipeBarrier<PIPE_V>();
     }
 }
@@ -74,8 +74,8 @@ class KernelQuestBlockSelectPaged {
         AscendC::LocalTensor<ComputeT> minblock;
         AscendC::LocalTensor<ComputeT> block_scores;
         AscendC::LocalTensor<ComputeT> accumulated_scores;
-        AscendC::LocalTensor<uint32_t> selected_indices;
-        AscendC::LocalTensor<uint32_t> index_local;
+        AscendC::LocalTensor<int32_t> selected_indices;
+        AscendC::LocalTensor<int32_t> index_local;
         AscendC::LocalTensor<ComputeT> sort_tmp;
     };
 
@@ -125,7 +125,7 @@ public:
         minblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)minblocks);
         metadata_block_tables_gm_.SetGlobalBuffer((__gm__ int32_t *)metadata_block_tables);
         seq_lens_gm_.SetGlobalBuffer((__gm__ int32_t *)seq_lens);
-        selected_indices_gm_.SetGlobalBuffer((__gm__ uint32_t *)selected_indices);
+        selected_indices_gm_.SetGlobalBuffer((__gm__ int32_t *)selected_indices);
 
         uint32_t input_storage_buf_size =
             NUM_UB_BYTES(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
@@ -141,10 +141,10 @@ public:
             max_metadata_blocks_per_request_ * block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t selected_indices_buf_size = NUM_UB_BYTES(
             DIV_ROUNDUP(k_, NUM_SORT_PAIRS_PER_REPEAT) * NUM_SORT_PAIRS_PER_REPEAT *
-            static_cast<int32_t>(sizeof(uint32_t)));
+            static_cast<int32_t>(sizeof(int32_t)));
         uint32_t index_local_buf_size =
             NUM_UB_BYTES(max_metadata_blocks_per_request_ * block_size_ *
-                         static_cast<int32_t>(sizeof(uint32_t)));
+                         static_cast<int32_t>(sizeof(int32_t)));
         uint32_t sort_tmp_buf_size = NUM_UB_BYTES(
             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
             static_cast<int32_t>(sizeof(ComputeT)));
@@ -214,7 +214,7 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
             AscendC::DataCopyExtParams indices_copy_params{
                 1,
-                static_cast<uint32_t>(k_ * static_cast<int32_t>(sizeof(uint32_t))),
+                static_cast<uint32_t>(k_ * static_cast<int32_t>(sizeof(int32_t))),
                 0,
                 0,
                 0};
@@ -237,8 +237,8 @@ private:
             minblock_buf_.Get<ComputeT>(),
             block_scores_buf_.Get<ComputeT>(),
             accumulated_scores_buf_.Get<ComputeT>(),
-            selected_indices_buf_.Get<uint32_t>(),
-            index_local_buf_.Get<uint32_t>(),
+            selected_indices_buf_.Get<int32_t>(),
+            index_local_buf_.Get<int32_t>(),
             sort_tmp_buf_.Get<ComputeT>()};
     }
 
@@ -431,9 +431,9 @@ private:
 
         ArithProgression(
             tensors.index_local,
-            static_cast<uint32_t>(0),
-            static_cast<uint32_t>(1),
-            static_cast<uint32_t>(sort_element_count));
+            static_cast<int32_t>(0),
+            static_cast<int32_t>(1),
+            static_cast<int32_t>(sort_element_count));
 
         AscendC::Sort<ComputeT, true>(
             tensors.maxblock,
@@ -455,7 +455,7 @@ private:
         uint8_t src1_pattern = QUEST_GATHER_INDEX_PATTERN;
         AscendC::GatherMask(
             tensors.selected_indices,
-            tensors.maxblock.template ReinterpretCast<uint32_t>(),
+            tensors.maxblock.template ReinterpretCast<int32_t>(),
             src1_pattern,
             false,
             static_cast<uint32_t>(0),
@@ -480,7 +480,7 @@ private:
     AscendC::GlobalTensor<StorageT> minblocks_gm_;
     AscendC::GlobalTensor<int32_t> metadata_block_tables_gm_;
     AscendC::GlobalTensor<int32_t> seq_lens_gm_;
-    AscendC::GlobalTensor<uint32_t> selected_indices_gm_;
+    AscendC::GlobalTensor<int32_t> selected_indices_gm_;
 
     int32_t batch_size_;
     int32_t num_kv_heads_;
