@@ -13,13 +13,10 @@
 
 #define BYTES_UB_BLOCK 32
 #define BYTES_DATA_BLOCK 32
-#define BYTES_VECTOR_REPEAT 256
 #define NUM_FLOAT_ELEMS_PER_VECTOR 64
 #define NUM_FLOAT_ELEMS_PER_DATA_BLOCK 8
 #define NUM_PAGE_INDEX_ELEMS_PER_DATA_BLOCK 8
 #define NUM_SORT_PAIRS_PER_REPEAT 32
-#define NUM_SORT_PAIR_ELEMS 2
-#define QUEST_GATHER_INDEX_PATTERN 2
 #define QUEST_MAX_SELECTED_BLOCKS 64
 #define DIV_ROUNDUP(x, y) (((x) + (y)-1) / (y))
 #define DIV_ROUNDUP_MUL(bytes, bytes_per_block) (DIV_ROUNDUP(bytes, bytes_per_block) * (bytes_per_block))
@@ -99,6 +96,7 @@ class KernelQuestBlockSelectPaged {
         AscendC::LocalTensor<ComputeT> block_scores;
         AscendC::LocalTensor<ComputeT> accumulated_scores;
         AscendC::LocalTensor<QuestPageIndexT> selected_indices;
+        AscendC::LocalTensor<ComputeT> selected_values;
         AscendC::LocalTensor<ComputeT> tmp_concat;
         // Sort requires uint32_t index lanes; page IDs stay int32_t everywhere else.
         AscendC::LocalTensor<QuestSortIndexT> index_local;
@@ -165,9 +163,14 @@ public:
             NUM_UB_BYTES(block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t accumulated_scores_size = NUM_UB_BYTES(
             max_metadata_blocks_per_request_ * block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
+        uint32_t selected_element_count =
+            DIV_ROUNDUP(k_, NUM_SORT_PAIRS_PER_REPEAT) * NUM_SORT_PAIRS_PER_REPEAT;
         uint32_t selected_indices_buf_size = NUM_UB_BYTES(
-            DIV_ROUNDUP(k_, NUM_SORT_PAIRS_PER_REPEAT) * NUM_SORT_PAIRS_PER_REPEAT *
+            selected_element_count *
             static_cast<int32_t>(sizeof(QuestPageIndexT)));
+        uint32_t selected_values_buf_size = NUM_UB_BYTES(
+            selected_element_count *
+            static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t tmp_concat_buf_size = NUM_UB_BYTES(
             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
             static_cast<int32_t>(sizeof(ComputeT)));
@@ -184,6 +187,7 @@ public:
         pipe_.InitBuffer(block_scores_buf_, reduced_buf_size);
         pipe_.InitBuffer(accumulated_scores_buf_, accumulated_scores_size);
         pipe_.InitBuffer(selected_indices_buf_, selected_indices_buf_size);
+        pipe_.InitBuffer(selected_values_buf_, selected_values_buf_size);
         pipe_.InitBuffer(tmp_concat_buf_, tmp_concat_buf_size);
         pipe_.InitBuffer(index_local_buf_, index_local_buf_size);
         pipe_.InitBuffer(sort_tmp_buf_, sort_tmp_buf_size);
@@ -238,7 +242,7 @@ public:
                 if (likely(use_fixed_anchors)) {
                     PinAnchorScores(tensors, valid_page_count);
                 }
-                SortAndGatherTopK(tensors, sort_element_count);
+                SortAndExtractTopK(tensors, sort_element_count);
             }
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
@@ -269,6 +273,7 @@ private:
             block_scores_buf_.Get<ComputeT>(),
             accumulated_scores_buf_.Get<ComputeT>(),
             selected_indices_buf_.Get<QuestPageIndexT>(),
+            selected_values_buf_.Get<ComputeT>(),
             tmp_concat_buf_.Get<ComputeT>(),
             index_local_buf_.Get<QuestSortIndexT>(),
             sort_tmp_buf_.Get<ComputeT>()};
@@ -485,11 +490,12 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void SortAndGatherTopK(
+    __aicore__ inline void SortAndExtractTopK(
         LocalTensors &tensors,
         int32_t sort_element_count)
     {
         uint32_t repeat_times = sort_element_count / 32;
+        uint32_t selected_repeat_times = DIV_ROUNDUP(k_, NUM_SORT_PAIRS_PER_REPEAT);
 
         Arange<QuestPageIndexT>(
             tensors.index_local.template ReinterpretCast<QuestPageIndexT>(),
@@ -513,24 +519,11 @@ private:
             repeat_times);
         AscendC::PipeBarrier<PIPE_V>();
 
-        AscendC::GatherMaskParams gather_mask_params;
-        gather_mask_params.repeatTimes = static_cast<uint8_t>(
-            DIV_ROUNDUP(k_ * static_cast<int32_t>(sizeof(ComputeT)) * NUM_SORT_PAIR_ELEMS,
-                        BYTES_VECTOR_REPEAT));
-        gather_mask_params.src0BlockStride = 1;
-        gather_mask_params.src0RepeatStride = BYTES_VECTOR_REPEAT / BYTES_DATA_BLOCK;
-        gather_mask_params.src1RepeatStride = 0;
-
-        uint64_t rsvd_cnt = 0;
-        uint8_t src1_pattern = QUEST_GATHER_INDEX_PATTERN;
-        AscendC::GatherMask(
-            tensors.selected_indices,
-            tensors.maxblock.template ReinterpretCast<QuestPageIndexT>(),
-            src1_pattern,
-            false,
-            static_cast<uint32_t>(0),
-            gather_mask_params,
-            rsvd_cnt);
+        AscendC::Extract(
+            tensors.selected_values,
+            tensors.selected_indices.template ReinterpretCast<QuestSortIndexT>(),
+            tensors.maxblock,
+            selected_repeat_times);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -542,6 +535,7 @@ private:
     VecBufT block_scores_buf_;
     VecBufT accumulated_scores_buf_;
     VecBufT selected_indices_buf_;
+    VecBufT selected_values_buf_;
     VecBufT tmp_concat_buf_;
     VecBufT index_local_buf_;
     VecBufT sort_tmp_buf_;
