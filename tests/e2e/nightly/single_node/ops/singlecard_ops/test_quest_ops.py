@@ -340,8 +340,15 @@ def assert_selection_exact(actual, expected, seq_lens, k, use_fixed_anchors):
         for h in range(num_heads):
             a = actual[b, h].tolist()
             e = expected[b, h].tolist()
-            if vpc <= 0 or k >= vpc:
-                assert a == e, f"k>=vpc/empty mismatch (b={b}, h={h}): {a} != {e}"
+            if vpc <= 0:
+                continue  # no pages consumed; the whole row is unused tail
+            if k >= vpc:
+                # Only [0, vpc) is consumed by paged_select_attention (it bounds
+                # its loop by the kv seq length); the trailing slots are unused
+                # tail and not necessarily zero. The consumed prefix is the ramp.
+                assert a[:vpc] == e[:vpc], (
+                    f"k>=vpc prefix mismatch (b={b}, h={h}): {a[:vpc]} != {e[:vpc]}"
+                )
                 continue
             a_sel, e_sel = a[:k], e[:k]
             anchors = _anchors_for(vpc, use_fixed_anchors)
