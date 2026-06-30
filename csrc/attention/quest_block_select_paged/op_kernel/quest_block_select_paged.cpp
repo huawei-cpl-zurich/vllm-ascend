@@ -18,6 +18,11 @@ constexpr int32_t QUEST_PAGE_SIZE = 128;  // tokens per KV page
 constexpr float QUEST_MIN_SCORE = -3.4028235e38f;
 constexpr float QUEST_MAX_SCORE = 3.4028235e38f;
 constexpr uint32_t REGION_PROPOSAL_DATA_SIZE_FLOAT_V220 = 2;
+// The Sort high-level API emits one (score, index) pair per element; GatherMask
+// pattern 2 keeps the index word of each pair, 32 pairs per 256-byte repeat.
+constexpr int32_t NUM_SORT_PAIRS_PER_REPEAT = 32;
+constexpr int32_t BYTES_VECTOR_REPEAT = 256;
+constexpr uint8_t GATHER_INDEX_PATTERN = 2;
 
 inline __aicore__ int32_t ceilDiv(int32_t x, int32_t d) { return (x + d - 1) / d; }
 inline __aicore__ int32_t ceilDivMul(int32_t x, int32_t d) { return d * ceilDiv(x, d); }
@@ -57,9 +62,6 @@ class KernelQuestBlockSelectPaged {
         AscendC::LocalTensor<ComputeT> block_scores;
         AscendC::LocalTensor<ComputeT> accumulated_scores;
         AscendC::LocalTensor<uint32_t> selected_indices;
-        AscendC::LocalTensor<ComputeT> selected_values;
-        AscendC::LocalTensor<ComputeT> tmp_concat;
-        AscendC::LocalTensor<ComputeT> concat;
         AscendC::LocalTensor<uint32_t> index_local;
         AscendC::LocalTensor<ComputeT> sort_tmp;
     };
@@ -122,16 +124,11 @@ public:
             alignUpUbBytes(block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t accumulated_scores_size = alignUpUbBytes(
             max_metadata_blocks_per_request_ * block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t selected_indices_buf_size = alignUpUbBytes(k_ * static_cast<int32_t>(sizeof(uint32_t)));
-        uint32_t selected_values_buf_size =
-            alignUpUbBytes(k_ * static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t tmp_concat_buf_size = alignUpUbBytes(
-            max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
-            static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t concat_buf_size = alignUpUbBytes(
-            (max_metadata_blocks_per_request_ * block_size_ +
-             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE) *
-            static_cast<int32_t>(sizeof(ComputeT)));
+        // GatherMask extracts a whole 32-index repeat at a time, so the output
+        // buffer must hold ceil(k / 32) * 32 indices even when k is smaller.
+        uint32_t selected_indices_buf_size = alignUpUbBytes(
+            ceilDiv(k_, NUM_SORT_PAIRS_PER_REPEAT) * NUM_SORT_PAIRS_PER_REPEAT *
+            static_cast<int32_t>(sizeof(uint32_t)));
         uint32_t index_local_buf_size =
             alignUpUbBytes(max_metadata_blocks_per_request_ * block_size_ *
                          static_cast<int32_t>(sizeof(uint32_t)));
@@ -145,9 +142,6 @@ public:
         pipe_.InitBuffer(block_scores_buf_, reduced_buf_size);
         pipe_.InitBuffer(accumulated_scores_buf_, accumulated_scores_size);
         pipe_.InitBuffer(selected_indices_buf_, selected_indices_buf_size);
-        pipe_.InitBuffer(selected_values_buf_, selected_values_buf_size);
-        pipe_.InitBuffer(tmp_concat_buf_, tmp_concat_buf_size);
-        pipe_.InitBuffer(concat_buf_, concat_buf_size);
         pipe_.InitBuffer(index_local_buf_, index_local_buf_size);
         pipe_.InitBuffer(sort_tmp_buf_, sort_tmp_buf_size);
     }
@@ -227,9 +221,6 @@ private:
             block_scores_buf_.Get<ComputeT>(),
             accumulated_scores_buf_.Get<ComputeT>(),
             selected_indices_buf_.Get<uint32_t>(),
-            selected_values_buf_.Get<ComputeT>(),
-            tmp_concat_buf_.Get<ComputeT>(),
-            concat_buf_.Get<ComputeT>(),
             index_local_buf_.Get<uint32_t>(),
             sort_tmp_buf_.Get<ComputeT>()};
     }
@@ -420,7 +411,7 @@ private:
         LocalTensors &tensors,
         int32_t sort_element_count)
     {
-        uint32_t repeat_times = sort_element_count / 32;
+        int32_t repeat_times = sort_element_count / NUM_SORT_PAIRS_PER_REPEAT;
 
         // Build the [0, 1, 2, ...] page-index ramp with a vector op (Arange) so
         // it is naturally ordered before the Sort that consumes it -- no
@@ -432,23 +423,38 @@ private:
             static_cast<int32_t>(1),
             sort_element_count);
 
-        AscendC::Concat(
-            tensors.concat,
-            tensors.accumulated_scores,
-            tensors.tmp_concat,
-            repeat_times);
-        AscendC::PipeBarrier<PIPE_V>();
+        // Full descending sort of the raw scores (Sort concatenates the score
+        // and index internally -- no separate Concat needed). The result in
+        // `maxblock` holds one (score, index) pair per element; as uint32 words
+        // it is [score0, index0, score1, index1, ...], 32 pairs per 256B repeat.
         AscendC::Sort<ComputeT, true>(
             tensors.maxblock,
-            tensors.concat,
+            tensors.accumulated_scores,
             tensors.index_local,
             tensors.sort_tmp,
             repeat_times);
-        AscendC::Extract(
-            tensors.selected_values,
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // Gather only the index word of each sorted pair (built-in pattern 2,
+        // which keeps the second word of every pair). Each repeat extracts 32
+        // indices, so ceil(k / 32) repeats cover the top k; the first k written
+        // are the highest-scoring pages.
+        AscendC::GatherMaskParams gather_params;
+        gather_params.src0BlockStride = 1;
+        gather_params.repeatTimes = ceilDiv(k_, NUM_SORT_PAIRS_PER_REPEAT);
+        gather_params.src0RepeatStride = BYTES_VECTOR_REPEAT / BYTES_DATA_BLOCK;
+        gather_params.src1RepeatStride = 0;
+        uint64_t reserved_count = 0;
+        uint8_t index_pattern = GATHER_INDEX_PATTERN;
+        AscendC::GatherMask(
             tensors.selected_indices,
-            tensors.maxblock,
-            repeat_times);
+            tensors.maxblock.template ReinterpretCast<uint32_t>(),
+            index_pattern,
+            false,
+            static_cast<uint32_t>(0),
+            gather_params,
+            reserved_count);
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     AscendC::TPipe pipe_;
@@ -459,9 +465,6 @@ private:
     VecBufT block_scores_buf_;
     VecBufT accumulated_scores_buf_;
     VecBufT selected_indices_buf_;
-    VecBufT selected_values_buf_;
-    VecBufT tmp_concat_buf_;
-    VecBufT concat_buf_;
     VecBufT index_local_buf_;
     VecBufT sort_tmp_buf_;
 
