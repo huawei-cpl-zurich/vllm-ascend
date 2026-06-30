@@ -257,6 +257,10 @@ public:
                 SortAndExtract(tensors, sort_element_count);
 
                 if (likely(use_fixed_anchors)) {
+                    // The Extract output (vector) is read below with scalar
+                    // GetValue, so synchronize the vector unit with the scalar unit.
+                    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
                     quest_apply_anchor_selection(
                         tensors.selected_indices,
                         tensors.index_local,
@@ -468,9 +472,17 @@ private:
             return;
         }
 
+        // The page scores were just written by the vector Copy in
+        // CopyScoresToAccumulated; wait for the vector unit before overwriting
+        // the anchor scores with the scalar unit (vector -> scalar).
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         tensors.accumulated_scores.SetValue(0, static_cast<ComputeT>(QUEST_MIN_SCORE));
         tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(QUEST_MIN_SCORE));
-        AscendC::PipeBarrier<PIPE_V>();
+        // These scalar writes feed the vector Sort/Concat in SortAndExtract, so
+        // they must be made visible to the vector unit (scalar -> vector).
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
     }
 
     __aicore__ inline void SortAndExtract(
@@ -482,6 +494,10 @@ private:
         for (uint32_t idx = 0; idx < static_cast<uint32_t>(sort_element_count); idx++) {
             tensors.index_local.SetValue(idx, idx);
         }
+        // index_local is filled with scalar writes but consumed by the vector
+        // Sort below, so synchronize the scalar unit with the vector unit first.
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
 
         AscendC::Concat(
             tensors.concat,
