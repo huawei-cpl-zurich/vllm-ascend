@@ -268,6 +268,27 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
+    // Multiply every page's head_dim channels in `buf` by the query (broadcast
+    // across pages), one NUM_FLOAT_ELEMS_PER_VECTOR-wide vector chunk at a time.
+    // head_dim is a multiple of the vector width (128 / 64 == 2 chunks today).
+    __aicore__ inline void MultiplyPagesByQuery(
+        AscendC::LocalTensor<ComputeT> buf,
+        AscendC::LocalTensor<ComputeT> query,
+        const AscendC::BinaryRepeatParams &mul_repeat_params)
+    {
+        int32_t num_vector_chunks = head_dim_ / NUM_FLOAT_ELEMS_PER_VECTOR;
+        for (int32_t chunk = 0; chunk < num_vector_chunks; chunk++) {
+            int32_t offset = chunk * NUM_FLOAT_ELEMS_PER_VECTOR;
+            AscendC::Mul(
+                buf[offset],
+                query[offset],
+                buf[offset],
+                NUM_FLOAT_ELEMS_PER_VECTOR,
+                block_size_,
+                mul_repeat_params);
+        }
+    }
+
     __aicore__ inline void ScoreMetadataBlock(
         LocalTensors &tensors,
         int32_t meta_block_offset)
@@ -300,20 +321,7 @@ private:
             block_size_ * head_dim_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
-        AscendC::Mul(
-            tensors.maxblock,
-            tensors.query,
-            tensors.maxblock,
-            NUM_FLOAT_ELEMS_PER_VECTOR,
-            block_size_,
-            mul_repeat_params);
-        AscendC::Mul(
-            tensors.maxblock[NUM_FLOAT_ELEMS_PER_VECTOR],
-            tensors.query[NUM_FLOAT_ELEMS_PER_VECTOR],
-            tensors.maxblock[NUM_FLOAT_ELEMS_PER_VECTOR],
-            NUM_FLOAT_ELEMS_PER_VECTOR,
-            block_size_,
-            mul_repeat_params);
+        MultiplyPagesByQuery(tensors.maxblock, tensors.query, mul_repeat_params);
 
         AscendC::DataCopy(input_storage_lt, minblocks_gm_[meta_block_offset], gm_ub_cp);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
@@ -323,41 +331,24 @@ private:
             input_storage_lt,
             AscendC::RoundMode::CAST_NONE,
             block_size_ * head_dim_);
-        AscendC::Mul(
-            tensors.minblock,
-            tensors.query,
-            tensors.minblock,
-            NUM_FLOAT_ELEMS_PER_VECTOR,
-            block_size_,
-            mul_repeat_params);
-        AscendC::Mul(
-            tensors.minblock[NUM_FLOAT_ELEMS_PER_VECTOR],
-            tensors.query[NUM_FLOAT_ELEMS_PER_VECTOR],
-            tensors.minblock[NUM_FLOAT_ELEMS_PER_VECTOR],
-            NUM_FLOAT_ELEMS_PER_VECTOR,
-            block_size_,
-            mul_repeat_params);
+        MultiplyPagesByQuery(tensors.minblock, tensors.query, mul_repeat_params);
 
         AscendC::Max(tensors.maxblock, tensors.maxblock, tensors.minblock, block_size_ * head_dim_);
 
-        AscendC::RepeatReduceSum(
-            tensors.minblock,
-            tensors.maxblock,
-            block_size_,
-            mask,
-            0,
-            1,
-            1,
-            8);
-        AscendC::RepeatReduceSum(
-            tensors.minblock[block_size_],
-            tensors.maxblock[block_size_ * head_dim_ / masks_per_head_dim],
-            block_size_,
-            mask,
-            0,
-            1,
-            1,
-            8);
+        // Reduce each page's head_dim upper bounds in NUM_FLOAT_ELEMS_PER_VECTOR
+        // chunks; chunk c leaves one partial sum per page at minblock[c*block_size_].
+        // PairReduceSum below then collapses the per-chunk partials into one score.
+        for (int32_t chunk = 0; chunk < static_cast<int32_t>(masks_per_head_dim); chunk++) {
+            AscendC::RepeatReduceSum(
+                tensors.minblock[chunk * block_size_],
+                tensors.maxblock[chunk * block_size_ * NUM_FLOAT_ELEMS_PER_VECTOR],
+                block_size_,
+                mask,
+                0,
+                1,
+                1,
+                8);
+        }
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::PairReduceSum(
             tensors.block_scores,
