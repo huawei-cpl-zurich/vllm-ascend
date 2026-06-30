@@ -41,16 +41,36 @@ __aicore__ inline void quest_apply_sequential_selection(
     int32_t k)
 {
     int32_t num_selected_pages = valid_page_count > 0 ? minI32(k, valid_page_count) : 0;
-    // Zero all k output slots, then write the page-index ramp
-    // [0, 1, ..., num_selected_pages - 1] over the valid prefix. Both vector ops
-    // start at offset 0 so they stay 32-byte aligned (the tail offset is not
-    // generally aligned). This replaces the per-element scalar SetValue loops.
+    // Vector replacement for the per-element scalar SetValue loops.
     AscendC::LocalTensor<int32_t> indices = selected_indices_lt.ReinterpretCast<int32_t>();
-    AscendC::Duplicate(indices, static_cast<int32_t>(0), k);
-    if (num_selected_pages > 0) {
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Arange<int32_t>(
-            indices, static_cast<int32_t>(0), static_cast<int32_t>(1), num_selected_pages);
+    if (unlikely(num_selected_pages <= 0)) {
+        AscendC::Duplicate(indices, static_cast<int32_t>(0), k);
+        return;
+    }
+
+    // Page-index ramp [0, 1, ..., num_selected_pages - 1] over the valid prefix.
+    // Arange may round its write up past num_selected_pages, so the padding
+    // [num_selected_pages, k) is zeroed afterwards.
+    AscendC::Arange<int32_t>(
+        indices, static_cast<int32_t>(0), static_cast<int32_t>(1), num_selected_pages);
+    AscendC::PipeBarrier<PIPE_V>();
+
+    // Duplicate requires a 32-byte-aligned start, so clear the unaligned < 8
+    // remnant of the boundary block with a bitwise-masked Duplicate (the mask
+    // preserves the ramp elements before num_selected_pages), then clear the
+    // 32-byte-aligned remainder with a plain count Duplicate.
+    constexpr int32_t ALIGN_ELEMS = BYTES_DATA_BLOCK / static_cast<int32_t>(sizeof(int32_t));
+    int32_t aligned_base = num_selected_pages / ALIGN_ELEMS * ALIGN_ELEMS;
+    int32_t remnant = num_selected_pages - aligned_base;
+    if (remnant > 0) {
+        uint64_t mask[2] = {((1ULL << ALIGN_ELEMS) - 1) & ~((1ULL << remnant) - 1), 0};
+        AscendC::Duplicate(
+            indices[aligned_base], static_cast<int32_t>(0), mask,
+            static_cast<uint8_t>(1), static_cast<uint16_t>(1), static_cast<uint8_t>(8));
+        aligned_base += ALIGN_ELEMS;
+    }
+    if (aligned_base < k) {
+        AscendC::Duplicate(indices[aligned_base], static_cast<int32_t>(0), k - aligned_base);
     }
 }
 
