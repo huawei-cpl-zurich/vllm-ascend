@@ -16,6 +16,7 @@ constexpr int32_t BYTES_DATA_BLOCK = 32;
 constexpr int32_t NUM_FLOAT_ELEMS_PER_VECTOR = 64;
 constexpr int32_t QUEST_PAGE_SIZE = 128;  // tokens per KV page
 constexpr float QUEST_MIN_SCORE = -3.4028235e38f;
+constexpr float QUEST_MAX_SCORE = 3.4028235e38f;
 constexpr uint32_t REGION_PROPOSAL_DATA_SIZE_FLOAT_V220 = 2;
 
 inline __aicore__ int32_t ceilDiv(int32_t x, int32_t d) { return (x + d - 1) / d; }
@@ -28,55 +29,6 @@ using namespace AscendC;
 
 // QuestBlockSelectPagedTilingData is generated from the op_host tiling
 // definition. The kernel must not redeclare it locally.
-
-__aicore__ inline void quest_apply_anchor_selection(
-    LocalTensor<uint32_t> &selected_indices_lt,
-    LocalTensor<uint32_t> &candidate_indices_lt,
-    int32_t valid_page_count,
-    int32_t k)
-{
-    if (valid_page_count <= 0 || k <= 0) {
-        return;
-    }
-
-    int32_t num_selected_pages = minI32(k, valid_page_count);
-    if (num_selected_pages <= 0) {
-        return;
-    }
-
-    uint32_t last_anchor = static_cast<uint32_t>(valid_page_count - 1);
-    if (unlikely(num_selected_pages <= 2)) {
-        for (int32_t idx = 0; idx < k; ++idx) {
-            selected_indices_lt.SetValue(idx, 0U);
-        }
-        if (num_selected_pages == 1) {
-            selected_indices_lt.SetValue(0, last_anchor);
-        } else {
-            selected_indices_lt.SetValue(0, 0U);
-            selected_indices_lt.SetValue(1, last_anchor);
-        }
-        return;
-    }
-
-    for (int32_t idx = 0; idx < k; ++idx) {
-        candidate_indices_lt.SetValue(idx, selected_indices_lt.GetValue(idx));
-        selected_indices_lt.SetValue(idx, 0U);
-    }
-
-    selected_indices_lt.SetValue(0, 0U);
-    selected_indices_lt.SetValue(1, last_anchor);
-
-    int32_t output_idx = 2;
-    for (int32_t idx = 0; idx < k && output_idx < num_selected_pages; ++idx) {
-        uint32_t page_idx = candidate_indices_lt.GetValue(idx);
-        if (page_idx == 0U || page_idx == last_anchor ||
-            page_idx >= static_cast<uint32_t>(valid_page_count)) {
-            continue;
-        }
-        selected_indices_lt.SetValue(output_idx, page_idx);
-        output_idx++;
-    }
-}
 
 __aicore__ inline void quest_apply_sequential_selection(
     LocalTensor<uint32_t> &selected_indices_lt,
@@ -255,18 +207,6 @@ public:
                     MaskAnchorScores(tensors, valid_page_count);
                 }
                 SortAndExtract(tensors, sort_element_count);
-
-                if (likely(use_fixed_anchors)) {
-                    // The Extract output (vector) is read below with scalar
-                    // GetValue, so synchronize the vector unit with the scalar unit.
-                    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
-                    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
-                    quest_apply_anchor_selection(
-                        tensors.selected_indices,
-                        tensors.index_local,
-                        valid_page_count,
-                        k_);
-                }
             }
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
@@ -477,8 +417,8 @@ private:
         // the anchor scores with the scalar unit (vector -> scalar).
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
-        tensors.accumulated_scores.SetValue(0, static_cast<ComputeT>(QUEST_MIN_SCORE));
-        tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(QUEST_MIN_SCORE));
+        tensors.accumulated_scores.SetValue(0, static_cast<ComputeT>(QUEST_MAX_SCORE));
+        tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(QUEST_MAX_SCORE));
         // These scalar writes feed the vector Sort/Concat in SortAndExtract, so
         // they must be made visible to the vector unit (scalar -> vector).
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
