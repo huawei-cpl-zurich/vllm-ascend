@@ -205,6 +205,11 @@ public:
                 ub_gm_cp.dstStride = inter_kv_head_stride_blocks_;
                 DataCopy(maxblocks_gm_[meta_offset], max_lt, ub_gm_cp);
                 DataCopy(minblocks_gm_[meta_offset], min_lt, ub_gm_cp);
+                // max_lt/min_lt are single-buffered and reused by the next
+                // meta-block's reduce, so wait for these GM copies (MTE3) to
+                // finish reading them before those vector writes can start.
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
 
                 max_out_q_.FreeTensor(max_lt);
                 min_out_q_.FreeTensor(min_lt);
