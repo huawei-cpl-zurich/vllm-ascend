@@ -220,15 +220,12 @@ public:
             int32_t seq_len = seq_lens_gm_.GetValue(batch_idx);
             int32_t valid_page_count = seq_len > 0 ? ceilDiv(seq_len, QUEST_PAGE_SIZE) : 0;
             bool use_fixed_anchors = tokens_since_metadata_update_ >= 0;
-            if (unlikely(valid_page_count <= 0 || (!use_fixed_anchors && k_ >= valid_page_count))) {
+            // When the page budget covers every page, select all pages
+            // sequentially. This degenerate case also satisfies the fixed
+            // anchors (page 0 and the last page are always in [0, valid_page_count)).
+            if (unlikely(valid_page_count <= 0 || k_ >= valid_page_count)) {
                 quest_apply_sequential_selection(
                     tensors.selected_indices,
-                    valid_page_count,
-                    k_);
-            } else if (unlikely(use_fixed_anchors && valid_page_count <= 2)) {
-                quest_apply_anchor_selection(
-                    tensors.selected_indices,
-                    tensors.index_local,
                     valid_page_count,
                     k_);
             } else {
