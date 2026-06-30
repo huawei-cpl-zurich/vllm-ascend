@@ -8,6 +8,11 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  */
 
+/*******************************************************************************
+ *  quest_block_select_paged_kernel - vector-core, 1 core = (request, q-head)
+ *  Scores every page of the request with the QUEST upper bound, then selects
+ *  the top-k pages (plus the page-0 and last-page anchors) via Sort + GatherMask
+ *******************************************************************************/
 #include "kernel_operator.h"
 #include "quest_block_select_paged_tilingkey.h"
 
@@ -17,7 +22,8 @@ constexpr int32_t NUM_FLOAT_ELEMS_PER_VECTOR = 64;
 constexpr int32_t QUEST_PAGE_SIZE = 128;  // tokens per KV page
 constexpr float QUEST_MIN_SCORE = -3.4028235e38f;
 constexpr float QUEST_MAX_SCORE = 3.4028235e38f;
-constexpr uint32_t REGION_PROPOSAL_DATA_SIZE_FLOAT_V220 = 2;
+// The Sort API stores each element as a (score, index) pair == two words.
+constexpr int32_t SORT_PAIR_WORDS = 2;
 // The Sort high-level API emits one (score, index) pair per element; GatherMask
 // pattern 2 keeps the index word of each pair, 32 pairs per 256-byte repeat.
 constexpr int32_t NUM_SORT_PAIRS_PER_REPEAT = 32;
@@ -53,7 +59,6 @@ template <typename StorageT>
 class KernelQuestBlockSelectPaged {
     using VecBufT = AscendC::TBuf<AscendC::QuePosition::VECCALC>;
     using ComputeT = float;
-    static constexpr uint32_t REGION_SIZE = REGION_PROPOSAL_DATA_SIZE_FLOAT_V220;
 
     struct LocalTensors {
         AscendC::LocalTensor<ComputeT> query;
@@ -90,7 +95,7 @@ public:
         batch_size_ = batch_size;
         num_kv_heads_ = num_kv_heads;
         num_heads_ = num_heads;
-        block_size_ = block_size;
+        pages_per_metadata_block_ = block_size;
         head_dim_ = head_dim;
         max_metadata_blocks_per_request_ = max_metadata_blocks_per_request;
         tokens_since_metadata_update_ = tokens_since_metadata_update;
@@ -113,27 +118,27 @@ public:
         selected_indices_gm_.SetGlobalBuffer((__gm__ uint32_t *)selected_indices);
 
         uint32_t input_storage_buf_size =
-            alignUpUbBytes(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
+            alignUpUbBytes(pages_per_metadata_block_ * head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
         pipe_.InitBuffer(input_storage_buf_, input_storage_buf_size);
 
         uint32_t query_buf_size =
             alignUpUbBytes(head_dim_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t block_buf_size =
-            alignUpUbBytes(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(ComputeT)));
+            alignUpUbBytes(pages_per_metadata_block_ * head_dim_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t reduced_buf_size =
-            alignUpUbBytes(block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
+            alignUpUbBytes(pages_per_metadata_block_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t accumulated_scores_size = alignUpUbBytes(
-            max_metadata_blocks_per_request_ * block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
+            max_metadata_blocks_per_request_ * pages_per_metadata_block_ * static_cast<int32_t>(sizeof(ComputeT)));
         // GatherMask extracts a whole 32-index repeat at a time, so the output
         // buffer must hold ceil(k / 32) * 32 indices even when k is smaller.
         uint32_t selected_indices_buf_size = alignUpUbBytes(
             ceilDiv(k_, NUM_SORT_PAIRS_PER_REPEAT) * NUM_SORT_PAIRS_PER_REPEAT *
             static_cast<int32_t>(sizeof(uint32_t)));
         uint32_t index_local_buf_size =
-            alignUpUbBytes(max_metadata_blocks_per_request_ * block_size_ *
+            alignUpUbBytes(max_metadata_blocks_per_request_ * pages_per_metadata_block_ *
                          static_cast<int32_t>(sizeof(uint32_t)));
         uint32_t sort_tmp_buf_size = alignUpUbBytes(
-            max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
+            max_metadata_blocks_per_request_ * pages_per_metadata_block_ * SORT_PAIR_WORDS *
             static_cast<int32_t>(sizeof(ComputeT)));
 
         pipe_.InitBuffer(query_buf_, query_buf_size);
@@ -172,7 +177,7 @@ public:
             if (unlikely(valid_page_count <= 0 || k_ >= valid_page_count)) {
                 quest_apply_sequential_selection(tensors.selected_indices, k_);
             } else {
-                int32_t num_meta_blocks_in_request = ceilDiv(valid_page_count, block_size_);
+                int32_t num_meta_blocks_in_request = ceilDiv(valid_page_count, pages_per_metadata_block_);
                 int32_t sort_element_count = ceilDiv(valid_page_count, 32) * 32;
 
                 LoadQuery(tensors, query_offset);
@@ -182,7 +187,7 @@ public:
                     int32_t meta_block_id = metadata_block_tables_gm_.GetValue(
                         batch_idx * max_metadata_blocks_per_request_ + meta_block);
                     int32_t meta_block_offset =
-                        meta_block_id * block_size_ * num_kv_heads_ * head_dim_ + kv_head_idx * head_dim_;
+                        meta_block_id * pages_per_metadata_block_ * num_kv_heads_ * head_dim_ + kv_head_idx * head_dim_;
 
                     ScoreMetadataBlock(tensors, meta_block_offset);
                     CopyScoresToAccumulated(
@@ -236,7 +241,7 @@ private:
         auto query_copy_params = AscendC::DataCopyParams(1, query_copy_block_len, 0, 0);
 
         AscendC::LocalTensor<StorageT> input_storage_lt =
-            input_storage_buf_.Get<StorageT>(block_size_ * head_dim_);
+            input_storage_buf_.Get<StorageT>(pages_per_metadata_block_ * head_dim_);
         AscendC::DataCopy(input_storage_lt, query_gm_[query_offset], query_copy_params);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
@@ -277,7 +282,7 @@ private:
                 query[offset],
                 buf[offset],
                 NUM_FLOAT_ELEMS_PER_VECTOR,
-                block_size_,
+                pages_per_metadata_block_,
                 mul_repeat_params);
         }
     }
@@ -287,9 +292,9 @@ private:
         int32_t meta_block_offset)
     {
         AscendC::LocalTensor<StorageT> input_storage_lt =
-            input_storage_buf_.Get<StorageT>(block_size_ * head_dim_);
+            input_storage_buf_.Get<StorageT>(pages_per_metadata_block_ * head_dim_);
         AscendC::DataCopyParams gm_ub_cp;
-        gm_ub_cp.blockCount = block_size_;
+        gm_ub_cp.blockCount = pages_per_metadata_block_;
         gm_ub_cp.blockLen = head_dim_storage_blocks_;
         gm_ub_cp.srcStride = inter_kv_head_stride_blocks_;
         gm_ub_cp.dstStride = 0;
@@ -311,7 +316,7 @@ private:
             tensors.maxblock,
             input_storage_lt,
             AscendC::RoundMode::CAST_NONE,
-            block_size_ * head_dim_);
+            pages_per_metadata_block_ * head_dim_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
         MultiplyPagesByQuery(tensors.maxblock, tensors.query, mul_repeat_params);
@@ -323,19 +328,19 @@ private:
             tensors.minblock,
             input_storage_lt,
             AscendC::RoundMode::CAST_NONE,
-            block_size_ * head_dim_);
+            pages_per_metadata_block_ * head_dim_);
         MultiplyPagesByQuery(tensors.minblock, tensors.query, mul_repeat_params);
 
-        AscendC::Max(tensors.maxblock, tensors.maxblock, tensors.minblock, block_size_ * head_dim_);
+        AscendC::Max(tensors.maxblock, tensors.maxblock, tensors.minblock, pages_per_metadata_block_ * head_dim_);
 
         // Reduce each page's head_dim upper bounds in NUM_FLOAT_ELEMS_PER_VECTOR
-        // chunks; chunk c leaves one partial sum per page at minblock[c*block_size_].
+        // chunks; chunk c leaves one partial sum per page at minblock[c*pages_per_metadata_block_].
         // PairReduceSum below then collapses the per-chunk partials into one score.
         for (int32_t chunk = 0; chunk < static_cast<int32_t>(masks_per_head_dim); chunk++) {
             AscendC::RepeatReduceSum(
-                tensors.minblock[chunk * block_size_],
-                tensors.maxblock[chunk * block_size_ * NUM_FLOAT_ELEMS_PER_VECTOR],
-                block_size_,
+                tensors.minblock[chunk * pages_per_metadata_block_],
+                tensors.maxblock[chunk * pages_per_metadata_block_ * NUM_FLOAT_ELEMS_PER_VECTOR],
+                pages_per_metadata_block_,
                 mask,
                 0,
                 1,
@@ -346,7 +351,7 @@ private:
         AscendC::PairReduceSum(
             tensors.block_scores,
             tensors.minblock,
-            masks_per_head_dim * block_size_ / mask,
+            masks_per_head_dim * pages_per_metadata_block_ / mask,
             mask,
             1,
             1,
@@ -360,8 +365,8 @@ private:
         int32_t meta_block,
         int32_t num_meta_blocks_in_request)
     {
-        int32_t start_page = meta_block * block_size_;
-        int32_t pages_in_meta_block = minI32(valid_page_count - start_page, block_size_);
+        int32_t start_page = meta_block * pages_per_metadata_block_;
+        int32_t pages_in_meta_block = minI32(valid_page_count - start_page, pages_per_metadata_block_);
         if (pages_in_meta_block <= 0) {
             return;
         }
@@ -376,7 +381,7 @@ private:
                 break;
             }
 
-            int32_t accumulated_offset = meta_block * block_size_ + block_scores_offset;
+            int32_t accumulated_offset = meta_block * pages_per_metadata_block_ + block_scores_offset;
             AscendC::Copy(
                 tensors.accumulated_scores[accumulated_offset],
                 tensors.block_scores[block_scores_offset],
@@ -480,7 +485,7 @@ private:
     int32_t batch_size_;
     int32_t num_kv_heads_;
     int32_t num_heads_;
-    int32_t block_size_;  // page summaries per metadata block (maxblocks dim 1, == 128)
+    int32_t pages_per_metadata_block_;  // maxblocks dim 1 (== 128)
     int32_t head_dim_;
     int32_t max_metadata_blocks_per_request_;
     int32_t tokens_since_metadata_update_;
