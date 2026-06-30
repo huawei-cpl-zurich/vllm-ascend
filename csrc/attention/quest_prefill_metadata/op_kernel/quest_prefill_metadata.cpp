@@ -224,7 +224,7 @@ private:
             CopyRepeatParams ub_ub_cp = {1, 1, 8, 8};
             LocalTensor<ComputeT> work_lt = work_calc_buf_.Get<ComputeT>();
             Copy(work_lt, k_block_lt, mask, tokens_to_reduce, ub_ub_cp);
-            ReduceTokenDim<ComputeT, isMax>(work_lt, tokens_to_reduce * head_dim_);
+            ReducePageRows<ComputeT, isMax>(work_lt, tokens_to_reduce);
             Copy(out_lt, work_lt, mask, 1, ub_ub_cp);
         } else {
             ReduceCastBlockToOutput<isMax>(out_lt, k_block_lt, tokens_to_reduce);
@@ -255,7 +255,7 @@ private:
                 RoundMode::CAST_NONE,
                 chunk_tokens * head_dim_);
             AscendC::PipeBarrier<PIPE_V>();
-            ReduceTokenDim<ComputeT, isMax>(chunk_lt, chunk_tokens * head_dim_);
+            ReducePageRows<ComputeT, isMax>(chunk_lt, chunk_tokens);
 
             if (token_offset == 0) {
                 CopyRow<ComputeT>(acc_lt, chunk_lt);
@@ -283,35 +283,23 @@ private:
         }
     }
 
+    // Reduce `token_rows` rows of head_dim elements down to a single head_dim
+    // row, taking the per-channel Max (isMax) or Min across the rows. Fixed
+    // power-of-two halving stages -- token_rows must be a power of two (128 for
+    // a full FP16 page, 64 for a BF16 chunk), so there is no tail handling and
+    // no scalar bookkeeping. Consecutive vector instructions on the same pipe
+    // are ordered by the hardware (as the FP16 Copy -> Max path already relies
+    // on), so no per-stage barrier is required.
     template <typename ElementT, bool isMax>
-    __aicore__ inline void ReduceTokenDim(LocalTensor<ElementT> vec_lt, int32_t initial_length)
+    __aicore__ inline void ReducePageRows(LocalTensor<ElementT> vec_lt, int32_t token_rows)
     {
-        if (initial_length != block_size_ * head_dim_) {
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-
-        int32_t len = initial_length;
-        while (len > head_dim_) {
-            int32_t num_vec = len / head_dim_;
-            int32_t pair_vec = num_vec >> 1;
-            int32_t has_tail = num_vec & 1;
-            int32_t reduce_len = pair_vec * head_dim_;
-
-            if (reduce_len > 0) {
-                if (isMax) {
-                    Max(vec_lt[0], vec_lt[0], vec_lt[reduce_len], reduce_len);
-                } else {
-                    Min(vec_lt[0], vec_lt[0], vec_lt[reduce_len], reduce_len);
-                }
+        for (int32_t half = token_rows >> 1; half > 0; half >>= 1) {
+            int32_t count = half * head_dim_;
+            if constexpr (isMax) {
+                Max(vec_lt[0], vec_lt[0], vec_lt[count], count);
+            } else {
+                Min(vec_lt[0], vec_lt[0], vec_lt[count], count);
             }
-
-            if (has_tail) {
-                CopyRow<ElementT>(vec_lt[reduce_len], vec_lt[(num_vec - 1) * head_dim_]);
-                reduce_len += head_dim_;
-            }
-
-            len = reduce_len;
-            AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
