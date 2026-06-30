@@ -24,6 +24,72 @@ inline at::Tensor allocate_workspace_tensor(uint64_t workspace_size)
         at::TensorOptions(torch_npu::utils::get_npu_device_type());
     return at::empty({static_cast<int64_t>(workspace_size)}, options.dtype(kByte));
 }
+
+// Host-side validation of the statically-knowable contract (shapes, dtypes,
+// attrs). The device kernel re-checks the data-dependent invariants (e.g. that
+// each selected logical page id is in range) which cannot be validated here
+// without a device->host sync on the decode hot path. Keeping these checks on
+// the host gives a clean, catchable error before the kernel ever launches.
+inline void check_paged_select_attention_inputs(
+    const at::Tensor &query,
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &block_table,
+    const at::Tensor &selected_kv_indices,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    int64_t block_size)
+{
+    TORCH_CHECK(num_heads > 0 && num_key_value_heads > 0 && block_size > 0,
+        "npu_paged_select_attention: num_heads, num_key_value_heads and block_size must be positive (got ",
+        num_heads, ", ", num_key_value_heads, ", ", block_size, ").");
+    TORCH_CHECK(num_heads % num_key_value_heads == 0,
+        "npu_paged_select_attention: num_heads (", num_heads,
+        ") must be a multiple of num_key_value_heads (", num_key_value_heads, ").");
+
+    TORCH_CHECK(query.dim() == 3 && key.dim() == 3 && value.dim() == 3,
+        "npu_paged_select_attention: query/key/value must be rank-3 (got dims ",
+        query.dim(), "/", key.dim(), "/", value.dim(), ").");
+    TORCH_CHECK(block_table.dim() == 2,
+        "npu_paged_select_attention: block_table must be rank-2 (got dim ", block_table.dim(), ").");
+    TORCH_CHECK(selected_kv_indices.dim() == 3,
+        "npu_paged_select_attention: selected_kv_indices must be rank-3 (got dim ",
+        selected_kv_indices.dim(), ").");
+
+    const int64_t head_dim = query.size(2);
+    TORCH_CHECK(query.size(1) == num_heads,
+        "npu_paged_select_attention: query.size(1) (", query.size(1),
+        ") must equal num_heads (", num_heads, ").");
+    TORCH_CHECK(selected_kv_indices.size(1) == num_heads,
+        "npu_paged_select_attention: selected_kv_indices.size(1) (", selected_kv_indices.size(1),
+        ") must equal num_heads (", num_heads, ").");
+    TORCH_CHECK(selected_kv_indices.size(2) > 0,
+        "npu_paged_select_attention: selected_kv_indices.size(2) (k) must be > 0 (got ",
+        selected_kv_indices.size(2), ").");
+
+    TORCH_CHECK(key.size(1) == block_size && value.size(1) == block_size,
+        "npu_paged_select_attention: key/value.size(1) must equal block_size (", block_size,
+        ") (got ", key.size(1), "/", value.size(1), ").");
+    TORCH_CHECK(key.size(2) == num_key_value_heads * head_dim && value.size(2) == num_key_value_heads * head_dim,
+        "npu_paged_select_attention: key/value.size(2) must equal num_key_value_heads * head_dim (",
+        num_key_value_heads * head_dim, ") (got ", key.size(2), "/", value.size(2), ").");
+
+    TORCH_CHECK(selected_kv_indices.size(0) == block_table.size(0),
+        "npu_paged_select_attention: selected_kv_indices.size(0) (", selected_kv_indices.size(0),
+        ") must equal block_table.size(0) i.e. batch (", block_table.size(0), ").");
+
+    TORCH_CHECK(query.scalar_type() == key.scalar_type() && query.scalar_type() == value.scalar_type(),
+        "npu_paged_select_attention: query/key/value must share a dtype (got ",
+        query.scalar_type(), "/", key.scalar_type(), "/", value.scalar_type(), ").");
+    TORCH_CHECK(query.scalar_type() == at::kHalf || query.scalar_type() == at::kBFloat16,
+        "npu_paged_select_attention: query/key/value dtype must be float16 or bfloat16 (got ",
+        query.scalar_type(), ").");
+    TORCH_CHECK(block_table.scalar_type() == at::kInt,
+        "npu_paged_select_attention: block_table must be int32 (got ", block_table.scalar_type(), ").");
+    TORCH_CHECK(selected_kv_indices.scalar_type() == at::kInt,
+        "npu_paged_select_attention: selected_kv_indices must be int32 (got ",
+        selected_kv_indices.scalar_type(), ").");
+}
 } // namespace
 
 at::Tensor npu_paged_select_attention(
@@ -39,6 +105,9 @@ at::Tensor npu_paged_select_attention(
     int64_t num_key_value_heads,
     int64_t block_size)
 {
+    check_paged_select_attention_inputs(
+        query, key, value, block_table, selected_kv_indices,
+        num_heads, num_key_value_heads, block_size);
     at::Tensor output = at::empty_like(query);
 
     EXEC_NPU_CMD(
@@ -72,6 +141,12 @@ at::Tensor &npu_paged_select_attention_out(
     int64_t block_size,
     at::Tensor &output)
 {
+    check_paged_select_attention_inputs(
+        query, key, value, block_table, selected_kv_indices,
+        num_heads, num_key_value_heads, block_size);
+    TORCH_CHECK(output.sizes() == query.sizes(),
+        "npu_paged_select_attention_out: output shape must equal query shape (got ",
+        output.sizes(), " vs ", query.sizes(), ").");
     EXEC_NPU_CMD(
         aclnnPagedSelectAttention,
         query,
@@ -103,6 +178,12 @@ at::Tensor npu_paged_select_attention_get_workspace(
     int64_t block_size,
     const at::Tensor &output)
 {
+    check_paged_select_attention_inputs(
+        query, key, value, block_table, selected_kv_indices,
+        num_heads, num_key_value_heads, block_size);
+    TORCH_CHECK(output.sizes() == query.sizes(),
+        "npu_paged_select_attention_get_workspace: output shape must equal query shape (got ",
+        output.sizes(), " vs ", query.sizes(), ").");
     static const auto getWorkspaceSizeFuncAddr =
         GetOpApiFuncAddr("aclnnPagedSelectAttentionGetWorkspaceSize");
     static const auto initMemAddr = GetOpApiFuncAddr("InitHugeMemThreadLocal");
@@ -174,6 +255,12 @@ at::Tensor &npu_paged_select_attention_graph_out(
     const at::Tensor &workspace,
     at::Tensor &output)
 {
+    check_paged_select_attention_inputs(
+        query, key, value, block_table, selected_kv_indices,
+        num_heads, num_key_value_heads, block_size);
+    TORCH_CHECK(output.sizes() == query.sizes(),
+        "npu_paged_select_attention_graph_out: output shape must equal query shape (got ",
+        output.sizes(), " vs ", query.sizes(), ").");
     static const auto getWorkspaceSizeFuncAddr =
         GetOpApiFuncAddr("aclnnPagedSelectAttentionGetWorkspaceSize");
     static const auto opApiFuncAddr = GetOpApiFuncAddr("aclnnPagedSelectAttention");

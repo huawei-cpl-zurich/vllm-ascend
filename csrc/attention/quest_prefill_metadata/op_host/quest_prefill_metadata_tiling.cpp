@@ -25,6 +25,8 @@ constexpr uint32_t METADATA_BLOCK_TABLES_INDEX = 4;
 constexpr uint32_t K_CACHE_DIM_NUM = 4;
 constexpr uint32_t TABLE_DIM_NUM = 2;
 constexpr uint32_t SEQ_LEN_DIM_NUM = 1;
+constexpr uint32_t QUEST_PAGE_SIZE = 128;
+constexpr uint32_t QUEST_HEAD_DIM = 128;
 constexpr uint32_t DIM_0 = 0;
 constexpr uint32_t DIM_1 = 1;
 constexpr uint32_t DIM_2 = 2;
@@ -88,6 +90,11 @@ static ge::graphStatus QuestPrefillMetadataTilingFunc(gert::TilingContext *conte
         static_cast<uint32_t>(block_tables_storage.GetDim(DIM_1));
     const uint32_t max_metadata_blocks_per_request =
         static_cast<uint32_t>(metadata_block_tables_storage.GetDim(DIM_1));
+
+    OPS_ERR_IF(block_size != QUEST_PAGE_SIZE || head_dim != QUEST_HEAD_DIM,
+               OPS_LOG_E(context->GetNodeName(),
+                         "QUEST prefill metadata requires block_size == 128 and head_dim == 128."),
+               return ge::GRAPH_FAILED);
 
     QuestPrefillMetadataTilingData tiling;
     tiling.set_batchSize(batch_size);

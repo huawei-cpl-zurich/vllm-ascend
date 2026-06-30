@@ -19,8 +19,14 @@ constexpr int32_t SINGLEBUFFER = 1;
 constexpr int32_t DOUBLEBUFFER = 2;
 constexpr int32_t BYTES_UB_BLOCK = 32;
 constexpr int32_t BYTES_DATA_BLOCK = 32;
-constexpr int32_t BF16_METADATA_REDUCE_CHUNK_TOKENS = 64;
+// Tokens reduced per FP32 cast chunk. A power of two (so ReducePageRows needs
+// no tail handling) and < block_size, so a 128-token page reduces in two
+// chunks, keeping the FP32 scratch tile small.
+constexpr int32_t METADATA_REDUCE_CHUNK_TOKENS = 64;
 constexpr uint64_t FP32_VECTOR_MASK = 64;
+// A metadata block stores the summaries of this many KV pages (one row per page).
+// It is numerically equal to the page size but is a distinct concept.
+constexpr int32_t PAGES_PER_METADATA_BLOCK = 128;
 
 inline __aicore__ int32_t ceilDiv(int32_t x, int32_t d) { return (x + d - 1) / d; }
 inline __aicore__ int32_t ceilDivMul(int32_t x, int32_t d) { return d * ((x + d - 1) / d); }
@@ -30,19 +36,13 @@ using namespace AscendC;
 // QuestPrefillMetadataTilingData is generated from the op_host tiling
 // definition. The kernel must not redeclare it locally.
 
-template <typename A, typename B>
-struct quest_is_same {
-    static constexpr bool value = false;
-};
-
-template <typename A>
-struct quest_is_same<A, A> {
-    static constexpr bool value = true;
-};
-
-template <typename StorageT, typename ComputeT>
+template <typename StorageT>
 class KernelQuestMetadata {
 public:
+    // Metadata reductions always run in FP32 regardless of the KV storage dtype
+    // (FP16 or BF16); the per-channel result is cast back to StorageT at the end.
+    using ComputeT = float;
+
     __aicore__ inline KernelQuestMetadata() {}
 
     __aicore__ void Init(
@@ -67,6 +67,15 @@ public:
         max_kv_blocks_per_request_ = max_kv_blocks_per_request;
         max_metadata_blocks_per_request_ = max_metadata_blocks_per_request;
 
+        // A key row (head_dim elements) occupies this many 32-byte data blocks,
+        // and consecutive tokens are inter_kv_head_stride_blocks_ apart in the
+        // KV cache because other KV heads sit between them.
+        head_dim_storage_blocks_ =
+            ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_DATA_BLOCK);
+        inter_kv_head_stride_blocks_ = ceilDiv(
+            (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
+            BYTES_DATA_BLOCK);
+
         k_cache_gm_.SetGlobalBuffer((__gm__ StorageT *)k_cache);
         block_tables_gm_.SetGlobalBuffer((__gm__ int32_t *)block_tables);
         refresh_start_seq_lens_gm_.SetGlobalBuffer((__gm__ int32_t *)refresh_start_seq_lens);
@@ -77,11 +86,9 @@ public:
 
         int32_t storage_tile_bytes =
             ceilDivMul(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_UB_BLOCK);
-        int32_t compute_rows = block_size_;
-        if constexpr (!quest_is_same<StorageT, ComputeT>::value) {
-            // Keep the BF16 FP32 scratch tile the same size as a full FP16 tile.
-            compute_rows = BF16_METADATA_REDUCE_CHUNK_TOKENS + 2;
-        }
+        // FP32 reduction scratch: two accumulator rows (max, min) plus one
+        // METADATA_REDUCE_CHUNK_TOKENS-token cast chunk.
+        int32_t compute_rows = METADATA_REDUCE_CHUNK_TOKENS + 2;
         int32_t work_tile_bytes =
             ceilDivMul(compute_rows * head_dim_ * static_cast<int32_t>(sizeof(ComputeT)), BYTES_UB_BLOCK);
         pipe_.InitBuffer(k_block_in_q_, DOUBLEBUFFER, storage_tile_bytes);
@@ -112,18 +119,18 @@ public:
             // do not refresh partial-page metadata here.
             int32_t start_page = start_len / block_size_;
             int32_t end_page = end_len / block_size_;
-            int32_t start_meta_block = start_page / block_size_;
-            int32_t end_meta_block = ceilDiv(end_page, block_size_);
+            int32_t start_meta_block = start_page / PAGES_PER_METADATA_BLOCK;
+            int32_t end_meta_block = ceilDiv(end_page, PAGES_PER_METADATA_BLOCK);
 
             for (int32_t meta_block = start_meta_block; meta_block < end_meta_block; meta_block++) {
-                int32_t meta_block_start_page = meta_block * block_size_;
+                int32_t meta_block_start_page = meta_block * PAGES_PER_METADATA_BLOCK;
                 int32_t first_page = start_page - meta_block_start_page;
                 if (first_page < 0) {
                     first_page = 0;
                 }
                 int32_t last_page = end_page - meta_block_start_page;
-                if (last_page > block_size_) {
-                    last_page = block_size_;
+                if (last_page > PAGES_PER_METADATA_BLOCK) {
+                    last_page = PAGES_PER_METADATA_BLOCK;
                 }
                 int32_t pages_to_refresh = last_page - first_page;
                 if (pages_to_refresh <= 0) {
@@ -145,11 +152,8 @@ public:
                     LocalTensor<StorageT> k_block_lt = k_block_in_q_.AllocTensor<StorageT>();
                     DataCopyParams gm_ub_cp;
                     gm_ub_cp.blockCount = tokens_to_reduce;
-                    gm_ub_cp.blockLen =
-                        ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_DATA_BLOCK);
-                    gm_ub_cp.srcStride = ceilDiv(
-                        (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
-                        BYTES_DATA_BLOCK);
+                    gm_ub_cp.blockLen = head_dim_storage_blocks_;
+                    gm_ub_cp.srcStride = inter_kv_head_stride_blocks_;
                     gm_ub_cp.dstStride = 0;
                     DataCopy(k_block_lt, k_cache_gm_[kv_block_offset_gm], gm_ub_cp);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
@@ -168,8 +172,8 @@ public:
 
                 int32_t rows_to_write = pages_to_refresh;
                 int32_t zero_rows = 0;
-                if (first_page == 0 && last_page < block_size_) {
-                    zero_rows = block_size_ - last_page;
+                if (first_page == 0 && last_page < PAGES_PER_METADATA_BLOCK) {
+                    zero_rows = PAGES_PER_METADATA_BLOCK - last_page;
                     Duplicate<StorageT>(
                         max_lt[pages_to_refresh * head_dim_],
                         static_cast<StorageT>(0),
@@ -186,19 +190,21 @@ public:
                 int32_t meta_block_id = metadata_block_tables_gm_.GetValue(
                     request_idx * max_metadata_blocks_per_request_ + meta_block);
                 int32_t meta_offset =
-                    (meta_block_id * block_size_ * num_kv_heads_ * head_dim_) +
+                    (meta_block_id * PAGES_PER_METADATA_BLOCK * num_kv_heads_ * head_dim_) +
                     first_page * num_kv_heads_ * head_dim_ + head_idx * head_dim_;
 
                 DataCopyParams ub_gm_cp;
                 ub_gm_cp.blockCount = rows_to_write;
-                ub_gm_cp.blockLen =
-                    ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_UB_BLOCK);
+                ub_gm_cp.blockLen = head_dim_storage_blocks_;
                 ub_gm_cp.srcStride = 0;
-                ub_gm_cp.dstStride = ceilDiv(
-                    (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
-                    BYTES_UB_BLOCK);
+                ub_gm_cp.dstStride = inter_kv_head_stride_blocks_;
                 DataCopy(maxblocks_gm_[meta_offset], max_lt, ub_gm_cp);
                 DataCopy(minblocks_gm_[meta_offset], min_lt, ub_gm_cp);
+                // max_lt/min_lt are single-buffered and reused by the next
+                // meta-block's reduce, so wait for these GM copies (MTE3) to
+                // finish reading them before those vector writes can start.
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
 
                 max_out_q_.FreeTensor(max_lt);
                 min_out_q_.FreeTensor(min_lt);
@@ -213,34 +219,20 @@ private:
         LocalTensor<StorageT> k_block_lt,
         int32_t tokens_to_reduce)
     {
-        if constexpr (quest_is_same<StorageT, ComputeT>::value) {
-            uint64_t mask = head_dim_;
-            CopyRepeatParams ub_ub_cp = {1, 1, 8, 8};
-            LocalTensor<ComputeT> work_lt = work_calc_buf_.Get<ComputeT>();
-            Copy(work_lt, k_block_lt, mask, tokens_to_reduce, ub_ub_cp);
-            ReduceTokenDim<ComputeT, isMax>(work_lt, tokens_to_reduce * head_dim_);
-            Copy(out_lt, work_lt, mask, 1, ub_ub_cp);
-        } else {
-            ReduceCastBlockToOutput<isMax>(out_lt, k_block_lt, tokens_to_reduce);
-        }
-    }
-
-    template <bool isMax>
-    __aicore__ inline void ReduceCastBlockToOutput(
-        LocalTensor<StorageT> out_lt,
-        LocalTensor<StorageT> k_block_lt,
-        int32_t tokens_to_reduce)
-    {
         LocalTensor<ComputeT> work_lt = work_calc_buf_.Get<ComputeT>();
         LocalTensor<ComputeT> acc_lt = work_lt[isMax ? 0 : head_dim_];
         LocalTensor<ComputeT> chunk_lt = work_lt[2 * head_dim_];
 
-        // BF16 chunks are reduced in FP32 and cast back to BF16 metadata rows.
+        // Reduce in FP32 regardless of the storage dtype: cast each chunk of
+        // tokens up to FP32, reduce it, and combine into the FP32 accumulator;
+        // cast the final per-channel result back to StorageT. For FP16 this is
+        // bit-identical to reducing in FP16 (Max/Min pick the same element and
+        // the exact value casts back losslessly) and it keeps BF16 accurate.
         for (int32_t token_offset = 0; token_offset < tokens_to_reduce;
-             token_offset += BF16_METADATA_REDUCE_CHUNK_TOKENS) {
+             token_offset += METADATA_REDUCE_CHUNK_TOKENS) {
             int32_t chunk_tokens = tokens_to_reduce - token_offset;
-            if (chunk_tokens > BF16_METADATA_REDUCE_CHUNK_TOKENS) {
-                chunk_tokens = BF16_METADATA_REDUCE_CHUNK_TOKENS;
+            if (chunk_tokens > METADATA_REDUCE_CHUNK_TOKENS) {
+                chunk_tokens = METADATA_REDUCE_CHUNK_TOKENS;
             }
 
             Cast(
@@ -249,10 +241,10 @@ private:
                 RoundMode::CAST_NONE,
                 chunk_tokens * head_dim_);
             AscendC::PipeBarrier<PIPE_V>();
-            ReduceTokenDim<ComputeT, isMax>(chunk_lt, chunk_tokens * head_dim_);
+            ReducePageRows<isMax>(chunk_lt, chunk_tokens);
 
             if (token_offset == 0) {
-                CopyRow<ComputeT>(acc_lt, chunk_lt);
+                CopyRow(acc_lt, chunk_lt);
             } else if (isMax) {
                 Max(acc_lt, acc_lt, chunk_lt, head_dim_);
             } else {
@@ -265,46 +257,29 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    template <typename ElementT>
-    __aicore__ inline void CopyRow(LocalTensor<ElementT> dst_lt, LocalTensor<ElementT> src_lt)
+    __aicore__ inline void CopyRow(LocalTensor<ComputeT> dst_lt, LocalTensor<ComputeT> src_lt)
     {
-        if constexpr (quest_is_same<ElementT, float>::value) {
-            uint64_t mask = FP32_VECTOR_MASK;
-            uint8_t repeats = static_cast<uint8_t>(head_dim_ / FP32_VECTOR_MASK);
-            Copy(dst_lt, src_lt, mask, repeats, {1, 1, 8, 8});
-        } else {
-            Copy(dst_lt, src_lt, head_dim_, 1, {1, 1, 8, 8});
-        }
+        uint64_t mask = FP32_VECTOR_MASK;
+        uint8_t repeats = static_cast<uint8_t>(head_dim_ / FP32_VECTOR_MASK);
+        Copy(dst_lt, src_lt, mask, repeats, {1, 1, 8, 8});
     }
 
-    template <typename ElementT, bool isMax>
-    __aicore__ inline void ReduceTokenDim(LocalTensor<ElementT> vec_lt, int32_t initial_length)
+    // Reduce `token_rows` rows of head_dim elements down to a single head_dim
+    // row, taking the per-channel Max (isMax) or Min across the rows. Fixed
+    // power-of-two halving stages -- token_rows must be a power of two (the
+    // METADATA_REDUCE_CHUNK_TOKENS-token cast chunk), so there is no tail
+    // handling and no scalar bookkeeping. Each stage reads what the previous
+    // stage wrote (in-place RAW), so a per-stage PipeBarrier is required.
+    template <bool isMax>
+    __aicore__ inline void ReducePageRows(LocalTensor<ComputeT> vec_lt, int32_t token_rows)
     {
-        if (initial_length != block_size_ * head_dim_) {
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-
-        int32_t len = initial_length;
-        while (len > head_dim_) {
-            int32_t num_vec = len / head_dim_;
-            int32_t pair_vec = num_vec >> 1;
-            int32_t has_tail = num_vec & 1;
-            int32_t reduce_len = pair_vec * head_dim_;
-
-            if (reduce_len > 0) {
-                if (isMax) {
-                    Max(vec_lt[0], vec_lt[0], vec_lt[reduce_len], reduce_len);
-                } else {
-                    Min(vec_lt[0], vec_lt[0], vec_lt[reduce_len], reduce_len);
-                }
+        for (int32_t half = token_rows >> 1; half > 0; half >>= 1) {
+            int32_t count = half * head_dim_;
+            if constexpr (isMax) {
+                Max(vec_lt[0], vec_lt[0], vec_lt[count], count);
+            } else {
+                Min(vec_lt[0], vec_lt[0], vec_lt[count], count);
             }
-
-            if (has_tail) {
-                CopyRow<ElementT>(vec_lt[reduce_len], vec_lt[(num_vec - 1) * head_dim_]);
-                reduce_len += head_dim_;
-            }
-
-            len = reduce_len;
             AscendC::PipeBarrier<PIPE_V>();
         }
     }
@@ -325,13 +300,15 @@ private:
 
     int32_t batch_size_;
     int32_t num_kv_heads_;
-    int32_t block_size_;
+    int32_t block_size_;  // tokens per KV page (k_cache dim 1, == 128)
     int32_t head_dim_;
     int32_t max_kv_blocks_per_request_;
     int32_t max_metadata_blocks_per_request_;
+    int32_t head_dim_storage_blocks_;
+    int32_t inter_kv_head_stride_blocks_;
 };
 
-template <typename StorageT, typename ComputeT>
+template <typename StorageT>
 __aicore__ inline void RunQuestPrefillMetadata(
     GM_ADDR k_cache,
     GM_ADDR block_tables,
@@ -342,7 +319,7 @@ __aicore__ inline void RunQuestPrefillMetadata(
     GM_ADDR minblocks,
     const QuestPrefillMetadataTilingData *tiling_data)
 {
-    KernelQuestMetadata<StorageT, ComputeT> op;
+    KernelQuestMetadata<StorageT> op;
     op.Init(
         k_cache,
         block_tables,
@@ -380,7 +357,7 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
     }
 
     if (tiling_data->dataType == QUEST_PREFILL_METADATA_DTYPE_FP16) {
-        RunQuestPrefillMetadata<half, half>(
+        RunQuestPrefillMetadata<half>(
             k_cache,
             block_tables,
             refresh_start_seq_lens,
@@ -393,7 +370,7 @@ extern "C" __global__ __aicore__ void quest_prefill_metadata(
     }
 
     if (tiling_data->dataType == QUEST_PREFILL_METADATA_DTYPE_BF16) {
-        RunQuestPrefillMetadata<bfloat16_t, float>(
+        RunQuestPrefillMetadata<bfloat16_t>(
             k_cache,
             block_tables,
             refresh_start_seq_lens,

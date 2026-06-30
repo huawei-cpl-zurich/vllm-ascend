@@ -492,6 +492,10 @@ class QuestDecodeMetadataManager:
             return QuestBatchMetadata()
 
         num_selected_blocks = min(self.topk_pages, block_table_width)
+        # The selection kernel requires k to be a multiple of 8. topk_pages is already a
+        # multiple of 8; this only rounds up when the block-table clamp lowered it. Rounding
+        # up is always safe -- selecting more pages never changes attention correctness.
+        num_selected_blocks = ((num_selected_blocks + 7) // 8) * 8
         if not self._meets_sparse_selection_ratio(seq_lens_cpu, num_reqs, num_selected_blocks):
             return QuestBatchMetadata()
 
