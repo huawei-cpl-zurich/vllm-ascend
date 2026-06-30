@@ -287,9 +287,8 @@ private:
     // row, taking the per-channel Max (isMax) or Min across the rows. Fixed
     // power-of-two halving stages -- token_rows must be a power of two (128 for
     // a full FP16 page, 64 for a BF16 chunk), so there is no tail handling and
-    // no scalar bookkeeping. Consecutive vector instructions on the same pipe
-    // are ordered by the hardware (as the FP16 Copy -> Max path already relies
-    // on), so no per-stage barrier is required.
+    // no scalar bookkeeping. Each stage reads what the previous stage wrote
+    // (in-place RAW), so a per-stage PipeBarrier is required for correctness.
     template <typename ElementT, bool isMax>
     __aicore__ inline void ReducePageRows(LocalTensor<ElementT> vec_lt, int32_t token_rows)
     {
@@ -300,6 +299,7 @@ private:
             } else {
                 Min(vec_lt[0], vec_lt[0], vec_lt[count], count);
             }
+            AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
