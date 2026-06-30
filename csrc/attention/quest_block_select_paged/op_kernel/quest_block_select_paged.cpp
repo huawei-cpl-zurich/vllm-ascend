@@ -11,17 +11,18 @@
 #include "kernel_operator.h"
 #include "quest_block_select_paged_tilingkey.h"
 
-#define BYTES_UB_BLOCK 32
-#define BYTES_DATA_BLOCK 32
-#define NUM_FLOAT_ELEMS_PER_VECTOR 64
-#define DIV_ROUNDUP(x, y) (((x) + (y)-1) / (y))
-#define DIV_ROUNDUP_MUL(bytes, bytes_per_block) (DIV_ROUNDUP(bytes, bytes_per_block) * (bytes_per_block))
-#define NUM_UB_BYTES(bytes) (DIV_ROUNDUP_MUL(bytes, BYTES_UB_BLOCK))
-#define NUM_DATA_BLOCKS(bytes) (DIV_ROUNDUP(bytes, BYTES_DATA_BLOCK))
-#define MIN(a, b) (((a) < (b)) ? (a) : (b))
-#define MINFLOAT -3.4028235e38f
-
+constexpr int32_t BYTES_UB_BLOCK = 32;
+constexpr int32_t BYTES_DATA_BLOCK = 32;
+constexpr int32_t NUM_FLOAT_ELEMS_PER_VECTOR = 64;
+constexpr int32_t QUEST_PAGE_SIZE = 128;  // tokens per KV page
+constexpr float QUEST_MIN_SCORE = -3.4028235e38f;
 constexpr uint32_t REGION_PROPOSAL_DATA_SIZE_FLOAT_V220 = 2;
+
+inline __aicore__ int32_t ceilDiv(int32_t x, int32_t d) { return (x + d - 1) / d; }
+inline __aicore__ int32_t ceilDivMul(int32_t x, int32_t d) { return d * ceilDiv(x, d); }
+inline __aicore__ int32_t alignUpUbBytes(int32_t bytes) { return ceilDivMul(bytes, BYTES_UB_BLOCK); }
+inline __aicore__ int32_t numDataBlocks(int32_t bytes) { return ceilDiv(bytes, BYTES_DATA_BLOCK); }
+inline __aicore__ int32_t minI32(int32_t a, int32_t b) { return a < b ? a : b; }
 
 using namespace AscendC;
 
@@ -38,7 +39,7 @@ __aicore__ inline void quest_apply_anchor_selection(
         return;
     }
 
-    int32_t num_selected_pages = MIN(k, valid_page_count);
+    int32_t num_selected_pages = minI32(k, valid_page_count);
     if (num_selected_pages <= 0) {
         return;
     }
@@ -82,7 +83,7 @@ __aicore__ inline void quest_apply_sequential_selection(
     int32_t valid_page_count,
     int32_t k)
 {
-    int32_t num_selected_pages = valid_page_count > 0 ? MIN(k, valid_page_count) : 0;
+    int32_t num_selected_pages = valid_page_count > 0 ? minI32(k, valid_page_count) : 0;
     for (int32_t idx = 0; idx < num_selected_pages; ++idx) {
         selected_indices_lt.SetValue(idx, static_cast<uint32_t>(idx));
     }
@@ -141,6 +142,15 @@ public:
         tokens_since_metadata_update_ = tokens_since_metadata_update;
         k_ = k;
 
+        // A metadata row (head_dim elements) spans this many 32-byte data blocks,
+        // and consecutive page rows are inter_kv_head_stride_blocks_ apart because
+        // other KV heads sit between them in the metadata layout.
+        head_dim_storage_blocks_ =
+            ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_DATA_BLOCK);
+        inter_kv_head_stride_blocks_ = ceilDiv(
+            (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
+            BYTES_DATA_BLOCK);
+
         query_gm_.SetGlobalBuffer((__gm__ StorageT *)query);
         maxblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)maxblocks);
         minblocks_gm_.SetGlobalBuffer((__gm__ StorageT *)minblocks);
@@ -149,31 +159,31 @@ public:
         selected_indices_gm_.SetGlobalBuffer((__gm__ uint32_t *)selected_indices);
 
         uint32_t input_storage_buf_size =
-            NUM_UB_BYTES(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
+            alignUpUbBytes(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
         pipe_.InitBuffer(input_storage_buf_, input_storage_buf_size);
 
         uint32_t query_buf_size =
-            NUM_UB_BYTES(head_dim_ * static_cast<int32_t>(sizeof(ComputeT)));
+            alignUpUbBytes(head_dim_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t block_buf_size =
-            NUM_UB_BYTES(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(ComputeT)));
+            alignUpUbBytes(block_size_ * head_dim_ * static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t reduced_buf_size =
-            NUM_UB_BYTES(block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t accumulated_scores_size = NUM_UB_BYTES(
+            alignUpUbBytes(block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
+        uint32_t accumulated_scores_size = alignUpUbBytes(
             max_metadata_blocks_per_request_ * block_size_ * static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t selected_indices_buf_size = NUM_UB_BYTES(k_ * static_cast<int32_t>(sizeof(uint32_t)));
+        uint32_t selected_indices_buf_size = alignUpUbBytes(k_ * static_cast<int32_t>(sizeof(uint32_t)));
         uint32_t selected_values_buf_size =
-            NUM_UB_BYTES(k_ * static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t tmp_concat_buf_size = NUM_UB_BYTES(
+            alignUpUbBytes(k_ * static_cast<int32_t>(sizeof(ComputeT)));
+        uint32_t tmp_concat_buf_size = alignUpUbBytes(
             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
             static_cast<int32_t>(sizeof(ComputeT)));
-        uint32_t concat_buf_size = NUM_UB_BYTES(
+        uint32_t concat_buf_size = alignUpUbBytes(
             (max_metadata_blocks_per_request_ * block_size_ +
              max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE) *
             static_cast<int32_t>(sizeof(ComputeT)));
         uint32_t index_local_buf_size =
-            NUM_UB_BYTES(max_metadata_blocks_per_request_ * block_size_ *
+            alignUpUbBytes(max_metadata_blocks_per_request_ * block_size_ *
                          static_cast<int32_t>(sizeof(uint32_t)));
-        uint32_t sort_tmp_buf_size = NUM_UB_BYTES(
+        uint32_t sort_tmp_buf_size = alignUpUbBytes(
             max_metadata_blocks_per_request_ * block_size_ * REGION_SIZE *
             static_cast<int32_t>(sizeof(ComputeT)));
 
@@ -208,7 +218,7 @@ public:
             int32_t output_offset = batch_head_idx * k_;
 
             int32_t seq_len = seq_lens_gm_.GetValue(batch_idx);
-            int32_t valid_page_count = seq_len > 0 ? DIV_ROUNDUP(seq_len, block_size_) : 0;
+            int32_t valid_page_count = seq_len > 0 ? ceilDiv(seq_len, QUEST_PAGE_SIZE) : 0;
             bool use_fixed_anchors = tokens_since_metadata_update_ >= 0;
             if (unlikely(valid_page_count <= 0 || (!use_fixed_anchors && k_ >= valid_page_count))) {
                 quest_apply_sequential_selection(
@@ -222,8 +232,8 @@ public:
                     valid_page_count,
                     k_);
             } else {
-                int32_t num_meta_blocks_in_request = DIV_ROUNDUP(valid_page_count, block_size_);
-                int32_t sort_element_count = DIV_ROUNDUP(valid_page_count, 32) * 32;
+                int32_t num_meta_blocks_in_request = ceilDiv(valid_page_count, block_size_);
+                int32_t sort_element_count = ceilDiv(valid_page_count, 32) * 32;
 
                 LoadQuery(tensors, query_offset);
                 DuplicateAccumulatedScores(tensors, sort_element_count);
@@ -260,7 +270,7 @@ public:
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
-            uint16_t indices_copy_block_len = NUM_DATA_BLOCKS(k_ * static_cast<int32_t>(sizeof(int32_t)));
+            uint16_t indices_copy_block_len = numDataBlocks(k_ * static_cast<int32_t>(sizeof(int32_t)));
             auto indices_copy_params = AscendC::DataCopyParams(1, indices_copy_block_len, 0, 0);
             AscendC::DataCopy(selected_indices_gm_[output_offset], tensors.selected_indices, indices_copy_params);
         }
@@ -288,7 +298,7 @@ private:
         int32_t query_offset)
     {
         uint16_t query_copy_block_len =
-            NUM_DATA_BLOCKS(head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
+            numDataBlocks(head_dim_ * static_cast<int32_t>(sizeof(StorageT)));
         auto query_copy_params = AscendC::DataCopyParams(1, query_copy_block_len, 0, 0);
 
         AscendC::LocalTensor<StorageT> input_storage_lt =
@@ -312,7 +322,7 @@ private:
     {
         AscendC::Duplicate(
             tensors.accumulated_scores,
-            static_cast<ComputeT>(MINFLOAT),
+            static_cast<ComputeT>(QUEST_MIN_SCORE),
             sort_element_count);
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -325,11 +335,8 @@ private:
             input_storage_buf_.Get<StorageT>(block_size_ * head_dim_);
         AscendC::DataCopyParams gm_ub_cp;
         gm_ub_cp.blockCount = block_size_;
-        gm_ub_cp.blockLen =
-            DIV_ROUNDUP(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_DATA_BLOCK);
-        gm_ub_cp.srcStride = DIV_ROUNDUP(
-            (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
-            BYTES_DATA_BLOCK);
+        gm_ub_cp.blockLen = head_dim_storage_blocks_;
+        gm_ub_cp.srcStride = inter_kv_head_stride_blocks_;
         gm_ub_cp.dstStride = 0;
 
         uint64_t mask = NUM_FLOAT_ELEMS_PER_VECTOR;
@@ -429,7 +436,7 @@ private:
         int32_t num_meta_blocks_in_request)
     {
         int32_t start_page = meta_block * block_size_;
-        int32_t pages_in_meta_block = MIN(valid_page_count - start_page, block_size_);
+        int32_t pages_in_meta_block = minI32(valid_page_count - start_page, block_size_);
         if (pages_in_meta_block <= 0) {
             return;
         }
@@ -448,7 +455,7 @@ private:
             AscendC::Copy(
                 tensors.accumulated_scores[accumulated_offset],
                 tensors.block_scores[block_scores_offset],
-                static_cast<uint64_t>(MIN(pages_remaining, NUM_FLOAT_ELEMS_PER_VECTOR)),
+                static_cast<uint64_t>(minI32(pages_remaining, NUM_FLOAT_ELEMS_PER_VECTOR)),
                 1,
                 {1, 1, 8, 8});
             if (meta_block < num_meta_blocks_in_request - 1) {
@@ -464,8 +471,8 @@ private:
             return;
         }
 
-        tensors.accumulated_scores.SetValue(0, static_cast<ComputeT>(MINFLOAT));
-        tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(MINFLOAT));
+        tensors.accumulated_scores.SetValue(0, static_cast<ComputeT>(QUEST_MIN_SCORE));
+        tensors.accumulated_scores.SetValue(valid_page_count - 1, static_cast<ComputeT>(QUEST_MIN_SCORE));
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -522,11 +529,13 @@ private:
     int32_t batch_size_;
     int32_t num_kv_heads_;
     int32_t num_heads_;
-    int32_t block_size_;
+    int32_t block_size_;  // page summaries per metadata block (maxblocks dim 1, == 128)
     int32_t head_dim_;
     int32_t max_metadata_blocks_per_request_;
     int32_t tokens_since_metadata_update_;
     int32_t k_;
+    int32_t head_dim_storage_blocks_;
+    int32_t inter_kv_head_stride_blocks_;
 };
 
 template <typename StorageT>

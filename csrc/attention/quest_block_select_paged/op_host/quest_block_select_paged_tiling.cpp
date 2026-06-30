@@ -31,6 +31,9 @@ constexpr uint32_t OUTPUT_DIM_NUM = 3;
 constexpr uint32_t DIM_0 = 0;
 constexpr uint32_t DIM_1 = 1;
 constexpr uint32_t DIM_2 = 2;
+constexpr int64_t QUEST_PAGE_SIZE = 128;
+constexpr int64_t QUEST_HEAD_DIM = 128;
+constexpr int64_t QUEST_SELECTED_BLOCKS_ALIGNMENT = 8;
 } // namespace
 
 static ge::graphStatus QuestBlockSelectPagedTilingFunc(gert::TilingContext *context)
@@ -90,6 +93,22 @@ static ge::graphStatus QuestBlockSelectPagedTilingFunc(gert::TilingContext *cont
     const int64_t *tokens_since_metadata_update =
         attrs->GetInt(ATTR_TOKENS_SINCE_METADATA_UPDATE_INDEX);
     OPS_LOG_E_IF_NULL(context, tokens_since_metadata_update, return ge::GRAPH_FAILED);
+
+    const int64_t block_size = maxblocks_storage.GetDim(DIM_1);
+    const int64_t head_dim = query_storage.GetDim(DIM_2);
+    const int64_t num_heads = query_storage.GetDim(DIM_1);
+    const int64_t num_kv_heads = maxblocks_storage.GetDim(DIM_2);
+    const int64_t k = selected_indices_storage.GetDim(DIM_2);
+    OPS_ERR_IF(block_size != QUEST_PAGE_SIZE || head_dim != QUEST_HEAD_DIM,
+               OPS_LOG_E(context->GetNodeName(),
+                         "QUEST block select requires block_size == 128 and head_dim == 128."),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF(num_kv_heads <= 0 || num_heads % num_kv_heads != 0,
+               OPS_LOG_E(context->GetNodeName(), "num_heads must be a positive multiple of num_kv_heads."),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF(k <= 0 || k % QUEST_SELECTED_BLOCKS_ALIGNMENT != 0,
+               OPS_LOG_E(context->GetNodeName(), "QUEST block select requires k to be a positive multiple of 8."),
+               return ge::GRAPH_FAILED);
 
     QuestBlockSelectPagedTilingData tiling;
     tiling.set_batchSize(static_cast<uint32_t>(query_storage.GetDim(DIM_0)));

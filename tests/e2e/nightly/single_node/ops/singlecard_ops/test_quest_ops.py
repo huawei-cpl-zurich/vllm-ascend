@@ -66,7 +66,8 @@ HEAD_DIM = 128
 # equal BLOCK_SIZE in the current layout, but it is a *distinct* concept and is
 # named separately on purpose (the kernels conflate the two today).
 PAGES_PER_METADATA_BLOCK = 128
-INDICES_PER_DATA_BLOCK = 8  # 32-byte data block / 4-byte int32
+# The selection kernel requires k (selected pages) to be a multiple of 8.
+QUEST_SELECTED_BLOCKS_ALIGNMENT = 8
 
 
 # ---------------------------------------------------------------------------
@@ -78,11 +79,6 @@ def _ceil_div(x: int, y: int) -> int:
 
 def _valid_page_count(seq_len: int) -> int:
     return _ceil_div(seq_len, BLOCK_SIZE) if seq_len > 0 else 0
-
-
-def _round_k(k: int) -> int:
-    """Round k up to the 8-int32 (32-byte) alignment the kernel writes with."""
-    return _ceil_div(k, INDICES_PER_DATA_BLOCK) * INDICES_PER_DATA_BLOCK
 
 
 def _meta_blocks_for(max_vpc: int) -> int:
@@ -296,16 +292,10 @@ def ascendc_block_select_out_exec(
     k: int,
     tokens_since_metadata_update: int,
 ) -> torch.Tensor:
-    """The ``_out`` variant.
-
-    The ``_out`` op requires the output's last dim be 8-int32 aligned, so we
-    allocate the rounded width and slice back to ``k`` -- exactly what the
-    functional variant does internally.
-    """
-    rounded_k = _round_k(k)
+    """The ``_out`` variant. ``k`` is a multiple of 8, so the output is allocated directly."""
     query_npu = query.npu()
     out = torch.empty(
-        (query.size(0), query.size(1), rounded_k),
+        (query.size(0), query.size(1), k),
         dtype=torch.int32,
         device=query_npu.device,
     )
@@ -319,7 +309,7 @@ def ascendc_block_select_out_exec(
         tokens_since_metadata_update,
     )
     torch.npu.synchronize()
-    return out[..., :k].cpu()
+    return out.cpu()
 
 
 # ===========================================================================
@@ -461,8 +451,8 @@ def _make_prefill_case(dtype, seed=0):
     )
 
 
-# A single rich batch covering: empty, 1 page, 2 pages, small (<k), the
-# round_k(k) > vpc corner (vpc=14), and a large multi-metadata-block request.
+# A single rich batch covering: empty, 1 page, 2 pages, small (< k), a
+# mid-size request (vpc=14), and a large multi-metadata-block request (vpc=131).
 _RICH_SEQ_LENS = [0, 100, 2 * BLOCK_SIZE, 5 * BLOCK_SIZE - 3, 14 * BLOCK_SIZE - 3, 131 * BLOCK_SIZE - 5]
 
 
@@ -630,7 +620,7 @@ def test_prefill_metadata_noop_when_end_le_start(dtype):
 # Tests: block selection
 # ===========================================================================
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("k", [2, 8, 9, 13, 16])
+@pytest.mark.parametrize("k", [8, 16, 24])
 @pytest.mark.parametrize("tokens_since_metadata_update", [-1, 0])
 @pytest.mark.parametrize("num_heads,num_kv_heads", [(4, 4), (4, 2), (8, 2)])
 @torch.inference_mode()
@@ -681,7 +671,7 @@ def test_block_select_uses_min_bound_for_negative_query(dtype, tokens_since_meta
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("k", [2, 8, 13])
+@pytest.mark.parametrize("k", [8, 16])
 @pytest.mark.parametrize("tokens_since_metadata_update", [-1, 0])
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 @torch.inference_mode()
@@ -742,12 +732,12 @@ def test_block_select_does_not_touch_inputs(dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_block_select_out_matches_functional(dtype):
-    """The ``_out`` and functional variants must agree for aligned/unaligned k."""
+    """The ``_out`` and functional variants must agree across k values."""
     query, maxblocks, minblocks, metadata_block_tables, seq_lens = _make_block_select_structured(
         dtype, _RICH_SEQ_LENS, num_heads=4, num_kv_heads=2, seed=3
     )
     try:
-        for k in (8, 9, 16):
+        for k in (8, 16, 24):
             functional = ascendc_block_select_exec(
                 query, maxblocks, minblocks, metadata_block_tables, seq_lens, k, 0
             )
@@ -755,6 +745,23 @@ def test_block_select_out_matches_functional(dtype):
                 query, maxblocks, minblocks, metadata_block_tables, seq_lens, k, 0
             )
             torch.testing.assert_close(out_variant, functional, rtol=0, atol=0)
+    finally:
+        _cleanup_npu()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("k", [1, 2, 9, 13])
+@torch.inference_mode()
+def test_block_select_rejects_unaligned_k(dtype, k):
+    """k must be a positive multiple of 8; the op rejects anything else."""
+    query, maxblocks, minblocks, metadata_block_tables, seq_lens = _make_block_select_random(
+        dtype, [3 * BLOCK_SIZE], num_heads=4, num_kv_heads=2, seed=0
+    )
+    try:
+        with pytest.raises(Exception):
+            ascendc_block_select_exec(
+                query, maxblocks, minblocks, metadata_block_tables, seq_lens, k, 0
+            )
     finally:
         _cleanup_npu()
 

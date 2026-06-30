@@ -21,6 +21,9 @@ constexpr int32_t BYTES_UB_BLOCK = 32;
 constexpr int32_t BYTES_DATA_BLOCK = 32;
 constexpr int32_t BF16_METADATA_REDUCE_CHUNK_TOKENS = 64;
 constexpr uint64_t FP32_VECTOR_MASK = 64;
+// A metadata block stores the summaries of this many KV pages (one row per page).
+// It is numerically equal to the page size but is a distinct concept.
+constexpr int32_t PAGES_PER_METADATA_BLOCK = 128;
 
 inline __aicore__ int32_t ceilDiv(int32_t x, int32_t d) { return (x + d - 1) / d; }
 inline __aicore__ int32_t ceilDivMul(int32_t x, int32_t d) { return d * ((x + d - 1) / d); }
@@ -67,6 +70,15 @@ public:
         max_kv_blocks_per_request_ = max_kv_blocks_per_request;
         max_metadata_blocks_per_request_ = max_metadata_blocks_per_request;
 
+        // A key row (head_dim elements) occupies this many 32-byte data blocks,
+        // and consecutive tokens are inter_kv_head_stride_blocks_ apart in the
+        // KV cache because other KV heads sit between them.
+        head_dim_storage_blocks_ =
+            ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_DATA_BLOCK);
+        inter_kv_head_stride_blocks_ = ceilDiv(
+            (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
+            BYTES_DATA_BLOCK);
+
         k_cache_gm_.SetGlobalBuffer((__gm__ StorageT *)k_cache);
         block_tables_gm_.SetGlobalBuffer((__gm__ int32_t *)block_tables);
         refresh_start_seq_lens_gm_.SetGlobalBuffer((__gm__ int32_t *)refresh_start_seq_lens);
@@ -112,18 +124,18 @@ public:
             // do not refresh partial-page metadata here.
             int32_t start_page = start_len / block_size_;
             int32_t end_page = end_len / block_size_;
-            int32_t start_meta_block = start_page / block_size_;
-            int32_t end_meta_block = ceilDiv(end_page, block_size_);
+            int32_t start_meta_block = start_page / PAGES_PER_METADATA_BLOCK;
+            int32_t end_meta_block = ceilDiv(end_page, PAGES_PER_METADATA_BLOCK);
 
             for (int32_t meta_block = start_meta_block; meta_block < end_meta_block; meta_block++) {
-                int32_t meta_block_start_page = meta_block * block_size_;
+                int32_t meta_block_start_page = meta_block * PAGES_PER_METADATA_BLOCK;
                 int32_t first_page = start_page - meta_block_start_page;
                 if (first_page < 0) {
                     first_page = 0;
                 }
                 int32_t last_page = end_page - meta_block_start_page;
-                if (last_page > block_size_) {
-                    last_page = block_size_;
+                if (last_page > PAGES_PER_METADATA_BLOCK) {
+                    last_page = PAGES_PER_METADATA_BLOCK;
                 }
                 int32_t pages_to_refresh = last_page - first_page;
                 if (pages_to_refresh <= 0) {
@@ -145,11 +157,8 @@ public:
                     LocalTensor<StorageT> k_block_lt = k_block_in_q_.AllocTensor<StorageT>();
                     DataCopyParams gm_ub_cp;
                     gm_ub_cp.blockCount = tokens_to_reduce;
-                    gm_ub_cp.blockLen =
-                        ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_DATA_BLOCK);
-                    gm_ub_cp.srcStride = ceilDiv(
-                        (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
-                        BYTES_DATA_BLOCK);
+                    gm_ub_cp.blockLen = head_dim_storage_blocks_;
+                    gm_ub_cp.srcStride = inter_kv_head_stride_blocks_;
                     gm_ub_cp.dstStride = 0;
                     DataCopy(k_block_lt, k_cache_gm_[kv_block_offset_gm], gm_ub_cp);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
@@ -168,8 +177,8 @@ public:
 
                 int32_t rows_to_write = pages_to_refresh;
                 int32_t zero_rows = 0;
-                if (first_page == 0 && last_page < block_size_) {
-                    zero_rows = block_size_ - last_page;
+                if (first_page == 0 && last_page < PAGES_PER_METADATA_BLOCK) {
+                    zero_rows = PAGES_PER_METADATA_BLOCK - last_page;
                     Duplicate<StorageT>(
                         max_lt[pages_to_refresh * head_dim_],
                         static_cast<StorageT>(0),
@@ -186,17 +195,14 @@ public:
                 int32_t meta_block_id = metadata_block_tables_gm_.GetValue(
                     request_idx * max_metadata_blocks_per_request_ + meta_block);
                 int32_t meta_offset =
-                    (meta_block_id * block_size_ * num_kv_heads_ * head_dim_) +
+                    (meta_block_id * PAGES_PER_METADATA_BLOCK * num_kv_heads_ * head_dim_) +
                     first_page * num_kv_heads_ * head_dim_ + head_idx * head_dim_;
 
                 DataCopyParams ub_gm_cp;
                 ub_gm_cp.blockCount = rows_to_write;
-                ub_gm_cp.blockLen =
-                    ceilDiv(head_dim_ * static_cast<int32_t>(sizeof(StorageT)), BYTES_UB_BLOCK);
+                ub_gm_cp.blockLen = head_dim_storage_blocks_;
                 ub_gm_cp.srcStride = 0;
-                ub_gm_cp.dstStride = ceilDiv(
-                    (num_kv_heads_ - 1) * head_dim_ * static_cast<int32_t>(sizeof(StorageT)),
-                    BYTES_UB_BLOCK);
+                ub_gm_cp.dstStride = inter_kv_head_stride_blocks_;
                 DataCopy(maxblocks_gm_[meta_offset], max_lt, ub_gm_cp);
                 DataCopy(minblocks_gm_[meta_offset], min_lt, ub_gm_cp);
 
@@ -325,10 +331,12 @@ private:
 
     int32_t batch_size_;
     int32_t num_kv_heads_;
-    int32_t block_size_;
+    int32_t block_size_;  // tokens per KV page (k_cache dim 1, == 128)
     int32_t head_dim_;
     int32_t max_kv_blocks_per_request_;
     int32_t max_metadata_blocks_per_request_;
+    int32_t head_dim_storage_blocks_;
+    int32_t inter_kv_head_stride_blocks_;
 };
 
 template <typename StorageT, typename ComputeT>
