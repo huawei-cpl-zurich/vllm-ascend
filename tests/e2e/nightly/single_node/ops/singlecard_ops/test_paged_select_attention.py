@@ -567,3 +567,129 @@ def test_out_matches_functional(dtype):
         torch.testing.assert_close(out_variant, functional, rtol=0, atol=0)
     finally:
         _cleanup_npu()
+
+
+# ===========================================================================
+# Tests: host-side input validation (the wrapper's TORCH_CHECK contract)
+# ===========================================================================
+# The kernel-facing rank-3 cache layout: [num_blocks, block_size, num_kv_heads * head_dim].
+def _valid_validation_inputs() -> dict:
+    """A minimal, fully-valid call.  Negative tests mutate exactly one field."""
+    gen = torch.Generator().manual_seed(0)
+    batch, num_heads, num_kv_heads, k, vpc = 2, 4, 2, 8, 8
+    num_kv_blocks = 32
+    key4d, value4d = _build_paged_cache(num_kv_blocks, num_kv_heads, torch.float16, gen)
+    block_table = _disjoint_block_table(batch, vpc, num_kv_blocks, gen)
+    query = torch.randn((batch, num_heads, HEAD_DIM), generator=gen, dtype=torch.float32).to(torch.float16)
+    selected = torch.zeros((batch, num_heads, k), dtype=torch.int32)
+    selected[:, :] = torch.arange(k, dtype=torch.int32)  # pages 0..k-1 < vpc
+    return dict(
+        query=query,
+        key=_as_3d_cache(key4d),
+        value=_as_3d_cache(value4d),
+        asl_q=_cumulative_q_lengths(batch),
+        asl_kv=[vpc * BLOCK_SIZE] * batch,
+        block_table=block_table,
+        selected=selected,
+        num_heads=num_heads,
+        scale=0.1,
+        num_kv_heads=num_kv_heads,
+        block_size=BLOCK_SIZE,
+    )
+
+
+def _call_raw(d: dict) -> torch.Tensor:
+    out = torch.ops._C_ascend.npu_paged_select_attention(
+        d["query"].npu(),
+        d["key"].npu(),
+        d["value"].npu(),
+        d["asl_q"],
+        d["asl_kv"],
+        d["block_table"].npu(),
+        d["selected"].npu(),
+        d["num_heads"],
+        d["scale"],
+        d["num_kv_heads"],
+        d["block_size"],
+    )
+    torch.npu.synchronize()
+    return out.cpu()
+
+
+@torch.inference_mode()
+def test_validation_accepts_valid_baseline():
+    """The baseline the negative tests mutate must itself be accepted and run."""
+    d = _valid_validation_inputs()
+    try:
+        out = _call_raw(d)
+        assert out.shape == d["query"].shape
+    finally:
+        _cleanup_npu()
+
+
+@torch.inference_mode()
+def test_rejects_non_divisible_head_counts():
+    d = _valid_validation_inputs()
+    d["num_kv_heads"] = 3  # 4 % 3 != 0
+    try:
+        with pytest.raises(Exception):
+            _call_raw(d)
+    finally:
+        _cleanup_npu()
+
+
+@torch.inference_mode()
+def test_rejects_head_count_mismatch():
+    d = _valid_validation_inputs()
+    d["num_heads"] = 8  # query/selected carry 4 heads
+    try:
+        with pytest.raises(Exception):
+            _call_raw(d)
+    finally:
+        _cleanup_npu()
+
+
+@torch.inference_mode()
+def test_rejects_dtype_mismatch():
+    d = _valid_validation_inputs()
+    d["key"] = d["key"].to(torch.bfloat16)  # query stays fp16
+    try:
+        with pytest.raises(Exception):
+            _call_raw(d)
+    finally:
+        _cleanup_npu()
+
+
+@torch.inference_mode()
+def test_rejects_non_int32_selected_indices():
+    d = _valid_validation_inputs()
+    d["selected"] = d["selected"].to(torch.int64)
+    try:
+        with pytest.raises(Exception):
+            _call_raw(d)
+    finally:
+        _cleanup_npu()
+
+
+@torch.inference_mode()
+def test_rejects_wrong_query_rank():
+    d = _valid_validation_inputs()
+    q = d["query"]
+    d["query"] = q.reshape(q.shape[0], q.shape[1] * q.shape[2])  # rank-2
+    try:
+        with pytest.raises(Exception):
+            _call_raw(d)
+    finally:
+        _cleanup_npu()
+
+
+@torch.inference_mode()
+def test_rejects_mismatched_kv_width():
+    d = _valid_validation_inputs()
+    # key/value width must be num_kv_heads * head_dim; truncate one head_dim slab.
+    d["key"] = d["key"][:, :, :-HEAD_DIM].contiguous()
+    try:
+        with pytest.raises(Exception):
+            _call_raw(d)
+    finally:
+        _cleanup_npu()
