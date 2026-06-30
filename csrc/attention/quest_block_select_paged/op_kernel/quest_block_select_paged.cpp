@@ -41,11 +41,16 @@ __aicore__ inline void quest_apply_sequential_selection(
     int32_t k)
 {
     int32_t num_selected_pages = valid_page_count > 0 ? minI32(k, valid_page_count) : 0;
-    for (int32_t idx = 0; idx < num_selected_pages; ++idx) {
-        selected_indices_lt.SetValue(idx, static_cast<uint32_t>(idx));
-    }
-    for (int32_t idx = num_selected_pages; idx < k; ++idx) {
-        selected_indices_lt.SetValue(idx, 0U);
+    // Zero all k output slots, then write the page-index ramp
+    // [0, 1, ..., num_selected_pages - 1] over the valid prefix. Both vector ops
+    // start at offset 0 so they stay 32-byte aligned (the tail offset is not
+    // generally aligned). This replaces the per-element scalar SetValue loops.
+    AscendC::LocalTensor<int32_t> indices = selected_indices_lt.ReinterpretCast<int32_t>();
+    AscendC::Duplicate(indices, static_cast<int32_t>(0), k);
+    if (num_selected_pages > 0) {
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Arange<int32_t>(
+            indices, static_cast<int32_t>(0), static_cast<int32_t>(1), num_selected_pages);
     }
 }
 
@@ -208,6 +213,11 @@ public:
             uint16_t indices_copy_block_len = numDataBlocks(k_ * static_cast<int32_t>(sizeof(int32_t)));
             auto indices_copy_params = AscendC::DataCopyParams(1, indices_copy_block_len, 0, 0);
             AscendC::DataCopy(selected_indices_gm_[output_offset], tensors.selected_indices, indices_copy_params);
+            // selected_indices (UB) is reused by the next iteration's vector
+            // writes (Duplicate/Arange or GatherMask), so wait for this GM copy
+            // (MTE3) to finish reading it before those writes can start.
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
         }
     }
 
