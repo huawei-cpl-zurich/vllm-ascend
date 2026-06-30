@@ -346,9 +346,7 @@ def assert_selection_exact(actual, expected, seq_lens, k, use_fixed_anchors):
                 # Only [0, vpc) is consumed by paged_select_attention (it bounds
                 # its loop by the kv seq length); the trailing slots are unused
                 # tail and not necessarily zero. The consumed prefix is the ramp.
-                assert a[:vpc] == e[:vpc], (
-                    f"k>=vpc prefix mismatch (b={b}, h={h}): {a[:vpc]} != {e[:vpc]}"
-                )
+                assert a[:vpc] == e[:vpc], f"k>=vpc prefix mismatch (b={b}, h={h}): {a[:vpc]} != {e[:vpc]}"
                 continue
             a_sel, e_sel = a[:k], e[:k]
             anchors = _anchors_for(vpc, use_fixed_anchors)
@@ -356,9 +354,7 @@ def assert_selection_exact(actual, expected, seq_lens, k, use_fixed_anchors):
                 assert anchor in a_sel, f"missing anchor {anchor} (b={b}, h={h}): {a_sel}"
             a_interior = [p for p in a_sel if p not in anchors]
             e_interior = [p for p in e_sel if p not in anchors]
-            assert a_interior == e_interior, (
-                f"interior order mismatch (b={b}, h={h}): {a_interior} != {e_interior}"
-            )
+            assert a_interior == e_interior, f"interior order mismatch (b={b}, h={h}): {a_interior} != {e_interior}"
 
 
 def assert_selection_valid(actual, scores, seq_lens, k, use_fixed_anchors, tol=1e-2):
@@ -375,14 +371,10 @@ def assert_selection_valid(actual, scores, seq_lens, k, use_fixed_anchors, tol=1
 
             for idx in selected:
                 assert 0 <= idx < vpc, f"index {idx} out of range [0,{vpc}) (b={b}, h={h})"
-            assert len(set(selected)) == len(selected), (
-                f"duplicate selected pages (b={b}, h={h}): {selected}"
-            )
+            assert len(set(selected)) == len(selected), f"duplicate selected pages (b={b}, h={h}): {selected}"
 
             if k >= vpc:
-                assert set(selected) == set(range(vpc)), (
-                    f"k>=vpc must select every page (b={b}, h={h}): {selected}"
-                )
+                assert set(selected) == set(range(vpc)), f"k>=vpc must select every page (b={b}, h={h}): {selected}"
                 continue
 
             anchors = _anchors_for(vpc, use_fixed_anchors)
@@ -425,9 +417,7 @@ def _make_prefill_case(dtype, seed=0):
     num_kv_blocks = 1024
     num_metadata_blocks = batch_size * num_meta_blocks_per_req
 
-    k_cache = torch.randn(
-        (num_kv_blocks, BLOCK_SIZE, num_kv_heads, HEAD_DIM), generator=g, dtype=dtype
-    )
+    k_cache = torch.randn((num_kv_blocks, BLOCK_SIZE, num_kv_heads, HEAD_DIM), generator=g, dtype=dtype)
 
     # Disjoint, shuffled physical kv-block ids per request.
     block_tables = torch.empty((batch_size, max_pages), dtype=torch.int32)
@@ -436,9 +426,7 @@ def _make_prefill_case(dtype, seed=0):
 
     metadata_block_tables = _identity_metadata_block_tables(batch_size, num_meta_blocks_per_req)
 
-    refresh_start_seq_lens = torch.tensor(
-        [0, 3 * BLOCK_SIZE + 40, 7 * BLOCK_SIZE, 9 * BLOCK_SIZE], dtype=torch.int32
-    )
+    refresh_start_seq_lens = torch.tensor([0, 3 * BLOCK_SIZE + 40, 7 * BLOCK_SIZE, 9 * BLOCK_SIZE], dtype=torch.int32)
     refresh_end_seq_lens = torch.tensor(
         [130 * BLOCK_SIZE + 41, 132 * BLOCK_SIZE + 5, 7 * BLOCK_SIZE, 10 * BLOCK_SIZE],
         dtype=torch.int32,
@@ -502,7 +490,7 @@ def _make_block_select_structured(dtype, seq_lens_list, num_heads, num_kv_heads,
                 mid = int(metadata_block_tables[b, meta_block].item())
                 if negative_q:
                     # q=-1: score = max(-max0, -min0); make min0 the discriminator.
-                    maxblocks[mid, page_offset, kv_head, 0] = 10 ** 4
+                    maxblocks[mid, page_offset, kv_head, 0] = 10**4
                     minblocks[mid, page_offset, kv_head, 0] = -score
                 else:
                     maxblocks[mid, page_offset, kv_head, 0] = score
@@ -614,8 +602,13 @@ def test_prefill_metadata_noop_when_end_le_start(dtype):
     minblocks = torch.randn(shape, generator=g, dtype=dtype)
     try:
         actual_max, actual_min = ascendc_prefill_metadata_exec(
-            k_cache, block_tables, refresh_start_seq_lens, refresh_end_seq_lens,
-            metadata_block_tables, maxblocks, minblocks,
+            k_cache,
+            block_tables,
+            refresh_start_seq_lens,
+            refresh_end_seq_lens,
+            metadata_block_tables,
+            maxblocks,
+            minblocks,
         )
         torch.testing.assert_close(actual_max, maxblocks, rtol=0, atol=0)
         torch.testing.assert_close(actual_min, minblocks, rtol=0, atol=0)
@@ -720,8 +713,7 @@ def test_block_select_does_not_touch_inputs(dtype):
     query, maxblocks, minblocks, metadata_block_tables, seq_lens = _make_block_select_random(
         dtype, _RICH_SEQ_LENS, num_heads=4, num_kv_heads=2, seed=5
     )
-    saved = (query.clone(), maxblocks.clone(), minblocks.clone(),
-             metadata_block_tables.clone(), seq_lens.clone())
+    saved = (query.clone(), maxblocks.clone(), minblocks.clone(), metadata_block_tables.clone(), seq_lens.clone())
     try:
         q_npu, max_npu, min_npu = query.npu(), maxblocks.npu(), minblocks.npu()
         mbt_npu, sl_npu = metadata_block_tables.npu(), seq_lens.npu()
@@ -745,9 +737,7 @@ def test_block_select_out_matches_functional(dtype):
     )
     try:
         for k in (8, 16, 24):
-            functional = ascendc_block_select_exec(
-                query, maxblocks, minblocks, metadata_block_tables, seq_lens, k, 0
-            )
+            functional = ascendc_block_select_exec(query, maxblocks, minblocks, metadata_block_tables, seq_lens, k, 0)
             out_variant = ascendc_block_select_out_exec(
                 query, maxblocks, minblocks, metadata_block_tables, seq_lens, k, 0
             )
@@ -766,9 +756,7 @@ def test_block_select_rejects_unaligned_k(dtype, k):
     )
     try:
         with pytest.raises(Exception):
-            ascendc_block_select_exec(
-                query, maxblocks, minblocks, metadata_block_tables, seq_lens, k, 0
-            )
+            ascendc_block_select_exec(query, maxblocks, minblocks, metadata_block_tables, seq_lens, k, 0)
     finally:
         _cleanup_npu()
 
@@ -811,15 +799,25 @@ def test_prefill_then_select_end_to_end(dtype, tokens_since_metadata_update):
 
     # CPU golden pipeline.
     exp_max, exp_min = cpu_quest_prefill_metadata(
-        k_cache, block_tables, refresh_start_seq_lens, refresh_end_seq_lens,
-        metadata_block_tables, maxblocks, minblocks,
+        k_cache,
+        block_tables,
+        refresh_start_seq_lens,
+        refresh_end_seq_lens,
+        metadata_block_tables,
+        maxblocks,
+        minblocks,
     )
     cpu_scores = cpu_page_scores(query, exp_max, exp_min, metadata_block_tables, seq_lens)
     try:
         # NPU pipeline: metadata kernel feeds the selection kernel.
         npu_max, npu_min = ascendc_prefill_metadata_exec(
-            k_cache, block_tables, refresh_start_seq_lens, refresh_end_seq_lens,
-            metadata_block_tables, maxblocks, minblocks,
+            k_cache,
+            block_tables,
+            refresh_start_seq_lens,
+            refresh_end_seq_lens,
+            metadata_block_tables,
+            maxblocks,
+            minblocks,
         )
         assert_metadata_equal(npu_max, npu_min, exp_max, exp_min)
         actual = ascendc_block_select_exec(

@@ -187,8 +187,16 @@ def cpu_dense_attention(
     for b, vpc in enumerate(vpc_list):
         all_pages[b, :, :vpc] = torch.arange(vpc, dtype=torch.int32)
     return cpu_paged_select_attention(
-        query, key, value, actual_seq_lengths_kv, block_table, all_pages,
-        num_heads, scale_value, num_kv_heads, block_size,
+        query,
+        key,
+        value,
+        actual_seq_lengths_kv,
+        block_table,
+        all_pages,
+        num_heads,
+        scale_value,
+        num_kv_heads,
+        block_size,
     )
 
 
@@ -202,8 +210,17 @@ def _as_3d_cache(cache_4d: torch.Tensor) -> torch.Tensor:
 
 
 def ascendc_paged_select_attention_exec(
-    query, key, value, actual_seq_lengths, actual_seq_lengths_kv,
-    block_table, selected_kv_indices, num_heads, scale_value, num_kv_heads, block_size,
+    query,
+    key,
+    value,
+    actual_seq_lengths,
+    actual_seq_lengths_kv,
+    block_table,
+    selected_kv_indices,
+    num_heads,
+    scale_value,
+    num_kv_heads,
+    block_size,
 ) -> torch.Tensor:
     """Allocating variant -> returns ``[batch, num_heads, head_dim]``."""
     out = torch.ops._C_ascend.npu_paged_select_attention(
@@ -224,8 +241,17 @@ def ascendc_paged_select_attention_exec(
 
 
 def ascendc_paged_select_attention_out_exec(
-    query, key, value, actual_seq_lengths, actual_seq_lengths_kv,
-    block_table, selected_kv_indices, num_heads, scale_value, num_kv_heads, block_size,
+    query,
+    key,
+    value,
+    actual_seq_lengths,
+    actual_seq_lengths_kv,
+    block_table,
+    selected_kv_indices,
+    num_heads,
+    scale_value,
+    num_kv_heads,
+    block_size,
 ) -> torch.Tensor:
     """``_out`` variant -> writes into a pre-allocated tensor."""
     query_npu = query.npu()
@@ -312,8 +338,17 @@ def test_matches_reference(dtype, num_heads, num_kv_heads, k, scale):
     )
     try:
         actual = ascendc_paged_select_attention_exec(
-            query, key, value, asl_q, kv_seq_lens, block_table, selected,
-            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+            query,
+            key,
+            value,
+            asl_q,
+            kv_seq_lens,
+            block_table,
+            selected,
+            num_heads,
+            scale,
+            num_kv_heads,
+            BLOCK_SIZE,
         )
         assert actual.shape == query.shape
         torch.testing.assert_close(actual.to(torch.float32), expected, **_TOL[dtype])
@@ -351,8 +386,17 @@ def test_single_token_returns_its_value(dtype):
             expected[b, h] = value[phys, 0, h // group_size, :].to(torch.float32)
     try:
         actual = ascendc_paged_select_attention_exec(
-            query, key, value, _cumulative_q_lengths(batch_size), kv_seq_lens, block_table, selected,
-            num_heads, 0.1, num_kv_heads, BLOCK_SIZE,
+            query,
+            key,
+            value,
+            _cumulative_q_lengths(batch_size),
+            kv_seq_lens,
+            block_table,
+            selected,
+            num_heads,
+            0.1,
+            num_kv_heads,
+            BLOCK_SIZE,
         )
         torch.testing.assert_close(actual.to(torch.float32), expected, **_TOL[dtype])
     finally:
@@ -388,8 +432,17 @@ def test_uniform_keys_average_values_respecting_gqa(dtype):
             expected[b, h] = value[phys, :, h // group_size, :].to(torch.float32).mean(dim=0)
     try:
         actual = ascendc_paged_select_attention_exec(
-            query, key, value, _cumulative_q_lengths(batch_size), kv_seq_lens, block_table, selected,
-            num_heads, 1.0 / math.sqrt(HEAD_DIM), num_kv_heads, BLOCK_SIZE,
+            query,
+            key,
+            value,
+            _cumulative_q_lengths(batch_size),
+            kv_seq_lens,
+            block_table,
+            selected,
+            num_heads,
+            1.0 / math.sqrt(HEAD_DIM),
+            num_kv_heads,
+            BLOCK_SIZE,
         )
         torch.testing.assert_close(actual.to(torch.float32), expected, **_TOL[dtype])
     finally:
@@ -438,8 +491,17 @@ def test_attends_only_selected_pages(dtype):
     assert expected_sparse.min() > 4.0  # selecting only the +8 pages
     try:
         actual = ascendc_paged_select_attention_exec(
-            query, key, value, _cumulative_q_lengths(batch_size), kv_seq_lens, block_table, selected,
-            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+            query,
+            key,
+            value,
+            _cumulative_q_lengths(batch_size),
+            kv_seq_lens,
+            block_table,
+            selected,
+            num_heads,
+            scale,
+            num_kv_heads,
+            BLOCK_SIZE,
         )
         torch.testing.assert_close(actual.to(torch.float32), expected_sparse, **_TOL[dtype])
     finally:
@@ -480,12 +542,30 @@ def test_ignores_padding_beyond_effective_count(dtype):
     asl_q = _cumulative_q_lengths(batch_size)
     try:
         out_a = ascendc_paged_select_attention_exec(
-            query, key, value, asl_q, kv_seq_lens, block_table, sel_a,
-            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+            query,
+            key,
+            value,
+            asl_q,
+            kv_seq_lens,
+            block_table,
+            sel_a,
+            num_heads,
+            scale,
+            num_kv_heads,
+            BLOCK_SIZE,
         )
         out_b = ascendc_paged_select_attention_exec(
-            query, key, value, asl_q, kv_seq_lens, block_table, sel_b,
-            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+            query,
+            key,
+            value,
+            asl_q,
+            kv_seq_lens,
+            block_table,
+            sel_b,
+            num_heads,
+            scale,
+            num_kv_heads,
+            BLOCK_SIZE,
         )
         # Padding is never read -> identical effective input -> identical output.
         torch.testing.assert_close(out_a, out_b, rtol=0, atol=0)

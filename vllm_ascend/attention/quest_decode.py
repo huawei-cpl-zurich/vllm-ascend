@@ -622,10 +622,7 @@ class QuestDecodeMetadataManager:
         )
         valid_count = valid_mask.sum()
         avg_selected_ratio = selected_ratio.sum() / torch.clamp(valid_count, min=1)
-        return bool((
-            (valid_count > 0)
-            & (avg_selected_ratio < QUEST_SPARSE_SELECTED_BLOCK_RATIO_THRESHOLD)
-        ).item())
+        return bool(((valid_count > 0) & (avg_selected_ratio < QUEST_SPARSE_SELECTED_BLOCK_RATIO_THRESHOLD)).item())
 
 
 class QuestAttentionBackend(AscendAttentionBackend):
