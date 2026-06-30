@@ -202,9 +202,9 @@ public:
                 }
 
                 if (likely(use_fixed_anchors)) {
-                    // Anchors are inserted after sorting; mask their scores so
-                    // the remaining slots are selected only from interior pages.
-                    MaskAnchorScores(tensors, valid_page_count);
+                    // Pin the anchor pages (page 0 and the last page) to +inf so
+                    // they sort to the top and are always among the selected top-k.
+                    PinAnchorScores(tensors, valid_page_count);
                 }
                 SortAndExtract(tensors, sort_element_count);
             }
@@ -406,7 +406,7 @@ private:
         }
     }
 
-    __aicore__ inline void MaskAnchorScores(LocalTensors &tensors, int32_t valid_page_count)
+    __aicore__ inline void PinAnchorScores(LocalTensors &tensors, int32_t valid_page_count)
     {
         if (valid_page_count <= 0) {
             return;
@@ -431,13 +431,15 @@ private:
     {
         uint32_t repeat_times = sort_element_count / 32;
 
-        for (uint32_t idx = 0; idx < static_cast<uint32_t>(sort_element_count); idx++) {
-            tensors.index_local.SetValue(idx, idx);
-        }
-        // index_local is filled with scalar writes but consumed by the vector
-        // Sort below, so synchronize the scalar unit with the vector unit first.
-        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        // Build the [0, 1, 2, ...] page-index ramp with a vector op (Arange) so
+        // it is naturally ordered before the Sort that consumes it -- no
+        // scalar->vector sync needed. Arange has no uint32_t overload, but the
+        // int32_t bit pattern is identical for these in-range page indices.
+        AscendC::Arange<int32_t>(
+            tensors.index_local.template ReinterpretCast<int32_t>(),
+            static_cast<int32_t>(0),
+            static_cast<int32_t>(1),
+            sort_element_count);
 
         AscendC::Concat(
             tensors.concat,
