@@ -701,6 +701,52 @@ def test_ignores_selection_order_and_masks_correct_tail_page(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
+def test_full_page_selection_order_within_precision(dtype):
+    """Control for the tail-masking test: with no partial page, reordering the
+    selection must leave the output unchanged up to the flash-attention precision
+    floor.  This isolates finite-precision reorder noise (benign) from the
+    partial-tail masking the ordering test above exercises.
+    """
+    gen = torch.Generator().manual_seed(24)
+    batch_size, num_heads, num_kv_heads = 1, 2, 1
+    vpc = 5
+    kv_seq_lens = [vpc * BLOCK_SIZE]  # exact multiple -> every page full, no tail mask
+    num_kv_blocks = 32
+    key, value = _build_paged_cache(num_kv_blocks, num_kv_heads, dtype, gen)
+    block_table = _disjoint_block_table(batch_size, vpc, num_kv_blocks, gen)
+    query = torch.randn((batch_size, num_heads, HEAD_DIM), generator=gen, dtype=torch.float32).to(dtype)
+    k = 8
+
+    def _sel(order):
+        s = torch.zeros((batch_size, num_heads, k), dtype=torch.int32)
+        for h in range(num_heads):
+            s[0, h, :vpc] = torch.tensor(order, dtype=torch.int32)
+        return s
+
+    ascending = _sel([0, 1, 2, 3, 4])
+    shuffled = _sel([4, 2, 0, 3, 1])
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    expected = cpu_paged_select_attention(
+        query, key, value, kv_seq_lens, block_table, ascending, num_heads, scale, num_kv_heads, BLOCK_SIZE
+    )
+    asl_q = _cumulative_q_lengths(batch_size)
+    try:
+        out_asc = ascendc_paged_select_attention_exec(
+            query, key, value, asl_q, kv_seq_lens, block_table, ascending,
+            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+        )
+        out_shuf = ascendc_paged_select_attention_exec(
+            query, key, value, asl_q, kv_seq_lens, block_table, shuffled,
+            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+        )
+        torch.testing.assert_close(out_asc.to(torch.float32), expected, **_TOL[dtype])
+        torch.testing.assert_close(out_shuf.to(torch.float32), expected, **_TOL[dtype])
+    finally:
+        _cleanup_npu()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
 def test_mixed_effective_count_regimes_in_one_batch(dtype):
     """One call mixing a ``vpc < k`` request with a ``vpc >= k`` request.
 

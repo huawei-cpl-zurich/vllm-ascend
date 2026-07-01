@@ -89,6 +89,10 @@ namespace SplitFuse {
             bool useSparseDecode = false;
             uint32_t taskMaskType = 0;
             int64_t noSkipKvS = 0;
+            // Selection slot holding the partial tail page, or selectedBlockCount
+            // if the tail page was not selected. The sparse window visits this
+            // slot last so the length truncation masks the tail page's stale tokens.
+            uint32_t tailWindowSlot = 0;
         };
 
         // Methods
@@ -163,9 +167,11 @@ namespace SplitFuse {
             uint32_t tailLogicalBlock,
             uint32_t tailToken,
             uint32_t pagedBlockSize,
-            int64_t &sparseKvS)
+            int64_t &sparseKvS,
+            uint32_t &tailWindowSlot)
         {
             sparseKvS = 0;
+            tailWindowSlot = selectedBlockLimit;  // sentinel: tail page not selected
             // Step-3 narrowed contract: the third dimension of selected_kv_indices is
             // the full active row width. The kernel no longer discovers a shorter row
             // via negative sentinels in the hot path.
@@ -175,7 +181,12 @@ namespace SplitFuse {
                     (static_cast<uint32_t>(blockId) >= validLogicalBlockCount),
                     "selected_kv_indices sparse contract violation: logical page id rowBase=%llu idx=%u value=%d validBlocks=%u",
                     static_cast<unsigned long long>(selectedRowBase), i, blockId, validLogicalBlockCount);
-                sparseKvS += (static_cast<uint32_t>(blockId) == tailLogicalBlock) ? tailToken : pagedBlockSize;
+                if (static_cast<uint32_t>(blockId) == tailLogicalBlock) {
+                    tailWindowSlot = i;
+                    sparseKvS += tailToken;
+                } else {
+                    sparseKvS += pagedBlockSize;
+                }
             }
             return selectedBlockLimit;
         }
@@ -190,19 +201,33 @@ namespace SplitFuse {
             uint32_t validLogicalBlockCount,
             uint32_t numBlocks,
             uint32_t sparseBlockBase,
+            uint32_t tailWindowSlot,
             uint32_t *windowPhysicalIds,
             uint32_t &windowPhysicalCount)
         {
             windowPhysicalCount = 0;
             uint32_t skipCount = sparseBlockBase;
+            uint32_t lastSlot = (selectedBlockLimit > 0U) ? (selectedBlockLimit - 1U) : 0U;
             // selected_kv_indices provides the full logical-page row; block_table
             // performs the logical-to-physical remap for the narrowed sparse path.
+            // The attention length is truncated position-wise at the very end of the
+            // window, so the partial tail page must be visited last. Swap its slot
+            // with the final slot; otherwise the tail page's stale tokens would be
+            // attended and a full page would be wrongly truncated.
             for (uint32_t i = 0; i < selectedBlockLimit; ++i) {
-                int32_t blockId = gSelectedKvIndices.GetValue(selectedRowBase + i);
+                uint32_t slot = i;
+                if (tailWindowSlot < selectedBlockLimit) {
+                    if (i == tailWindowSlot) {
+                        slot = lastSlot;
+                    } else if (i == lastSlot) {
+                        slot = tailWindowSlot;
+                    }
+                }
+                int32_t blockId = gSelectedKvIndices.GetValue(selectedRowBase + slot);
                 FIA_HARD_FAIL_IF((blockId < 0) ||
                     (static_cast<uint32_t>(blockId) >= validLogicalBlockCount),
                     "selected_kv_indices sparse contract violation: logical page id rowBase=%llu idx=%u value=%d validBlocks=%u",
-                    static_cast<unsigned long long>(selectedRowBase), i, blockId, validLogicalBlockCount);
+                    static_cast<unsigned long long>(selectedRowBase), slot, blockId, validLogicalBlockCount);
                 if (skipCount > 0U) {
                     --skipCount;
                     continue;
@@ -214,7 +239,7 @@ namespace SplitFuse {
                 FIA_HARD_FAIL_IF((physicalBlockIdRaw < 0) ||
                     (static_cast<uint32_t>(physicalBlockIdRaw) >= numBlocks),
                     "selected_kv_indices sparse contract violation: physical block id rowBase=%llu idx=%u logicalBlock=%d value=%d numBlocks=%u",
-                    static_cast<unsigned long long>(selectedRowBase), i, blockId, physicalBlockIdRaw, numBlocks);
+                    static_cast<unsigned long long>(selectedRowBase), slot, blockId, physicalBlockIdRaw, numBlocks);
                 windowPhysicalIds[windowPhysicalCount++] = static_cast<uint32_t>(physicalBlockIdRaw);
             }
         }
@@ -282,6 +307,7 @@ namespace SplitFuse {
             sparseHeadState.useSparseDecode = false;
             sparseHeadState.taskMaskType = maskType;
             sparseHeadState.noSkipKvS = static_cast<int64_t>(kvSeqlen);
+            sparseHeadState.tailWindowSlot = 0;
         }
 
         __aicore__ inline
@@ -316,6 +342,7 @@ namespace SplitFuse {
             sparseHeadState.selectedRowBase =
                 GetSparseSelectedRowBase(curBatch, qHeads, headQNStartIdx, sparseKMax);
             int64_t sparseKvS = 0;
+            uint32_t tailWindowSlot = 0;
             sparseHeadState.selectedBlockCount = CountSparseSelectedBlocks(
                 gSelectedKvIndices,
                 sparseHeadState.selectedRowBase,
@@ -324,7 +351,9 @@ namespace SplitFuse {
                 sparseBatchBounds.tailLogicalBlock,
                 sparseBatchBounds.tailToken,
                 pagedBlockSize,
-                sparseKvS);
+                sparseKvS,
+                tailWindowSlot);
+            sparseHeadState.tailWindowSlot = tailWindowSlot;
             FIA_HARD_FAIL_IF((qSeqlen != 1U) || (qSBlockSize != 1U) || (headQNBlockSize != 1U),
                 "sparse decode task-shape invariant violated qSeqlen=%u qSBlockSize=%u qN=%u",
                 qSeqlen, qSBlockSize, headQNBlockSize);
@@ -368,6 +397,7 @@ namespace SplitFuse {
                 sparseHeadState.validLogicalBlockCount,
                 numBlocks,
                 sparseBlockBase,
+                sparseHeadState.tailWindowSlot,
                 windowPhysicalIds,
                 windowPhysicalCount);
         }
