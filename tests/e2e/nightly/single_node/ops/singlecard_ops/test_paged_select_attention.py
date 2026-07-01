@@ -649,6 +649,164 @@ def test_out_matches_functional(dtype):
         _cleanup_npu()
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_ignores_selection_order_and_masks_correct_tail_page(dtype):
+    """Selection order must not matter, and the partial page must be masked by id.
+
+    Every other test feeds pages in ascending order with the partial final page
+    last.  Here the same page *set* is fed in two orders, once with the partial
+    tail page (logical id ``vpc-1``) placed *first*.  Both must match the
+    reference: the kernel identifies the tail page by value (``kv_seqlen``), not
+    by its slot, and attention over a fixed set is order-independent.
+    """
+    gen = torch.Generator().manual_seed(21)
+    batch_size, num_heads, num_kv_heads = 1, 2, 1
+    vpc = 5
+    kv_seq_lens = [vpc * BLOCK_SIZE - 30]  # partial tail page: 98 valid tokens
+    num_kv_blocks = 32
+    key, value = _build_paged_cache(num_kv_blocks, num_kv_heads, dtype, gen)
+    block_table = _disjoint_block_table(batch_size, vpc, num_kv_blocks, gen)
+    query = torch.randn((batch_size, num_heads, HEAD_DIM), generator=gen, dtype=torch.float32).to(dtype)
+    k = 8  # > vpc -> padding slots; effective count == vpc == 5
+
+    def _sel(order):
+        s = torch.zeros((batch_size, num_heads, k), dtype=torch.int32)
+        for h in range(num_heads):
+            s[0, h, :vpc] = torch.tensor(order, dtype=torch.int32)
+        return s
+
+    ascending = _sel([0, 1, 2, 3, 4])  # tail page (4) last
+    shuffled = _sel([4, 2, 0, 3, 1])   # tail page (4) first, interior reordered
+
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    expected = cpu_paged_select_attention(
+        query, key, value, kv_seq_lens, block_table, ascending, num_heads, scale, num_kv_heads, BLOCK_SIZE
+    )
+    asl_q = _cumulative_q_lengths(batch_size)
+    try:
+        out_asc = ascendc_paged_select_attention_exec(
+            query, key, value, asl_q, kv_seq_lens, block_table, ascending,
+            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+        )
+        out_shuf = ascendc_paged_select_attention_exec(
+            query, key, value, asl_q, kv_seq_lens, block_table, shuffled,
+            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+        )
+        torch.testing.assert_close(out_asc.to(torch.float32), expected, **_TOL[dtype])
+        torch.testing.assert_close(out_shuf.to(torch.float32), expected, **_TOL[dtype])
+    finally:
+        _cleanup_npu()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_mixed_effective_count_regimes_in_one_batch(dtype):
+    """One call mixing a ``vpc < k`` request with a ``vpc >= k`` request.
+
+    Request 0 (``vpc = 3 < k``) must be bounded by ``vpc`` and ignore its
+    padding slots; request 1 (``vpc = 12 >= k``) is bounded by ``k``.  This
+    stresses the per-(batch, head) ``effectiveBlockCount = min(k, vpc)`` -- a
+    kernel using a single batch-wide bound would over-read request 0's padding.
+    """
+    gen = torch.Generator().manual_seed(22)
+    num_heads, num_kv_heads, k = 4, 2, 8
+    kv_seq_lens = [3 * BLOCK_SIZE, 12 * BLOCK_SIZE]  # vpc = 3 (< k) and 12 (>= k)
+    batch_size = len(kv_seq_lens)
+    width = max(_valid_page_count(s) for s in kv_seq_lens)
+    num_kv_blocks = batch_size * width + 16
+    key, value = _build_paged_cache(num_kv_blocks, num_kv_heads, dtype, gen)
+    block_table = _disjoint_block_table(batch_size, width, num_kv_blocks, gen)
+    query = torch.randn((batch_size, num_heads, HEAD_DIM), generator=gen, dtype=torch.float32).to(dtype)
+
+    selected = torch.zeros((batch_size, num_heads, k), dtype=torch.int32)
+    # Request 0: pages [0, 1, 2]; slots [3:8] stay 0 -> if wrongly read, page 0
+    # would be over-weighted and the output would diverge from the reference.
+    selected[0, :, :3] = torch.tensor([0, 1, 2], dtype=torch.int32)
+    # Request 1: 8 distinct pages out of 12.
+    for h in range(num_heads):
+        selected[1, h] = torch.tensor([0, 2, 3, 5, 7, 8, 10, 11], dtype=torch.int32)
+
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    expected = cpu_paged_select_attention(
+        query, key, value, kv_seq_lens, block_table, selected, num_heads, scale, num_kv_heads, BLOCK_SIZE
+    )
+    asl_q = _cumulative_q_lengths(batch_size)
+    try:
+        actual = ascendc_paged_select_attention_exec(
+            query, key, value, asl_q, kv_seq_lens, block_table, selected,
+            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+        )
+        torch.testing.assert_close(actual.to(torch.float32), expected, **_TOL[dtype])
+    finally:
+        _cleanup_npu()
+
+
+# ===========================================================================
+# Test: end-to-end integration (metadata -> selection -> sparse attention)
+# ===========================================================================
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_end_to_end_select_then_attention(dtype):
+    """Chain all three QUEST decode kernels through the real shared contract.
+
+    ``quest_prefill_metadata`` -> ``quest_block_select_paged`` -> this kernel.
+    The pages the selection kernel actually picks are fed straight into
+    attention *and* into the reference, so this validates that the selection
+    output (``[B, num_heads, k]`` int32 logical page ids) is consumed correctly
+    -- a layout/dtype/semantics drift between the kernels shows up here even
+    though the isolated tests would still pass.
+    """
+    gen = torch.Generator().manual_seed(123)
+    batch_size, num_heads, num_kv_heads, k = 2, 4, 2, 8
+    # vpc > k so selection runs its real top-k (sort) path; page-size multiples
+    # so every page is complete and gets fresh metadata.
+    kv_seq_lens = [10 * BLOCK_SIZE, 16 * BLOCK_SIZE]
+    width = max(_valid_page_count(s) for s in kv_seq_lens)
+    num_kv_blocks = batch_size * width + 16
+
+    key, value = _build_paged_cache(num_kv_blocks, num_kv_heads, dtype, gen)
+    block_table = _disjoint_block_table(batch_size, width, num_kv_blocks, gen)
+    query = torch.randn((batch_size, num_heads, HEAD_DIM), generator=gen, dtype=torch.float32).to(dtype)
+
+    # One metadata block per request (vpc <= 128).
+    metadata_block_tables = torch.arange(batch_size, dtype=torch.int32).view(batch_size, 1)
+    metadata_shape = (batch_size, BLOCK_SIZE, num_kv_heads, HEAD_DIM)
+    maxblocks = torch.zeros(metadata_shape, dtype=dtype)
+    minblocks = torch.zeros(metadata_shape, dtype=dtype)
+    seq_lens = torch.tensor(kv_seq_lens, dtype=torch.int32)
+    refresh_start = torch.zeros(batch_size, dtype=torch.int32)
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    asl_q = _cumulative_q_lengths(batch_size)
+    try:
+        # 1) refresh QUEST metadata (per-page min/max of the key cache).
+        max_npu, min_npu = maxblocks.npu(), minblocks.npu()
+        torch.ops._C_ascend.npu_quest_prefill_metadata(
+            key.npu(), block_table.npu(), refresh_start.npu(), seq_lens.npu(),
+            metadata_block_tables.npu(), max_npu, min_npu,
+        )
+        # 2) select the top-k pages per (request, query head).
+        selected = torch.ops._C_ascend.npu_quest_block_select_paged(
+            query.npu(), max_npu, min_npu, metadata_block_tables.npu(), seq_lens.npu(), k, 0
+        )
+        torch.npu.synchronize()
+        selected_cpu = selected.cpu()
+        assert selected_cpu.dtype == torch.int32
+        # 3) sparse attention over exactly those pages.
+        out = ascendc_paged_select_attention_exec(
+            query, key, value, asl_q, kv_seq_lens, block_table, selected_cpu,
+            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+        )
+        # Reference attends the SAME pages the selection kernel chose.
+        expected = cpu_paged_select_attention(
+            query, key, value, kv_seq_lens, block_table, selected_cpu,
+            num_heads, scale, num_kv_heads, BLOCK_SIZE,
+        )
+        torch.testing.assert_close(out.to(torch.float32), expected, **_TOL[dtype])
+    finally:
+        _cleanup_npu()
+
+
 # ===========================================================================
 # Tests: host-side input validation (the wrapper's TORCH_CHECK contract)
 # ===========================================================================

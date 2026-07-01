@@ -694,6 +694,42 @@ def test_block_select_random_invariants(dtype, k, tokens_since_metadata_update, 
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("tokens_since_metadata_update", [-1, 0])
+@torch.inference_mode()
+def test_block_select_tied_scores_return_distinct_pages(dtype, tokens_since_metadata_update):
+    """Uniform metadata -> every page ties on score.
+
+    The ``Sort`` tie-break must still yield ``k`` *distinct*, valid pages (plus
+    the anchors when enabled).  A colliding tie-break would resurface the
+    duplicate-page bug this suite exists to catch; random scores essentially
+    never produce an exact tie, so this is the case that pins it.
+    """
+    use_fixed_anchors = tokens_since_metadata_update >= 0
+    k = 8
+    seq_lens_list = [20 * BLOCK_SIZE, 9 * BLOCK_SIZE]  # vpc = 20, 9 (both > k)
+    batch_size = len(seq_lens_list)
+    num_heads, num_kv_heads = 4, 2
+    meta_blocks = _meta_blocks_for(max(_valid_page_count(s) for s in seq_lens_list))
+    metadata_shape = (batch_size * meta_blocks, BLOCK_SIZE, num_kv_heads, HEAD_DIM)
+    # Identical metadata for every page and channel -> identical QUEST score per
+    # (request, head), i.e. an exact tie across all pages.
+    maxblocks = torch.ones(metadata_shape, dtype=dtype)
+    minblocks = torch.ones(metadata_shape, dtype=dtype)
+    g = torch.Generator().manual_seed(4)
+    query = torch.randn((batch_size, num_heads, HEAD_DIM), generator=g, dtype=torch.float32).to(dtype)
+    metadata_block_tables = _identity_metadata_block_tables(batch_size, meta_blocks)
+    seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32)
+    scores = cpu_page_scores(query, maxblocks, minblocks, metadata_block_tables, seq_lens)
+    try:
+        actual = ascendc_block_select_exec(
+            query, maxblocks, minblocks, metadata_block_tables, seq_lens, k, tokens_since_metadata_update
+        )
+        assert_selection_valid(actual, scores, seq_lens, k, use_fixed_anchors)
+    finally:
+        _cleanup_npu()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_block_select_is_deterministic(dtype):
     query, maxblocks, minblocks, metadata_block_tables, seq_lens = _make_block_select_random(
