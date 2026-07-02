@@ -56,16 +56,8 @@ class AscendConfig:
         self.profiling_chunk_config = ProfilingChunkConfig(profiling_chunk_config)
         if self.profiling_chunk_config.enabled:
             max_batched = vllm_config.scheduler_config.max_num_batched_tokens
-            if max_batched < self.profiling_chunk_config.min_chunk:
-                logger.warning(
-                    "max_num_batched_tokens is smaller than profiling_chunk_config.min_chunk. "
-                    "max_num_batched_tokens=%d, min_chunk=%d. "
-                    "Clamping min_chunk to %d to avoid it being silently ignored.",
-                    max_batched,
-                    self.profiling_chunk_config.min_chunk,
-                    max_batched,
-                )
-                self.profiling_chunk_config.min_chunk = max_batched
+            cache_block_size = vllm_config.cache_config.block_size
+            self.profiling_chunk_config.resolve_runtime_defaults(max_batched, cache_block_size)
         if self.profiling_chunk_config.enabled and vllm_config.parallel_config.pipeline_parallel_size <= 1:
             raise ValueError(
                 "profiling_chunk_config requires pipeline parallelism (pp > 1). "
@@ -667,10 +659,10 @@ class WeightPrefetchConfig:
 
 
 class ProfilingChunkConfig:
-    """Configuration for profiling-based dynamic chunk sizing.
+    """Configuration for lookup-table dynamic chunked prefill.
 
-    When enabled, the scheduler profiles prefill latency during initialization
-    and uses a quadratic model to predict optimal chunk sizes at runtime.
+    When enabled, the scheduler loads or profiles a full-forward latency table
+    and uses bounded beam search to select discrete chunk sizes at runtime.
 
     Usage (online)::
 
@@ -685,25 +677,88 @@ class ProfilingChunkConfig:
         if config is None:
             config = {}
         self.enabled: bool = config.get("enabled", False)
+        self.profile_file: str | None = config.get("profile_file", None)
+        self.min_chunk: int = int(config.get("min_chunk", 1024))
+        max_chunk = config.get("max_chunk", None)
+        self.max_chunk: int | None = int(max_chunk) if max_chunk is not None else None
+        self.allowed_chunk_sizes: list[int] | None = self._parse_int_list(
+            config.get("allowed_chunk_sizes", None)
+        )
+        self.profile_num_history_points: int = int(config.get("profile_num_history_points", 33))
+        self.profile_repeats: int = int(config.get("profile_repeats", 3))
+        self.search_depth: int = int(config.get("search_depth", 6))
+        self.beam_width: int = int(config.get("beam_width", 16))
+        # Backward-compatible no-ops.  The lookup-table scheduler does not use
+        # smoothing or runtime timing state.
         self.smooth_factor: float = float(config.get("smooth_factor", 1.0))
-        self.min_chunk: int = int(config.get("min_chunk", 4096))
-        # Controls online history-aware calibration. When True, the model
-        # runner synchronizes the device each step to measure execution time
-        # and feeds it back for incremental refitting.  Automatically set to
-        # False once calibration completes.  Users can set it to False from
-        # the start to skip online calibration entirely and rely solely on
-        # the startup profiling model (avoids per-step sync overhead).
-        self.need_timing: bool = config.get("need_timing", self.enabled)
-        self.max_fit_chunk: int = int(config.get("max_fit_chunk", 30))
+        self.need_timing: bool = False
+        if "smooth_factor" in config:
+            logger.warning(
+                "profiling_chunk_config.smooth_factor is ignored by the "
+                "lookup-table scheduler."
+            )
+        if "need_timing" in config:
+            logger.warning(
+                "profiling_chunk_config.need_timing is ignored by the "
+                "lookup-table scheduler."
+            )
         self._validate()
 
+    @staticmethod
+    def _parse_int_list(value) -> list[int] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError("profiling_chunk_config.allowed_chunk_sizes must be a list of integers")
+        return [int(item) for item in value]
+
     def _validate(self):
-        if not (0 < self.smooth_factor <= 1.0):
-            raise ValueError(f"profiling_chunk_config.smooth_factor must be in (0, 1], got {self.smooth_factor}")
         if self.min_chunk <= 0:
             raise ValueError(f"profiling_chunk_config.min_chunk must be positive, got {self.min_chunk}")
-        if self.max_fit_chunk <= 5:
-            raise ValueError(f"Recommend to use at least 30 data points for fitting, got {self.max_fit_chunk}")
+        if self.max_chunk is not None and self.max_chunk < self.min_chunk:
+            raise ValueError(
+                "profiling_chunk_config.max_chunk must be >= min_chunk, "
+                f"got max_chunk={self.max_chunk}, min_chunk={self.min_chunk}"
+            )
+        if self.allowed_chunk_sizes is not None and any(chunk <= 0 for chunk in self.allowed_chunk_sizes):
+            raise ValueError("profiling_chunk_config.allowed_chunk_sizes must contain only positive integers")
+        if self.profile_num_history_points < 2:
+            raise ValueError(
+                "profiling_chunk_config.profile_num_history_points must be >= 2, "
+                f"got {self.profile_num_history_points}"
+            )
+        if self.profile_repeats < 1:
+            raise ValueError(
+                f"profiling_chunk_config.profile_repeats must be >= 1, got {self.profile_repeats}"
+            )
+        if self.search_depth < 1:
+            raise ValueError(f"profiling_chunk_config.search_depth must be >= 1, got {self.search_depth}")
+        if self.beam_width < 1:
+            raise ValueError(f"profiling_chunk_config.beam_width must be >= 1, got {self.beam_width}")
+
+    def resolve_runtime_defaults(self, max_num_batched_tokens: int, kv_cache_block_size: int) -> None:
+        if self.max_chunk is None:
+            self.max_chunk = max_num_batched_tokens
+        if self.max_chunk < self.min_chunk:
+            raise ValueError(
+                "profiling_chunk_config.max_chunk must be >= min_chunk, "
+                f"got max_chunk={self.max_chunk}, min_chunk={self.min_chunk}"
+            )
+
+        alignment = max(kv_cache_block_size, 64)
+        if self.allowed_chunk_sizes is None:
+            return
+        for chunk_size in self.allowed_chunk_sizes:
+            if chunk_size < self.min_chunk or chunk_size > self.max_chunk:
+                raise ValueError(
+                    "profiling_chunk_config.allowed_chunk_sizes entries must be "
+                    f"within [{self.min_chunk}, {self.max_chunk}], got {chunk_size}"
+                )
+            if chunk_size % alignment != 0:
+                raise ValueError(
+                    "profiling_chunk_config.allowed_chunk_sizes entries must be "
+                    f"aligned to {alignment}, got {chunk_size}"
+                )
 
 
 class RejectionSamplerConfig:
