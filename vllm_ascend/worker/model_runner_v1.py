@@ -21,6 +21,7 @@ import gc
 import logging
 import math
 import sys
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
