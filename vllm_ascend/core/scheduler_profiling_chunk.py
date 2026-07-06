@@ -14,11 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Scheduler subclass with lookup-table dynamic chunk sizing.
+"""Scheduler subclass with profile-guided cost-budget chunk sizing.
 
-Synced to the vLLM v0.23.0 ``Scheduler.schedule()``.  The body is a verbatim
-copy of upstream with only two ``>>> PROFILING CHUNK`` injections; re-sync by
-recopying upstream ``schedule()`` and reapplying those two hooks.
+Synced to the vLLM v0.23.0 ``Scheduler.schedule()``: the body is a verbatim
+copy of upstream with a small set of ``>>> PROFILING CHUNK`` injections that
+size each prefill chunk against a shared per-step cost budget ``T*``.  Re-sync
+by recopying upstream ``schedule()`` and reapplying those hooks.
 """
 
 import time
@@ -45,11 +46,13 @@ from vllm_ascend.core.profiling_chunk_predictor import ProfilingChunkManager
 
 
 class ProfilingChunkScheduler(Scheduler):
-    """Scheduler with lookup-table dynamic chunk sizing.
+    """Scheduler with profile-guided cost-budget chunk sizing.
 
-    During initialization, the scheduler loads or profiles a latency lookup
-    table.  During scheduling it uses a bounded beam search over the allowed
-    chunk sizes to propose the next prefill chunk.
+    During initialization the scheduler loads or profiles a latency lookup
+    table and fits ``T(h, c)``.  During scheduling it holds each step to a
+    per-step cost budget ``T*`` by picking, for every request, the largest
+    allowed chunk whose predicted latency fits the remaining budget (floor at
+    ``c_min``).
     """
 
     def __init__(
@@ -92,12 +95,16 @@ class ProfilingChunkScheduler(Scheduler):
             allowed_chunk_sizes=getattr(profiling_cfg, "allowed_chunk_sizes", None),
             profile_num_history_points=getattr(profiling_cfg, "profile_num_history_points", 33),
             profile_repeats=getattr(profiling_cfg, "profile_repeats", 3),
-            search_depth=getattr(profiling_cfg, "search_depth", 6),
-            beam_width=getattr(profiling_cfg, "beam_width", 16),
+            target_latency_ms=getattr(profiling_cfg, "target_latency_ms", None),
+            backfill_reserve_ms=getattr(profiling_cfg, "backfill_reserve_ms", None),
             profile_file=getattr(profiling_cfg, "profile_file", None),
             metadata=self._build_profile_metadata(),
         )
         self._profiling_initialized = False
+        # Phase 2: never let preemption recompute a long in-flight prefill.
+        self._protect_inflight_prefill: bool = getattr(
+            profiling_cfg, "protect_inflight_prefill", True
+        )
 
         logger.info(
             "[ProfilingChunk] Scheduler initialized. page_size=%d, "
@@ -152,6 +159,7 @@ class ProfilingChunkScheduler(Scheduler):
         history: int,
         remaining_prompt_tokens: int,
         num_new_tokens: int,
+        time_budget: float,
     ) -> int:
         if (
             self.profiling_chunk_manager is None
@@ -165,11 +173,67 @@ class ProfilingChunkScheduler(Scheduler):
             history=history,
             remaining_prompt_tokens=remaining_prompt_tokens,
             token_budget=num_new_tokens,
-            pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,
+            cost_budget=time_budget,
         )
         if preferred_chunk is None or preferred_chunk <= 0:
             return num_new_tokens
         return min(preferred_chunk, remaining_prompt_tokens, num_new_tokens)
+
+    def _profiling_time_budget(self) -> float:
+        """Per-step cost budget ``T*`` (ms), or ``inf`` when profiling is off.
+
+        ``inf`` makes every cost gate a no-op, so ``schedule()`` behaves exactly
+        like upstream until the latency model is ready.
+        """
+        manager = self.profiling_chunk_manager
+        if manager is None or not manager.is_ready or manager.target_latency_ms is None:
+            return float("inf")
+        return manager.target_latency_ms
+
+    def _consume_time_budget(self, time_budget: float, history: int, num_new_tokens: int) -> float:
+        """Subtract a scheduled chunk's predicted cost from the step budget.
+
+        Decodes (``num_new_tokens <= 1``) are exempt; they are effectively free
+        and must not crowd prefill chunks out of the budget.
+        """
+        manager = self.profiling_chunk_manager
+        if (
+            manager is None
+            or not manager.is_ready
+            or num_new_tokens <= 1
+            or time_budget == float("inf")
+        ):
+            return time_budget
+        return time_budget - manager.predict_cost(history, num_new_tokens)
+
+    def _profiling_backfill_budget(self) -> float:
+        """Cost budget (ms) reserved each step for admitting waiting requests.
+
+        Combined with the running-loop consumption as
+        ``waiting_budget = max(time_budget, backfill_reserve)``, this guarantees
+        small requests can always piggyback a step dominated by a large
+        in-flight prefill.  ``0.0`` when profiling is off (then the waiting loop
+        simply uses the remaining ``time_budget``, i.e. ``inf``).
+        """
+        manager = self.profiling_chunk_manager
+        if manager is None or not manager.is_ready or manager.backfill_reserve_ms is None:
+            return 0.0
+        return manager.backfill_reserve_ms
+
+    def _pop_preemption_victim(self) -> Request:
+        """Pick a preemption victim, protecting long in-flight prefills.
+
+        Default vLLM preempts LIFO (the newest running request).  When
+        ``protect_inflight_prefill`` is set, evict the cheapest-to-recompute
+        request instead -- the one with the fewest computed tokens -- so a long
+        in-flight prefill (which would otherwise recompute from scratch) is
+        never the victim while a shorter request exists.
+        """
+        if not self._protect_inflight_prefill or not self.running:
+            return self.running.pop()
+        victim = min(self.running, key=lambda request: request.num_computed_tokens)
+        self.running.remove(victim)
+        return victim
 
     # ------------------------------------------------------------------
     # schedule() override
@@ -201,6 +265,9 @@ class ProfilingChunkScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        # >>> PROFILING CHUNK: per-step cost (time) budget shared across requests
+        time_budget = self._profiling_time_budget()
+        # <<< PROFILING CHUNK
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -284,6 +351,10 @@ class ProfilingChunkScheduler(Scheduler):
                 history=request.num_computed_tokens,
                 remaining_prompt_tokens=remaining_prompt_tokens,
                 num_new_tokens=num_new_tokens,
+                time_budget=time_budget,
+            )
+            time_budget = self._consume_time_budget(
+                time_budget, request.num_computed_tokens, num_new_tokens
             )
             # <<< PROFILING CHUNK
 
@@ -350,7 +421,9 @@ class ProfilingChunkScheduler(Scheduler):
                                 encoder_compute_budget += num_embeds_to_restore
                             req_index -= 1
                     else:
-                        preempted_req = self.running.pop()
+                        # >>> PROFILING CHUNK: protect long in-flight prefills
+                        preempted_req = self._pop_preemption_victim()
+                        # <<< PROFILING CHUNK
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
@@ -417,7 +490,11 @@ class ProfilingChunkScheduler(Scheduler):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            # >>> PROFILING CHUNK: guaranteed backfill budget for waiting requests
+            waiting_budget = max(time_budget, self._profiling_backfill_budget())
+            # <<< PROFILING CHUNK
+
+            while (self.waiting or self.skipped_waiting) and token_budget > 0 and waiting_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -559,6 +636,10 @@ class ProfilingChunkScheduler(Scheduler):
                         history=num_computed_tokens,
                         remaining_prompt_tokens=remaining_prompt_tokens,
                         num_new_tokens=num_new_tokens,
+                        time_budget=waiting_budget,
+                    )
+                    waiting_budget = self._consume_time_budget(
+                        waiting_budget, num_computed_tokens, num_new_tokens
                     )
                     # <<< PROFILING CHUNK
                     assert num_new_tokens > 0
@@ -835,7 +916,7 @@ class AsyncProfilingChunkScheduler(AsyncScheduler, ProfilingChunkScheduler):
     """Async-scheduling variant.
 
     MRO ``AsyncProfilingChunkScheduler -> AsyncScheduler ->
-    ProfilingChunkScheduler -> Scheduler`` gives it the lookup-table
+    ProfilingChunkScheduler -> Scheduler`` gives it the cost-budget
     ``schedule()`` from :class:`ProfilingChunkScheduler` together with
     :class:`AsyncScheduler`'s PP decode cadence (``next_decode_eligible_step``)
     and async output handling.

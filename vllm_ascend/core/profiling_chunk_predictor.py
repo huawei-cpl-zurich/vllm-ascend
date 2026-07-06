@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from vllm.logger import logger
 
 PROFILE_SCHEMA_VERSION = 1
@@ -298,184 +299,107 @@ class FullForwardChunkProfiler:
         return []
 
 
-@dataclass(frozen=True)
-class SearchState:
-    history: int
-    scheduled_tokens: int
-    sum_latency_ms: float
-    max_latency_ms: float
-    chunks: tuple[int, ...]
+@dataclass
+class LatencyModel:
+    """Least-squares fit of per-forward prefill latency from the lookup table.
 
+    ``T(h, c) = e + b*c + a_cross*(c*h) + a_intra*(c*c)``
 
-class ChunkBeamSearch:
-    """Bounded receding-horizon beam search over discrete chunk sizes."""
+    The shape coefficients are clamped non-negative so ``T`` is monotonically
+    non-decreasing in both history and chunk size -- which is what lets
+    :class:`SmoothChunkSelector` scan chunk sizes in ascending order.
+    """
 
-    def __init__(
-        self,
-        table: ChunkLatencyTable,
-        allowed_chunk_sizes: list[int],
-        search_depth: int,
-        beam_width: int,
-    ) -> None:
-        self.table = table
-        self.allowed_chunk_sizes = allowed_chunk_sizes
-        self.search_depth = search_depth
-        self.beam_width = beam_width
+    e: float
+    b: float
+    a_cross: float
+    a_intra: float
+    max_rel_residual: float = 0.0
 
-    @property
-    def min_chunk(self) -> int:
-        return self.allowed_chunk_sizes[0]
-
-    def select_next_chunk(
-        self,
-        history: int,
-        remaining_prompt_tokens: int,
-        token_budget: int,
-        pp_size: int,
-    ) -> int | None:
-        if remaining_prompt_tokens <= 0 or token_budget <= 0:
-            return None
-
-        initial = SearchState(
-            history=history,
-            scheduled_tokens=0,
-            sum_latency_ms=0.0,
-            max_latency_ms=0.0,
-            chunks=(),
-        )
-        beam = [initial]
-        best_states: list[SearchState] = []
-
-        for _ in range(self.search_depth):
-            candidates: list[SearchState] = []
-            for state in beam:
-                remaining = remaining_prompt_tokens - state.scheduled_tokens
-                if remaining <= 0:
-                    best_states.append(state)
+    @classmethod
+    def fit(cls, table: "ChunkLatencyTable") -> "LatencyModel":
+        features: list[list[float]] = []
+        targets: list[float] = []
+        for row_index, history in enumerate(table.history_sizes):
+            for col_index, chunk in enumerate(table.chunk_sizes):
+                latency = table.latencies_ms[row_index][col_index]
+                if latency is None:
                     continue
-                candidates.extend(
-                    self._expand_state(
-                        state=state,
-                        remaining=remaining,
-                        token_budget=token_budget,
-                    )
+                features.append(
+                    [1.0, float(chunk), float(chunk) * history, float(chunk) * chunk]
                 )
+                targets.append(float(latency))
+        if len(features) < 4:
+            raise ValueError("not enough usable latency entries to fit the latency model")
+        coeffs, *_ = np.linalg.lstsq(
+            np.asarray(features, dtype=np.float64),
+            np.asarray(targets, dtype=np.float64),
+            rcond=None,
+        )
+        model = cls(
+            e=float(coeffs[0]),
+            b=max(float(coeffs[1]), 0.0),
+            a_cross=max(float(coeffs[2]), 0.0),
+            a_intra=max(float(coeffs[3]), 0.0),
+        )
+        model.max_rel_residual = model._max_rel_residual(features, targets)
+        return model
 
-            if not candidates:
-                break
-
-            candidates = self._remove_dominated(candidates)
-            candidates.sort(key=lambda state: self._sort_key(state, pp_size))
-            beam = candidates[: self.beam_width]
-            best_states.extend(
-                state
-                for state in beam
-                if state.scheduled_tokens >= remaining_prompt_tokens
+    def _max_rel_residual(self, features: list[list[float]], targets: list[float]) -> float:
+        worst = 0.0
+        for feat, actual in zip(features, targets):
+            predicted = (
+                self.e + self.b * feat[1] + self.a_cross * feat[2] + self.a_intra * feat[3]
             )
-            if all(state.scheduled_tokens >= remaining_prompt_tokens for state in beam):
-                break
+            if actual > 0:
+                worst = max(worst, abs(predicted - actual) / actual)
+        return worst
 
-        selectable = [state for state in (best_states or beam) if state.chunks]
-        if not selectable:
-            return None
-        selectable.sort(key=lambda state: self._sort_key(state, pp_size))
-        return selectable[0].chunks[0]
+    def predict(self, history: int, chunk: int) -> float:
+        return (
+            self.e
+            + self.b * chunk
+            + self.a_cross * chunk * history
+            + self.a_intra * chunk * chunk
+        )
 
-    def fallback_chunk(
+
+class SmoothChunkSelector:
+    """Floor-tracking chunk selection under a shared per-step cost budget.
+
+    Returns the largest allowed chunk whose predicted latency stays under the
+    per-request target ``max(cost_budget, floor(history))``, where
+    ``floor(history) = T(history, c_min)``.  Because the target is always at
+    least the floor, ``c_min`` is always feasible so progress is guaranteed;
+    the final short chunk returns the exact remainder.
+    """
+
+    def __init__(self, model: LatencyModel, allowed_chunk_sizes: list[int]) -> None:
+        self.model = model
+        self.allowed = sorted(allowed_chunk_sizes)
+        self.c_min = self.allowed[0]
+
+    def select_chunk(
         self,
         history: int,
         remaining_prompt_tokens: int,
         token_budget: int,
+        cost_budget: float,
     ) -> int | None:
-        if remaining_prompt_tokens <= 0 or token_budget <= 0:
+        cap = min(remaining_prompt_tokens, token_budget)
+        if cap <= 0:
             return None
-        if remaining_prompt_tokens < self.min_chunk and remaining_prompt_tokens <= token_budget:
-            return remaining_prompt_tokens
-        for chunk in reversed(self.allowed_chunk_sizes):
-            if chunk <= remaining_prompt_tokens and chunk <= token_budget:
-                if self.table.latency_or_none(history, chunk) is not None:
-                    return chunk
-        return None
-
-    def _expand_state(
-        self,
-        state: SearchState,
-        remaining: int,
-        token_budget: int,
-    ) -> list[SearchState]:
-        expanded: list[SearchState] = []
-        if remaining < self.min_chunk and remaining <= token_budget:
-            latency = self.table.latency_or_none(state.history, self.min_chunk)
-            if latency is not None:
-                expanded.append(self._append_chunk(state, remaining, latency))
-            return expanded
-
-        for chunk in self.allowed_chunk_sizes:
-            if chunk > remaining or chunk > token_budget:
-                continue
-            latency = self.table.latency_or_none(state.history, chunk)
-            if latency is None:
-                continue
-            expanded.append(self._append_chunk(state, chunk, latency))
-        return expanded
-
-    @staticmethod
-    def _append_chunk(
-        state: SearchState,
-        chunk: int,
-        latency: float,
-    ) -> SearchState:
-        return SearchState(
-            history=state.history + chunk,
-            scheduled_tokens=state.scheduled_tokens + chunk,
-            sum_latency_ms=state.sum_latency_ms + latency,
-            max_latency_ms=max(state.max_latency_ms, latency),
-            chunks=state.chunks + (chunk,),
-        )
-
-    @staticmethod
-    def _remove_dominated(states: list[SearchState]) -> list[SearchState]:
-        grouped: dict[int, list[SearchState]] = {}
-        for state in states:
-            grouped.setdefault(state.history, []).append(state)
-
-        kept: list[SearchState] = []
-        for group in grouped.values():
-            for candidate in group:
-                dominated = False
-                for other in group:
-                    if candidate is other:
-                        continue
-                    no_worse = (
-                        other.sum_latency_ms <= candidate.sum_latency_ms
-                        and other.max_latency_ms <= candidate.max_latency_ms
-                    )
-                    strictly_better = (
-                        other.sum_latency_ms < candidate.sum_latency_ms
-                        or other.max_latency_ms < candidate.max_latency_ms
-                    )
-                    if no_worse and strictly_better:
-                        dominated = True
-                        break
-                if not dominated:
-                    kept.append(candidate)
-        return kept
-
-    @staticmethod
-    def _pipeline_cost(state: SearchState, pp_size: int) -> float:
-        return state.sum_latency_ms + max(pp_size - 1, 0) * state.max_latency_ms
-
-    def _sort_key(self, state: SearchState, pp_size: int) -> tuple[float, float, int, int, int]:
-        cost = self._pipeline_cost(state, pp_size)
-        score = cost / state.scheduled_tokens
-        first_chunk = state.chunks[0]
-        return (
-            score,
-            cost,
-            -state.scheduled_tokens,
-            len(state.chunks),
-            -first_chunk,
-        )
+        if cap <= self.c_min:
+            # Tail shorter than one min-chunk: schedule the exact remainder.
+            return cap
+        target = max(cost_budget, self.model.predict(history, self.c_min))
+        best = self.c_min
+        for chunk in self.allowed:
+            if chunk > cap:
+                break
+            if self.model.predict(history, chunk) <= target:
+                best = chunk
+        return best
 
 
 class ProfilingChunkManager:
@@ -491,8 +415,8 @@ class ProfilingChunkManager:
         allowed_chunk_sizes: list[int] | None,
         profile_num_history_points: int,
         profile_repeats: int,
-        search_depth: int,
-        beam_width: int,
+        target_latency_ms: float | None,
+        backfill_reserve_ms: float | None,
         profile_file: str | None,
         metadata: dict[str, Any],
     ) -> None:
@@ -508,16 +432,33 @@ class ProfilingChunkManager:
             alignment=self.alignment,
         )
         self.profile_repeats = profile_repeats
-        self.search_depth = search_depth
-        self.beam_width = beam_width
+        self.target_latency_ms_config = target_latency_ms
+        self.backfill_reserve_ms_config = backfill_reserve_ms
         self.profile_file = profile_file
         self.metadata = metadata
         self.table: ChunkLatencyTable | None = None
-        self.optimizer: ChunkBeamSearch | None = None
+        self.model: LatencyModel | None = None
+        self.selector: SmoothChunkSelector | None = None
+        self._target_latency_ms: float | None = None
+        self._backfill_reserve_ms: float | None = None
+
+    # Default backfill reserve when unset: a quarter of the step budget kept
+    # available every step for admitting small piggyback requests.
+    AUTO_BACKFILL_FRACTION = 0.25
 
     @property
     def is_ready(self) -> bool:
-        return self.optimizer is not None
+        return self.selector is not None
+
+    @property
+    def target_latency_ms(self) -> float | None:
+        """Per-step cost budget ``T*`` (ms).  ``None`` until the model is fit."""
+        return self._target_latency_ms
+
+    @property
+    def backfill_reserve_ms(self) -> float | None:
+        """Cost budget (ms) reserved every step for waiting requests."""
+        return self._backfill_reserve_ms
 
     def initialize(self, model_executor: Any) -> None:
         if self.profile_file is not None and Path(self.profile_file).exists():
@@ -562,38 +503,22 @@ class ProfilingChunkManager:
         history: int,
         remaining_prompt_tokens: int,
         token_budget: int,
-        pp_size: int,
+        cost_budget: float,
     ) -> int | None:
-        if self.optimizer is None:
+        if self.selector is None:
             return None
-        chunk = self.optimizer.select_next_chunk(
+        return self.selector.select_chunk(
             history=history,
             remaining_prompt_tokens=remaining_prompt_tokens,
             token_budget=token_budget,
-            pp_size=pp_size,
+            cost_budget=cost_budget,
         )
-        if chunk is not None:
-            return chunk
-        fallback = self.optimizer.fallback_chunk(
-            history=history,
-            remaining_prompt_tokens=remaining_prompt_tokens,
-            token_budget=token_budget,
-        )
-        if fallback is None:
-            logger.warning(
-                "[ProfilingChunk] Optimizer could not find a valid chunk for "
-                "history=%d, remaining=%d, token_budget=%d",
-                history,
-                remaining_prompt_tokens,
-                token_budget,
-            )
-        else:
-            logger.warning(
-                "[ProfilingChunk] Falling back to chunk=%d for history=%d",
-                fallback,
-                history,
-            )
-        return fallback
+
+    def predict_cost(self, history: int, chunk: int) -> float:
+        """Predicted per-forward latency (ms) for ``chunk`` at ``history``."""
+        if self.model is None:
+            return 0.0
+        return self.model.predict(history, chunk)
 
     def _set_table(self, table: ChunkLatencyTable) -> None:
         table.validate()
@@ -601,11 +526,26 @@ class ProfilingChunkManager:
             raise ValueError("profiling table has no usable latency entries")
         self.table = table
         self.allowed_chunk_sizes = table.chunk_sizes
-        self.optimizer = ChunkBeamSearch(
-            table=table,
-            allowed_chunk_sizes=table.chunk_sizes,
-            search_depth=self.search_depth,
-            beam_width=self.beam_width,
+        self.model = LatencyModel.fit(table)
+        self.selector = SmoothChunkSelector(self.model, table.chunk_sizes)
+        if self.target_latency_ms_config is not None:
+            self._target_latency_ms = float(self.target_latency_ms_config)
+        else:
+            # Default target = cost of the largest chunk at zero history.
+            self._target_latency_ms = self.model.predict(0, table.chunk_sizes[-1])
+        if self.backfill_reserve_ms_config is not None:
+            self._backfill_reserve_ms = float(self.backfill_reserve_ms_config)
+        else:
+            self._backfill_reserve_ms = self.AUTO_BACKFILL_FRACTION * self._target_latency_ms
+        logger.info(
+            "[ProfilingChunk] Fitted latency model: e=%.3g, b=%.3g, a_cross=%.3g, "
+            "a_intra=%.3g (max rel residual=%.1f%%); target_latency=%.3f ms",
+            self.model.e,
+            self.model.b,
+            self.model.a_cross,
+            self.model.a_intra,
+            self.model.max_rel_residual * 100.0,
+            self._target_latency_ms,
         )
 
     def _resolve_allowed_chunk_sizes(self, configured: list[int] | None) -> list[int]:

@@ -686,22 +686,37 @@ class ProfilingChunkConfig:
         )
         self.profile_num_history_points: int = int(config.get("profile_num_history_points", 33))
         self.profile_repeats: int = int(config.get("profile_repeats", 3))
-        self.search_depth: int = int(config.get("search_depth", 6))
-        self.beam_width: int = int(config.get("beam_width", 16))
-        # Backward-compatible no-ops.  The lookup-table scheduler does not use
-        # smoothing or runtime timing state.
+        # Target per-step cost budget ``T*`` (ms).  ``None`` -> auto (cost of
+        # the largest chunk at zero history).  Single tuning knob for Phase 1.
+        target_latency_ms = config.get("target_latency_ms", None)
+        self.target_latency_ms: float | None = (
+            float(target_latency_ms) if target_latency_ms is not None else None
+        )
+        # Phase 2 (memory-safe piggyback).
+        # Cost budget (ms) reserved every step for admitting waiting requests, so
+        # a large in-flight prefill cannot starve small piggyback requests.
+        # ``None`` -> auto (a fraction of ``T*``).
+        backfill_reserve_ms = config.get("backfill_reserve_ms", None)
+        self.backfill_reserve_ms: float | None = (
+            float(backfill_reserve_ms) if backfill_reserve_ms is not None else None
+        )
+        # When set, preemption evicts the cheapest-to-recompute request rather
+        # than the newest, so a long in-flight prefill is never recomputed.
+        self.protect_inflight_prefill: bool = bool(
+            config.get("protect_inflight_prefill", True)
+        )
+        # Backward-compatible no-ops.  The cost-budget scheduler does not use
+        # beam search, smoothing, or runtime timing state.
         self.smooth_factor: float = float(config.get("smooth_factor", 1.0))
         self.need_timing: bool = False
-        if "smooth_factor" in config:
-            logger.warning(
-                "profiling_chunk_config.smooth_factor is ignored by the "
-                "lookup-table scheduler."
-            )
-        if "need_timing" in config:
-            logger.warning(
-                "profiling_chunk_config.need_timing is ignored by the "
-                "lookup-table scheduler."
-            )
+        self.search_depth: int = int(config.get("search_depth", 6))
+        self.beam_width: int = int(config.get("beam_width", 16))
+        for ignored in ("smooth_factor", "need_timing", "search_depth", "beam_width"):
+            if ignored in config:
+                logger.warning(
+                    "profiling_chunk_config.%s is ignored by the cost-budget scheduler.",
+                    ignored,
+                )
         self._validate()
 
     @staticmethod
@@ -731,10 +746,16 @@ class ProfilingChunkConfig:
             raise ValueError(
                 f"profiling_chunk_config.profile_repeats must be >= 1, got {self.profile_repeats}"
             )
-        if self.search_depth < 1:
-            raise ValueError(f"profiling_chunk_config.search_depth must be >= 1, got {self.search_depth}")
-        if self.beam_width < 1:
-            raise ValueError(f"profiling_chunk_config.beam_width must be >= 1, got {self.beam_width}")
+        if self.target_latency_ms is not None and self.target_latency_ms <= 0:
+            raise ValueError(
+                "profiling_chunk_config.target_latency_ms must be positive, "
+                f"got {self.target_latency_ms}"
+            )
+        if self.backfill_reserve_ms is not None and self.backfill_reserve_ms < 0:
+            raise ValueError(
+                "profiling_chunk_config.backfill_reserve_ms must be >= 0, "
+                f"got {self.backfill_reserve_ms}"
+            )
 
     def resolve_runtime_defaults(self, max_num_batched_tokens: int, kv_cache_block_size: int) -> None:
         if self.max_chunk is None:
