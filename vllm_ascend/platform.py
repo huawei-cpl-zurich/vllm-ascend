@@ -697,10 +697,17 @@ class NPUPlatform(Platform):
             vllm_config.scheduler_config.SLO_limits_for_dynamic_batch = ascend_config.SLO_limits_for_dynamic_batch
 
         # Use ProfilingChunkScheduler when profiling-based chunk sizing is on.
+        # Pick the async variant under async scheduling so we keep the
+        # AsyncScheduler PP decode cadence (`next_decode_eligible_step`).
         if ascend_config.profiling_chunk_config.enabled:
-            vllm_config.scheduler_config.scheduler_cls = (
-                "vllm_ascend.core.scheduler_profiling_chunk.ProfilingChunkScheduler"
-            )
+            if vllm_config.scheduler_config.async_scheduling:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.scheduler_profiling_chunk.AsyncProfilingChunkScheduler"
+                )
+            else:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.scheduler_profiling_chunk.ProfilingChunkScheduler"
+                )
             import vllm_ascend.patch.platform.patch_profiling_chunk  # noqa
 
         cp_size = parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
