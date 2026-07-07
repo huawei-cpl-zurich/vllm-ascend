@@ -703,6 +703,19 @@ class NPUPlatform(Platform):
             )
             import vllm_ascend.patch.platform.patch_profiling_chunk  # noqa
 
+        # Use the analytic PP chunk scheduler when enabled (profiling-free).
+        # Pick the async variant under async scheduling to keep the AsyncScheduler
+        # PP decode cadence (`next_decode_eligible_step`).
+        if ascend_config.analytic_chunk_config.enabled:
+            if vllm_config.scheduler_config.async_scheduling:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.scheduler_analytic_chunk.AsyncAnalyticChunkScheduler"
+                )
+            else:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.scheduler_analytic_chunk.AnalyticChunkScheduler"
+                )
+
         cp_size = parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
         if (
             vllm_config.kv_transfer_config is not None

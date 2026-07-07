@@ -73,6 +73,17 @@ class AscendConfig:
                 "or disable profiling_chunk_config."
             )
 
+        analytic_chunk_config = additional_config.get("analytic_chunk_config", {})
+        self.analytic_chunk_config = AnalyticChunkConfig(analytic_chunk_config)
+        if (
+            self.analytic_chunk_config.enabled
+            and vllm_config.parallel_config.pipeline_parallel_size <= 1
+        ):
+            raise ValueError(
+                "analytic_chunk_config requires pipeline parallelism (pp > 1). "
+                "Set --pipeline-parallel-size > 1 or disable analytic_chunk_config."
+            )
+
         from vllm_ascend import envs as ascend_envs
 
         self.enable_balance_scheduling = self._get_config_value(
@@ -719,6 +730,53 @@ class ProfilingChunkConfig:
             raise ValueError(f"profiling_chunk_config.min_chunk must be positive, got {self.min_chunk}")
         if self.max_fit_chunk <= 5:
             raise ValueError(f"Recommend to use at least 30 data points for fitting, got {self.max_fit_chunk}")
+
+
+class AnalyticChunkConfig:
+    """Analytic (profiling-free) PP chunked-prefill scheduling.
+
+    When enabled, sizes each prefill chunk against a per-step cost budget derived
+    from ``T(h,c) = c*(1 + (h + c/2)/h_cross)``.  ``h_cross`` is estimated from
+    the model architecture (or set explicitly).  No profiling.  Requires pp > 1.
+    """
+
+    def __init__(self, config: dict | None = None):
+        if config is None:
+            config = {}
+        self.enabled: bool = config.get("enabled", False)
+        self.min_chunk: int = int(config.get("min_chunk", 1024))
+        max_chunk = config.get("max_chunk", None)
+        self.max_chunk: int | None = int(max_chunk) if max_chunk is not None else None
+        allowed = config.get("allowed_chunk_sizes", None)
+        self.allowed_chunk_sizes: list[int] | None = (
+            [int(c) for c in allowed] if allowed is not None else None
+        )
+        target_chunk = config.get("target_chunk", None)
+        self.target_chunk: int | None = int(target_chunk) if target_chunk is not None else None
+        self.backfill_reserve_frac: float = float(config.get("backfill_reserve_frac", 0.25))
+        self.protect_inflight_prefill: bool = bool(config.get("protect_inflight_prefill", True))
+        h_cross = config.get("h_cross", None)
+        self.h_cross: int | None = int(h_cross) if h_cross is not None else None
+        self.k_mfu: float = float(config.get("k_mfu", 0.8))
+        self._validate()
+
+    def _validate(self):
+        if self.min_chunk <= 0:
+            raise ValueError(f"analytic_chunk_config.min_chunk must be positive, got {self.min_chunk}")
+        if self.max_chunk is not None and self.max_chunk < self.min_chunk:
+            raise ValueError(
+                "analytic_chunk_config.max_chunk must be >= min_chunk, "
+                f"got max_chunk={self.max_chunk}, min_chunk={self.min_chunk}"
+            )
+        if not 0.0 <= self.backfill_reserve_frac <= 1.0:
+            raise ValueError(
+                "analytic_chunk_config.backfill_reserve_frac must be in [0, 1], "
+                f"got {self.backfill_reserve_frac}"
+            )
+        if self.h_cross is not None and self.h_cross <= 0:
+            raise ValueError(f"analytic_chunk_config.h_cross must be positive, got {self.h_cross}")
+        if self.k_mfu <= 0:
+            raise ValueError(f"analytic_chunk_config.k_mfu must be positive, got {self.k_mfu}")
 
 
 class RejectionSamplerConfig:
