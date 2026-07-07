@@ -22,10 +22,42 @@ from vllm_ascend.core.analytic_chunk_model import (
     AnalyticChunkManager,
     AnalyticLatencyModel,
     SmoothChunkSelector,
+    estimate_h_cross,
     h_cross_from_dims,
 )
 
 BIG = 10**9
+
+
+class _FakeHF:
+    num_attention_heads = 64
+    num_key_value_heads = 8
+    intermediate_size = 29568
+    n_routed_experts = None
+    kv_lora_rank = None
+
+
+class _FakeModelConfig:
+    hf_text_config = _FakeHF()
+    hf_config = _FakeHF()
+    is_deepseek_mla = False
+
+    def get_hidden_size(self):
+        return 8192
+
+    def get_head_size(self):
+        return 128
+
+    def get_num_attention_heads(self, pc):  # per-rank, like vllm
+        return 64 // pc.tensor_parallel_size
+
+    def get_num_kv_heads(self, pc):
+        return max(1, 8 // pc.tensor_parallel_size)
+
+
+class _FakeParallelConfig:
+    def __init__(self, tp):
+        self.tensor_parallel_size = tp
 
 DENSE = dict(hidden_size=4096, n_q_heads=32, n_kv_heads=32, head_dim=128,
              intermediate_size=11008, is_mla=False, is_moe=False)
@@ -54,6 +86,15 @@ class TestHCross(TestBase):
         self.assertAlmostEqual(
             h_cross_from_dims(DENSE, 0.4), h_cross_from_dims(DENSE, 0.8) / 2, delta=2
         )
+
+    def test_estimate_h_cross_is_tp_invariant(self):
+        # TP shards attention and FFN equally -> h_cross must not depend on TP.
+        model_config = _FakeModelConfig()
+        values = {
+            estimate_h_cross(model_config, _FakeParallelConfig(tp), 0.8)
+            for tp in (1, 2, 4, 8)
+        }
+        self.assertEqual(len(values), 1, f"h_cross varies with TP: {values}")
 
 
 class TestAnalyticLatencyModel(TestBase):

@@ -177,9 +177,18 @@ def _extract_dims(model_config, parallel_config) -> dict | None:
     try:
         hf = getattr(model_config, "hf_text_config", None) or model_config.hf_config
         d = model_config.get_hidden_size()
-        n_q = model_config.get_num_attention_heads(parallel_config)
-        n_kv = model_config.get_num_kv_heads(parallel_config)
         dh = model_config.get_head_size()
+        # Use TOTAL (unsharded) head counts so h_cross is TP-invariant.  TP
+        # shards attention and FFN equally, so the compute ratio L/A does not
+        # depend on TP -- but the per-rank getters (get_num_attention_heads)
+        # divide by TP while hidden_size / intermediate_size stay full, which
+        # would inflate h_cross with TP.
+        tp = getattr(parallel_config, "tensor_parallel_size", 1) or 1
+        n_q = int(
+            getattr(hf, "num_attention_heads", None)
+            or model_config.get_num_attention_heads(parallel_config) * tp
+        )
+        n_kv = int(getattr(hf, "num_key_value_heads", None) or n_q)
         is_mla = bool(getattr(model_config, "is_deepseek_mla", False)) or bool(
             getattr(hf, "kv_lora_rank", None)
         )
