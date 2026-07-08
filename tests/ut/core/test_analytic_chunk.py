@@ -125,6 +125,26 @@ class TestSmoothChunkSelector(TestBase):
         self.assertEqual(sel.select_chunk(0, BIG, 3000, BIG), 2048)
         self.assertIsNone(sel.select_chunk(0, 0, BIG, BIG))
 
+    def test_fit_or_skip_defers_when_nothing_fits(self):
+        sel = self._sel()
+        # Deep history: even c_min costs far more than the leftover budget.
+        self.assertIsNone(sel.select_chunk(100_000, BIG, BIG, 1_000.0, allow_floor=False))
+        # The same request with head-of-line floor privilege still gets c_min.
+        self.assertEqual(sel.select_chunk(100_000, BIG, BIG, 1_000.0, allow_floor=True), 1024)
+
+    def test_fit_or_skip_returns_largest_fitting_chunk(self):
+        sel = self._sel()
+        budget = sel.model.predict(0, 2048)
+        self.assertEqual(sel.select_chunk(0, BIG, BIG, budget, allow_floor=False), 2048)
+        # c_min itself fits a floor-sized budget without floor privilege.
+        floor = sel.model.predict(50_000, 1024)
+        self.assertEqual(sel.select_chunk(50_000, BIG, BIG, floor, allow_floor=False), 1024)
+
+    def test_fit_or_skip_tail_remainder_always_scheduled(self):
+        sel = self._sel()
+        # Exact remainders (cap <= c_min) bypass the fit test: tail/spec safety.
+        self.assertEqual(sel.select_chunk(100_000, 500, BIG, 0.0, allow_floor=False), 500)
+
 
 class TestAnalyticChunkManager(TestBase):
     def _mgr(self, **kw):
@@ -151,6 +171,77 @@ class TestAnalyticChunkManager(TestBase):
         )
         self.assertEqual(chunk, mgr.allowed_chunk_sizes[-1])
         self.assertGreater(mgr.predict_cost(0, 1024), 0)
+
+
+class TestFitOrSkipScheduling(TestBase):
+    """Head-of-line floor privilege + fit-or-skip via _apply_dynamic_chunk_size.
+
+    Builds a bare AnalyticChunkScheduler (no vLLM engine state) since the hook
+    only touches the manager and the per-step flag.
+    """
+
+    def _sched(self):
+        from vllm_ascend.core.scheduler_analytic_chunk import AnalyticChunkScheduler
+
+        sched = object.__new__(AnalyticChunkScheduler)
+        sched.analytic_chunk_manager = AnalyticChunkManager(
+            h_cross=12_000, page_size=128, min_chunk=1024, max_chunk=8192,
+            allowed_chunk_sizes=None, target_chunk=None, backfill_reserve_frac=0.25,
+        )
+        sched._prefill_scheduled_this_step = False
+        return sched
+
+    def test_head_of_line_floored_then_others_skipped(self):
+        sched = self._sched()
+        # First deep prefill: floored at c_min even with an exhausted budget.
+        first = sched._apply_dynamic_chunk_size(
+            history=100_000, remaining_prompt_tokens=BIG, num_new_tokens=BIG, budget=0.0
+        )
+        self.assertEqual(first, 1024)
+        self.assertTrue(sched._prefill_scheduled_this_step)
+        # Second deep prefill: cheapest chunk does not fit -> deferred.
+        second = sched._apply_dynamic_chunk_size(
+            history=100_000, remaining_prompt_tokens=BIG, num_new_tokens=BIG, budget=0.0
+        )
+        self.assertEqual(second, 0)
+
+    def test_shallow_filler_fits_leftover_after_deep_head(self):
+        sched = self._sched()
+        budget = sched.analytic_chunk_manager.target_latency
+        head = sched._apply_dynamic_chunk_size(
+            history=100_000, remaining_prompt_tokens=BIG, num_new_tokens=BIG, budget=budget
+        )
+        self.assertEqual(head, 1024)
+        leftover = budget - sched.analytic_chunk_manager.predict_cost(100_000, head)
+        # A fresh (h=0) prefill fills the quantization headroom...
+        filler = sched._apply_dynamic_chunk_size(
+            history=0, remaining_prompt_tokens=BIG, num_new_tokens=BIG, budget=leftover
+        )
+        self.assertGreaterEqual(filler, 1024)
+        # ...while another deep prefill is deferred by the same leftover.
+        deep = sched._apply_dynamic_chunk_size(
+            history=100_000, remaining_prompt_tokens=BIG, num_new_tokens=BIG, budget=leftover
+        )
+        self.assertEqual(deep, 0)
+
+    def test_decodes_and_tails_do_not_claim_floor_privilege(self):
+        sched = self._sched()
+        # Decode passthrough (num_new_tokens == 1).
+        self.assertEqual(
+            sched._apply_dynamic_chunk_size(
+                history=BIG, remaining_prompt_tokens=1, num_new_tokens=1, budget=0.0
+            ),
+            1,
+        )
+        self.assertFalse(sched._prefill_scheduled_this_step)
+        # Exact tail remainder below c_min is scheduled but keeps the flag off.
+        self.assertEqual(
+            sched._apply_dynamic_chunk_size(
+                history=BIG, remaining_prompt_tokens=500, num_new_tokens=500, budget=0.0
+            ),
+            500,
+        )
+        self.assertFalse(sched._prefill_scheduled_this_step)
 
 
 class TestAnalyticChunkConfig(TestBase):

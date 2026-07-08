@@ -52,9 +52,16 @@ from vllm_ascend.core.analytic_chunk_model import AnalyticChunkManager, estimate
 class AnalyticChunkScheduler(Scheduler):
     """Scheduler with analytic cost-budget chunk sizing for PP chunked prefill.
 
-    Holds each step to a per-step cost budget ``T*`` by picking, for every
-    request, the largest allowed chunk whose predicted latency fits the
-    remaining budget (floor ``c_min``).  ``T(h, c)`` is analytic (no profiling).
+    Holds each step to a per-step cost budget ``T*`` with fit-or-skip
+    semantics: the first prefill of a step (head-of-line, FCFS) is sized
+    against the full budget and floored at ``c_min`` (progress guaranteed);
+    every subsequent prefill is scheduled only if a chunk fits the *remaining*
+    budget, and is otherwise deferred to a later step.  Because a shallow
+    request's cheapest chunk fits leftover budget that a deep request's does
+    not, this yields staggered (near-serial) fat-chunk prefills whose
+    quantization headroom is backfilled by cheap low-history chunks -- e.g. the
+    next prompt's head overlapping the current prompt's tail.  ``T(h, c)`` is
+    analytic (no profiling).
     """
 
     def __init__(
@@ -100,6 +107,9 @@ class AnalyticChunkScheduler(Scheduler):
             backfill_reserve_frac=cfg.backfill_reserve_frac,
         )
         self._protect_inflight_prefill = cfg.protect_inflight_prefill
+        # Fit-or-skip head-of-line tracking: True once a chunked prefill has
+        # been sized in the current step (reset at the top of schedule()).
+        self._prefill_scheduled_this_step = False
         logger.info(
             "[AnalyticChunk] Scheduler initialized: h_cross=%d, chunks=%s",
             int(self.analytic_chunk_manager.model.h_cross),
@@ -130,9 +140,19 @@ class AnalyticChunkScheduler(Scheduler):
             remaining_prompt_tokens=remaining_prompt_tokens,
             token_budget=num_new_tokens,
             cost_budget=budget,
+            allow_floor=not self._prefill_scheduled_this_step,
         )
         if chunk is None or chunk <= 0:
-            return num_new_tokens
+            # Fit-or-skip: this prefill's cheapest chunk does not fit the
+            # remaining step budget; defer it to a later step.
+            return 0
+        # Only a chunked-prefill decision (cap above c_min) claims head-of-line
+        # floor privilege; exact tail remainders and spec-decode passthroughs
+        # (cap <= c_min) stay cheap and must not deny the floor to a real
+        # prefill later in the loop.
+        c_min = self.analytic_chunk_manager.selector.c_min
+        if min(remaining_prompt_tokens, num_new_tokens) > c_min:
+            self._prefill_scheduled_this_step = True
         return min(chunk, remaining_prompt_tokens, num_new_tokens)
 
     def _pop_preemption_victim(self) -> Request:
@@ -171,6 +191,7 @@ class AnalyticChunkScheduler(Scheduler):
         token_budget = self.max_num_scheduled_tokens
         # >>> ANALYTIC CHUNK: per-step cost budget shared across requests
         time_budget = self._step_cost_budget()
+        self._prefill_scheduled_this_step = False
         # <<< ANALYTIC CHUNK
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -542,6 +563,10 @@ class AnalyticChunkScheduler(Scheduler):
                         num_new_tokens=num_new_tokens,
                         budget=waiting_budget,
                     )
+                    if num_new_tokens == 0:
+                        # Fit-or-skip: the head-of-queue prefill does not fit
+                        # the remaining step budget; stop admitting (FCFS).
+                        break
                     waiting_budget = self._consume_budget(
                         waiting_budget, num_computed_tokens, num_new_tokens
                     )

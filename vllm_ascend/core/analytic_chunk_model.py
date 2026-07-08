@@ -72,9 +72,12 @@ class SmoothChunkSelector:
     """Floor-tracking chunk selection under a shared per-step cost budget.
 
     Returns the largest allowed chunk whose predicted latency stays under
-    ``max(cost_budget, floor(history))`` where ``floor(history) = T(history,
-    c_min)``.  ``c_min`` is therefore always feasible (progress guaranteed); the
-    final short chunk returns the exact remainder.
+    ``cost_budget``.  With ``allow_floor=True`` the budget is raised to
+    ``floor(history) = T(history, c_min)`` so ``c_min`` is always feasible
+    (progress guaranteed).  With ``allow_floor=False`` a request whose cheapest
+    chunk does not fit the remaining budget is deferred (``None``) instead of
+    floored -- fit-or-skip.  The final short chunk (``cap <= c_min``) is always
+    returned exactly regardless of budget (tail-remainder / spec-decode safety).
     """
 
     def __init__(self, model: AnalyticLatencyModel, allowed_chunk_sizes: list[int]) -> None:
@@ -88,14 +91,19 @@ class SmoothChunkSelector:
         remaining_prompt_tokens: int,
         token_budget: int,
         cost_budget: float,
+        allow_floor: bool = True,
     ) -> int | None:
         cap = min(remaining_prompt_tokens, token_budget)
         if cap <= 0:
             return None
         if cap <= self.c_min:
             return cap
-        target = max(cost_budget, self.model.predict(history, self.c_min))
-        best = self.c_min
+        if allow_floor:
+            target = max(cost_budget, self.model.predict(history, self.c_min))
+            best: int | None = self.c_min
+        else:
+            target = cost_budget
+            best = None
         for chunk in self.allowed:
             if chunk > cap:
                 break
@@ -298,13 +306,20 @@ class AnalyticChunkManager:
         return self._backfill_reserve
 
     def select_next_chunk(
-        self, *, history: int, remaining_prompt_tokens: int, token_budget: int, cost_budget: float
+        self,
+        *,
+        history: int,
+        remaining_prompt_tokens: int,
+        token_budget: int,
+        cost_budget: float,
+        allow_floor: bool = True,
     ) -> int | None:
         return self.selector.select_chunk(
             history=history,
             remaining_prompt_tokens=remaining_prompt_tokens,
             token_budget=token_budget,
             cost_budget=cost_budget,
+            allow_floor=allow_floor,
         )
 
     def predict_cost(self, history: int, chunk: int) -> float:
