@@ -73,6 +73,9 @@ class AscendConfig:
                 "or disable profiling_chunk_config."
             )
 
+        kv_fit_config = additional_config.get("kv_fit_config", {})
+        self.kv_fit_config = KVFitConfig(kv_fit_config)
+
         from vllm_ascend import envs as ascend_envs
 
         self.enable_balance_scheduling = self._get_config_value(
@@ -704,6 +707,43 @@ class ProfilingChunkConfig:
             raise ValueError(f"profiling_chunk_config.min_chunk must be positive, got {self.min_chunk}")
         if self.max_fit_chunk <= 5:
             raise ValueError(f"Recommend to use at least 30 data points for fitting, got {self.max_fit_chunk}")
+
+
+class KVFitConfig:
+    """Predictive KV-cache-aware admission scheduling.
+
+    When enabled, the scheduler predicts the peak KV-cache footprint of every
+    candidate request and only admits it when the total peak across all
+    concurrently-running requests fits within the GPU block budget.  This
+    prevents KV-cache overflows and the resulting preemption cascades.
+
+    Does not require pipeline parallelism — works for any deployment mode
+    (TP only, PP, PD-disaggregation).  For PD, the P-node only accounts for
+    prefill tokens (``max_tokens`` is 0 on the P node).
+
+    Usage (online)::
+
+        vllm serve <model> --additional-config '{"kv_fit_config": {"enabled": true}}'
+
+    Usage (offline)::
+
+        llm = LLM(model, additional_config={"kv_fit_config": {"enabled": true}})
+    """
+
+    def __init__(self, config: dict | None = None):
+        if config is None:
+            config = {}
+        self.enabled: bool = config.get("enabled", False)
+        self.kv_safety_margin: float = float(config.get("kv_safety_margin", 0.85))
+        self.log_admission: bool = bool(config.get("log_admission", False))
+        self._validate()
+
+    def _validate(self):
+        if not 0.0 < self.kv_safety_margin <= 1.0:
+            raise ValueError(
+                f"kv_fit_config.kv_safety_margin must be in (0, 1], "
+                f"got {self.kv_safety_margin}"
+            )
 
 
 class RejectionSamplerConfig:

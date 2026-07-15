@@ -688,6 +688,12 @@ class NPUPlatform(Platform):
             )
             import vllm_ascend.patch.platform.patch_profiling_chunk  # noqa
 
+        # Use KVFitScheduler when predictive KV-cache admission is on.
+        if ascend_config.kv_fit_config.enabled:
+            vllm_config.scheduler_config.scheduler_cls = (
+                "vllm_ascend.core.scheduler_kv_fit.KVFitScheduler"
+            )
+
         cp_size = parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
         use_sparse = model_uses_sfa_sparse(model_config)
         sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)
