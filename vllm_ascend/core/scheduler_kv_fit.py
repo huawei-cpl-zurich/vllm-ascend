@@ -14,16 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""KV-fit scheduler: upstream vLLM scheduling with predictive KV-cache admission.
+"""KV-fit scheduler: upstream scheduling with predictive KV-cache admission.
 
-``KVFitScheduler`` subclasses the upstream ``Scheduler`` and injects a
-predictive KV-cache admission gate (``_can_admit``) into the WAITING loop of
-:meth:`schedule`.  A request is only admitted when its predicted peak
-KV-cache footprint, together with all currently running requests, fits within
-the available GPU block budget.
-
-``AsyncKVFitScheduler`` combines the admission logic with
-``AsyncScheduler``'s PP decode cadence.
+Injects a KV-cache admission gate into the WAITING loop of :meth:`schedule`
+to prevent preemption cascades from memory overcommit.
 """
 
 import time
@@ -50,15 +44,13 @@ from vllm.v1.utils import record_function_or_nullcontext
 class KVFitScheduler(Scheduler):
     """Scheduler with predictive KV-cache-aware admission.
 
-    Injects a ``>>> KV-FIT`` admission gate into the WAITING request loop of
-    :meth:`schedule`.  Before admitting a new request the scheduler computes
-    the predicted peak KV-cache usage across all running requests plus the
-    candidate and only allows admission when the total fits within the GPU
-    block budget (with a configurable safety margin).
+    Injects a ``>>> KV-FIT`` gate into the WAITING loop of :meth:`schedule`
+    that only admits a request when its predicted peak KV-cache footprint,
+    together with all running requests, fits within the GPU block budget.
 
-    The rest of :meth:`schedule` is a verbatim copy of the upstream vLLM
-    v0.23.0 ``Scheduler.schedule()``.  When upstream changes, re-copy and
-    re-apply the ``>>> KV-FIT`` hook.
+    :meth:`schedule` is a verbatim copy of upstream vLLM v0.23.0
+    ``Scheduler.schedule()``.  Re-copy and re-apply the hook when upstream
+    changes.
     """
 
     def __init__(
@@ -90,6 +82,8 @@ class KVFitScheduler(Scheduler):
         self._kv_fit_enabled: bool = cfg.enabled
         self._kv_safety_margin: float = cfg.kv_safety_margin
         self._kv_fit_log: bool = cfg.log_admission
+        self._kv_fit_sim_step: int = cfg.simulation_step_tokens
+        self._kv_fit_max_sim_steps: int = cfg.max_simulation_steps
         self._kv_fit_block_budget: int = int(
             self.cache_config.num_gpu_blocks * self._kv_safety_margin
         )
@@ -97,10 +91,11 @@ class KVFitScheduler(Scheduler):
         if self._kv_fit_enabled:
             logger.info(
                 "[KVFit] Scheduler initialized: num_gpu_blocks=%d, "
-                "block_budget=%d, safety_margin=%.2f, block_size=%d",
+                "block_budget=%d, safety_margin=%.2f, sim_step=%d, block_size=%d",
                 self.cache_config.num_gpu_blocks,
                 self._kv_fit_block_budget,
                 self._kv_safety_margin,
+                self._kv_fit_sim_step,
                 self.cache_config.block_size,
             )
 
@@ -114,12 +109,10 @@ class KVFitScheduler(Scheduler):
         return (a + b - 1) // b
 
     def _peak_kv_blocks(self, request: Request) -> int:
-        """Predicted peak KV-cache blocks for *request* through its full
-        lifetime (prefill + decode).
+        """Peak KV-cache blocks for *request* (prefill + decode).
 
-        For PD-disaggregated prefill nodes (``max_tokens == 0``) this equals
-        ``ceil(prompt_len / block_size)``.  For combined P+D nodes it uses
-        ``max_tokens`` as a conservative decode-length bound.
+        Uses ``max_tokens`` as a conservative bound for decode length.
+        For PD P-nodes ``max_tokens == 0``, so this is pure prefill.
         """
         total_tokens = request.num_prompt_tokens + request.max_tokens
         return self._cdiv(total_tokens, self.cache_config.block_size)
@@ -128,29 +121,92 @@ class KVFitScheduler(Scheduler):
         """Sum of peak KV-cache blocks for all currently running requests."""
         return sum(self._peak_kv_blocks(r) for r in self.running)
 
+    # ------------------------------------------------------------------
+    # Predictive KV-usage simulation
+    # ------------------------------------------------------------------
+
+    def _simulate_kv_usage(self, candidate: Request) -> bool:
+        """Forward simulation of KV-cache usage.
+
+        Projects block usage at *simulation_step_tokens* granularity.
+        Prefill requests grow toward ``num_prompt_tokens`` and then free
+        their blocks (PD) or persist at peak (non-PD — peak was already
+        captured).  Decode requests are counted at their current near-peak
+        usage throughout.  Returns ``True`` when the total never exceeds
+        *block_budget*.
+        """
+        b = self.cache_config.block_size
+        budget = self._kv_fit_block_budget
+
+        # Fixed usage: requests in decode (near-peak) or fully done.
+        fixed_usage = 0
+        for r in self.running:
+            cap_r = r.num_prompt_tokens + r.max_tokens
+            if r.num_computed_tokens >= cap_r:
+                continue
+            if r.num_computed_tokens >= r.num_prompt_tokens:
+                fixed_usage += self._cdiv(r.num_computed_tokens, b)
+
+        # Active (evolving) list: prefill requests only, capped at prompt_len.
+        active: list[tuple[int, int]] = []  # (current_h, prefill_cap)
+        for r in self.running:
+            if r.num_computed_tokens >= r.num_prompt_tokens:
+                continue
+            active.append((r.num_computed_tokens, r.num_prompt_tokens))
+        active.append((0, candidate.num_prompt_tokens))
+
+        if not active and fixed_usage == 0:
+            return True
+
+        step = self._kv_fit_sim_step
+        max_k = min(
+            max((self._cdiv(cap - cur_h, step)
+                 for cur_h, cap in active if cap > cur_h), default=0),
+            self._kv_fit_max_sim_steps,
+        )
+
+        for k in range(max_k + 1):
+            usage = fixed_usage
+            for cur_h, cap in active:
+                future_h = cur_h + k * step
+                if future_h >= cap:
+                    continue
+                usage += self._cdiv(future_h, b)
+            if usage > budget:
+                if self._kv_fit_log:
+                    logger.info(
+                        "[KVFit] Simulation rejected %s at step %d: "
+                        "usage=%d > budget=%d (fixed=%d)",
+                        candidate.request_id, k, usage, budget, fixed_usage,
+                    )
+                return False
+        return True
+
     def _can_admit(self, request: Request) -> bool:
-        """Return ``True`` if *request* can be admitted without risking a
-        KV-cache overflow.
+        """Two-stage KV-cache admission gate.
 
-        Computes the total predicted peak KV-cache footprint (running requests
-        + candidate) and checks whether it fits within the GPU block budget
-        (``num_gpu_blocks * kv_safety_margin``).
-
-        A return value of ``False`` means admitting *request* would put the
-        scheduler at risk of a future preemption cascade; the caller should
-        defer admission to a later step.
+        Stage 1 (fast path): absolute peak fits → admit immediately.
+        Stage 2 (simulation): project forward step-by-step to check whether
+        running requests finish before the candidate would cause overflow.
+        Returns ``False`` when admission should be deferred.
         """
         if not self._kv_fit_enabled:
             return True
 
+        # Stage 1: fast-path absolute peak check.
         peak = self._running_peak_kv_blocks() + self._peak_kv_blocks(request)
         if peak <= self._kv_fit_block_budget:
+            return True
+
+        # Stage 2: step-by-step simulation.
+        if self._simulate_kv_usage(request):
             return True
 
         if self._kv_fit_log:
             logger.info(
                 "[KVFit] Deferred admission for %s: "
-                "peak_blocks=%d > budget=%d (running=%d candidate=%d)",
+                "peak_blocks=%d > budget=%d (running=%d candidate=%d) "
+                "and simulation rejected",
                 request.request_id,
                 peak,
                 self._kv_fit_block_budget,
@@ -160,12 +216,7 @@ class KVFitScheduler(Scheduler):
         return False
 
     # ------------------------------------------------------------------
-    # schedule()
-    #
-    # Verbatim copy of upstream vLLM v0.23.0 Scheduler.schedule() with a
-    # single ``>>> KV-FIT`` injection in the WAITING loop.
-    #
-    # Re-sync by recopying upstream schedule() and re-applying the hook.
+    # schedule() — verbatim upstream v0.23.0 with ``>>> KV-FIT`` injection.
     # ------------------------------------------------------------------
 
     def schedule(self) -> SchedulerOutput:
@@ -804,10 +855,4 @@ class KVFitScheduler(Scheduler):
 
 
 class AsyncKVFitScheduler(AsyncScheduler, KVFitScheduler):
-    """Async-scheduling variant.
-
-    MRO ``AsyncKVFitScheduler -> AsyncScheduler -> KVFitScheduler ->
-    Scheduler`` gives it the KV-FIT admission gate together with
-    :class:`AsyncScheduler`'s PP decode cadence
-    (``next_decode_eligible_step``) and async output handling.
-    """
+    """Async variant: adds PP decode cadence via :class:`AsyncScheduler`."""

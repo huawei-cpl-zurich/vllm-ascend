@@ -736,6 +736,16 @@ class KVFitConfig:
         self.enabled: bool = config.get("enabled", False)
         self.kv_safety_margin: float = float(config.get("kv_safety_margin", 0.85))
         self.log_admission: bool = bool(config.get("log_admission", False))
+        # Tokens-per-step granularity for the KV-usage simulation.
+        # Smaller values give more accurate projections at the cost of
+        # more iterations.  1024 is ~100 steps for a 100 k request.
+        self.simulation_step_tokens: int = int(
+            config.get("simulation_step_tokens", 1024)
+        )
+        # Upper bound on simulated steps to keep the admission check O(1).
+        self.max_simulation_steps: int = int(
+            config.get("max_simulation_steps", 5000)
+        )
         self._validate()
 
     def _validate(self):
@@ -743,6 +753,11 @@ class KVFitConfig:
             raise ValueError(
                 f"kv_fit_config.kv_safety_margin must be in (0, 1], "
                 f"got {self.kv_safety_margin}"
+            )
+        if self.simulation_step_tokens < 1:
+            raise ValueError(
+                "kv_fit_config.simulation_step_tokens must be >= 1, "
+                f"got {self.simulation_step_tokens}"
             )
 
 
