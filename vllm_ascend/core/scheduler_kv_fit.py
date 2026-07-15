@@ -82,7 +82,6 @@ class KVFitScheduler(Scheduler):
         self._kv_fit_enabled: bool = cfg.enabled
         self._kv_safety_margin: float = cfg.kv_safety_margin
         self._kv_fit_log: bool = cfg.log_admission
-        self._kv_fit_sim_step: int = cfg.simulation_step_tokens
         self._kv_fit_max_sim_steps: int = cfg.max_simulation_steps
         self._kv_fit_block_budget: int = int(
             self.cache_config.num_gpu_blocks * self._kv_safety_margin
@@ -91,11 +90,12 @@ class KVFitScheduler(Scheduler):
         if self._kv_fit_enabled:
             logger.info(
                 "[KVFit] Scheduler initialized: num_gpu_blocks=%d, "
-                "block_budget=%d, safety_margin=%.2f, sim_step=%d, block_size=%d",
+                "block_budget=%d, safety_margin=%.2f, max_sim_events=%d, "
+                "block_size=%d",
                 self.cache_config.num_gpu_blocks,
                 self._kv_fit_block_budget,
                 self._kv_safety_margin,
-                self._kv_fit_sim_step,
+                self._kv_fit_max_sim_steps,
                 self.cache_config.block_size,
             )
 
@@ -108,14 +108,38 @@ class KVFitScheduler(Scheduler):
         """Integer ceiling division."""
         return (a + b - 1) // b
 
+    def _predicted_total_tokens(self, request: Request) -> int:
+        """Predicted lifetime token count for admission simulation.
+        Keep pessimistic: the request's configured ``max_tokens``
+        is the decode estimate.
+        """
+        return min(
+            request.num_prompt_tokens + request.max_tokens,
+            self.max_model_len,
+        )
+
     def _peak_kv_blocks(self, request: Request) -> int:
         """Peak KV-cache blocks for *request* (prefill + decode).
 
-        Uses ``max_tokens`` as a conservative bound for decode length.
+        Uses ``max_tokens`` as a conservative decode-length prediction.
         For PD P-nodes ``max_tokens == 0``, so this is pure prefill.
         """
-        total_tokens = request.num_prompt_tokens + request.max_tokens
-        return self._cdiv(total_tokens, self.cache_config.block_size)
+        return self._cdiv(
+            self._predicted_total_tokens(request),
+            self.cache_config.block_size,
+        )
+
+    def _scheduled_progress(
+        self,
+        request: Request,
+        num_scheduled_tokens: dict[str, int],
+    ) -> int:
+        """Tokens the request will have allocated after this schedule step."""
+        return min(
+            request.num_computed_tokens
+            + num_scheduled_tokens.get(request.request_id, 0),
+            self._predicted_total_tokens(request),
+        )
 
     def _running_peak_kv_blocks(self) -> int:
         """Sum of peak KV-cache blocks for all currently running requests."""
@@ -125,64 +149,141 @@ class KVFitScheduler(Scheduler):
     # Predictive KV-usage simulation
     # ------------------------------------------------------------------
 
-    def _simulate_kv_usage(self, candidate: Request) -> bool:
-        """Forward simulation of KV-cache usage.
+    def _simulate_kv_usage(
+        self,
+        candidate: Request,
+        candidate_num_new_tokens: int,
+        candidate_computed_tokens: int,
+        num_scheduled_tokens: dict[str, int],
+    ) -> bool:
+        """Event-driven forward simulation of KV-cache usage.
 
-        Projects block usage at *simulation_step_tokens* granularity.
-        Prefill requests grow toward ``num_prompt_tokens`` and then free
-        their blocks (PD) or persist at peak (non-PD — peak was already
-        captured).  Decode requests are counted at their current near-peak
-        usage throughout.  Returns ``True`` when the total never exceeds
-        *block_budget*.
+        Fast-forward simulator with a simple pessimistic
+        output prediction.  The candidate first receives the tokens selected
+        for the next forward pass, then all active requests are advanced to the
+        next predicted completion event.  Blocks are released only when a
+        request reaches its predicted total length, not when prefill completes.
         """
         b = self.cache_config.block_size
         budget = self._kv_fit_block_budget
 
-        # Fixed usage: requests in decode (near-peak) or fully done.
-        fixed_usage = 0
-        for r in self.running:
-            cap_r = r.num_prompt_tokens + r.max_tokens
-            if r.num_computed_tokens >= cap_r:
-                continue
-            if r.num_computed_tokens >= r.num_prompt_tokens:
-                fixed_usage += self._cdiv(r.num_computed_tokens, b)
-
-        # Active (evolving) list: prefill requests only, capped at prompt_len.
-        active: list[tuple[int, int]] = []  # (current_h, prefill_cap)
-        for r in self.running:
-            if r.num_computed_tokens >= r.num_prompt_tokens:
-                continue
-            active.append((r.num_computed_tokens, r.num_prompt_tokens))
-        active.append((0, candidate.num_prompt_tokens))
-
-        if not active and fixed_usage == 0:
+        # Always allow the lone request through so a safety margin cannot
+        # deadlock a valid workload whose single-request footprint exceeds the
+        # reserved budget but still fits in the real KV cache.
+        if not self.running:
             return True
 
-        step = self._kv_fit_sim_step
-        max_k = min(
-            max((self._cdiv(cap - cur_h, step)
-                 for cur_h, cap in active if cap > cur_h), default=0),
-            self._kv_fit_max_sim_steps,
-        )
+        states: list[dict[str, int]] = []
+        used_blocks = 0
+        for r in self.running:
+            current = self._scheduled_progress(r, num_scheduled_tokens)
+            target = self._predicted_total_tokens(r)
+            blocks = self._cdiv(current, b)
+            used_blocks += blocks
+            states.append({
+                "current": current,
+                "target": target,
+                "blocks": blocks,
+            })
 
-        for k in range(max_k + 1):
-            usage = fixed_usage
-            for cur_h, cap in active:
-                future_h = cur_h + k * step
-                if future_h >= cap:
-                    continue
-                usage += self._cdiv(future_h, b)
-            if usage > budget:
+        candidate_current = min(
+            candidate_computed_tokens + candidate_num_new_tokens,
+            self._predicted_total_tokens(candidate),
+        )
+        candidate_target = self._predicted_total_tokens(candidate)
+        candidate_blocks = self._cdiv(candidate_current, b)
+        used_blocks += candidate_blocks
+
+        if used_blocks > budget:
+            if self._kv_fit_log:
+                logger.info(
+                    "[KVFit] Simulation rejected %s at admission: "
+                    "usage=%d > budget=%d",
+                    candidate.request_id,
+                    used_blocks,
+                    budget,
+                )
+            return False
+
+        states.sort(key=lambda state: state["target"] - state["current"])
+        simulated_events = 0
+        while candidate_current < candidate_target and states:
+            if simulated_events >= self._kv_fit_max_sim_steps:
                 if self._kv_fit_log:
                     logger.info(
-                        "[KVFit] Simulation rejected %s at step %d: "
-                        "usage=%d > budget=%d (fixed=%d)",
-                        candidate.request_id, k, usage, budget, fixed_usage,
+                        "[KVFit] Simulation rejected %s: exceeded max events=%d",
+                        candidate.request_id,
+                        self._kv_fit_max_sim_steps,
                     )
                 return False
+
+            next_state = states[0]
+            running_remaining = next_state["target"] - next_state["current"]
+            candidate_remaining = candidate_target - candidate_current
+            step = min(running_remaining, candidate_remaining)
+
+            if step <= 0:
+                used_blocks -= next_state["blocks"]
+                states.pop(0)
+                continue
+
+            simulated_events += 1
+            new_candidate_current = candidate_current + step
+            new_candidate_blocks = self._cdiv(new_candidate_current, b)
+            used_blocks += new_candidate_blocks - candidate_blocks
+            candidate_current = new_candidate_current
+            candidate_blocks = new_candidate_blocks
+
+            for state in states:
+                new_current = min(state["current"] + step, state["target"])
+                new_blocks = self._cdiv(new_current, b)
+                used_blocks += new_blocks - state["blocks"]
+                state["current"] = new_current
+                state["blocks"] = new_blocks
+
+            if used_blocks > budget:
+                if self._kv_fit_log:
+                    logger.info(
+                        "[KVFit] Simulation rejected %s after event %d: "
+                        "usage=%d > budget=%d",
+                        candidate.request_id,
+                        simulated_events,
+                        used_blocks,
+                        budget,
+                    )
+                return False
+
+            completed_prefix = 0
+            for state in states:
+                if state["current"] < state["target"]:
+                    break
+                used_blocks -= state["blocks"]
+                completed_prefix += 1
+            if completed_prefix:
+                states = states[completed_prefix:]
+
+        if candidate_current < candidate_target:
+            candidate_peak_blocks = self._cdiv(candidate_target, b)
+            if candidate_peak_blocks > budget:
+                if self._kv_fit_log:
+                    logger.info(
+                        "[KVFit] Simulation rejected %s after all running "
+                        "requests complete: candidate_peak=%d > budget=%d",
+                        candidate.request_id,
+                        candidate_peak_blocks,
+                        budget,
+                    )
+                return False
+
         return True
 
-    def _can_admit(self, request: Request) -> bool:
+    def _can_admit(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_computed_tokens: int,
+        num_scheduled_tokens: dict[str, int],
+    ) -> bool:
         """Two-stage KV-cache admission gate.
 
         Stage 1 (fast path): absolute peak fits → admit immediately.
@@ -199,7 +300,12 @@ class KVFitScheduler(Scheduler):
             return True
 
         # Stage 2: step-by-step simulation.
-        if self._simulate_kv_usage(request):
+        if self._simulate_kv_usage(
+            request,
+            num_new_tokens,
+            num_computed_tokens,
+            num_scheduled_tokens,
+        ):
             return True
 
         if self._kv_fit_log:
@@ -455,13 +561,6 @@ class KVFitScheduler(Scheduler):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
-                # >>> KV-FIT: predictive KV-cache admission gate
-                if not self._can_admit(request):
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-                # <<< KV-FIT
-
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -616,6 +715,19 @@ class KVFitScheduler(Scheduler):
                     )
                     if num_new_tokens == 0:
                         break
+
+                # >>> KV-FIT: predictive KV-cache admission gate.
+                # Run after num_new_tokens is known so the simulator can model
+                # the candidate's real next forward-pass allocation.
+                if not load_kv_async and not self._can_admit(
+                    request,
+                    num_new_tokens,
+                    num_computed_tokens,
+                    num_scheduled_tokens,
+                ):
+                    # Do not admit more waiting requests in this iteration
+                    break
+                # <<< KV-FIT
 
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an

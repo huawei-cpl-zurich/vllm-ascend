@@ -712,10 +712,11 @@ class ProfilingChunkConfig:
 class KVFitConfig:
     """Predictive KV-cache-aware admission scheduling.
 
-    When enabled, the scheduler predicts the peak KV-cache footprint of every
-    candidate request and only admits it when the total peak across all
-    concurrently-running requests fits within the GPU block budget.  This
-    prevents KV-cache overflows and the resulting preemption cascades.
+    When enabled, the scheduler admits waiting requests through a KV-cache
+    simulation gate.  The gate uses each request's configured ``max_tokens`` as
+    a conservative decode-length estimate, then fast-forwards active requests
+    to predicted completion events before deciding whether a candidate can join
+    without causing future KV-cache overflow.
 
     Does not require pipeline parallelism — works for any deployment mode
     (TP only, PP, PD-disaggregation).  For PD, the P-node only accounts for
@@ -736,9 +737,9 @@ class KVFitConfig:
         self.enabled: bool = config.get("enabled", False)
         self.kv_safety_margin: float = float(config.get("kv_safety_margin", 0.85))
         self.log_admission: bool = bool(config.get("log_admission", False))
-        # Tokens-per-step granularity for the KV-usage simulation.
-        # Smaller values give more accurate projections at the cost of
-        # more iterations.  1024 is ~100 steps for a 100 k request.
+        # Legacy option from the old token-step simulator.  The current KVFit
+        # simulator is event-driven, so this value is accepted for config
+        # compatibility but no longer affects admission decisions.
         self.simulation_step_tokens: int = int(
             config.get("simulation_step_tokens", 1024)
         )
