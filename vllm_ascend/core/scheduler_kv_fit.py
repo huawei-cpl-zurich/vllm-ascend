@@ -457,7 +457,9 @@ class KVFitScheduler(Scheduler):
 
                 # >>> KV-FIT: predictive KV-cache admission gate
                 if not self._can_admit(request):
-                    break
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
                 # <<< KV-FIT
 
                 # try to promote blocked statuses while traversing skipped queue.
