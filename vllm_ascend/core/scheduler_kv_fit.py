@@ -40,8 +40,10 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm_ascend.core.scheduler_kv_metrics import KVSchedulerMetricsMixin
 
-class KVFitScheduler(Scheduler):
+
+class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
     """Scheduler with predictive KV-cache-aware admission.
 
     Injects a ``>>> KV-FIT`` gate into the WAITING loop of :meth:`schedule`
@@ -98,6 +100,7 @@ class KVFitScheduler(Scheduler):
                 self._kv_fit_max_sim_steps,
                 self.cache_config.block_size,
             )
+        self._init_kv_scheduler_metrics(vllm_config)
 
     # ------------------------------------------------------------------
     # KV admission helpers
@@ -965,6 +968,7 @@ class KVFitScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._record_kv_scheduler_metrics(scheduler_output)
         return scheduler_output
 
 

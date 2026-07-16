@@ -75,6 +75,9 @@ class AscendConfig:
 
         kv_fit_config = additional_config.get("kv_fit_config", {})
         self.kv_fit_config = KVFitConfig(kv_fit_config)
+        self.kv_scheduler_metrics_config = KVSchedulerMetricsConfig(
+            additional_config.get("kv_scheduler_metrics_config", {})
+        )
 
         from vllm_ascend import envs as ascend_envs
 
@@ -759,6 +762,37 @@ class KVFitConfig:
             raise ValueError(
                 "kv_fit_config.simulation_step_tokens must be >= 1, "
                 f"got {self.simulation_step_tokens}"
+            )
+
+
+class KVSchedulerMetricsConfig:
+    """Configuration for KV scheduler preemption/page instrumentation.
+
+    Usage for a baseline run that preserves upstream scheduling behavior::
+
+        vllm serve <model> --additional-config \
+            '{"kv_scheduler_metrics_config": {"enabled": true}}'
+
+    Usage with KVFit::
+
+        vllm serve <model> --additional-config \
+            '{"kv_fit_config": {"enabled": true}, '
+            '"kv_scheduler_metrics_config": {"enabled": true, "label": "kvfit"}}'
+    """
+
+    def __init__(self, config: dict | None = None):
+        if config is None:
+            config = {}
+        self.enabled: bool = bool(config.get("enabled", False))
+        self.log_interval: int = int(config.get("log_interval", 1))
+        self.label: str = str(config.get("label", "scheduler"))
+        self._validate()
+
+    def _validate(self):
+        if self.log_interval < 1:
+            raise ValueError(
+                "kv_scheduler_metrics_config.log_interval must be >= 1, "
+                f"got {self.log_interval}"
             )
 
 

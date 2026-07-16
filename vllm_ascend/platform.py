@@ -688,6 +688,22 @@ class NPUPlatform(Platform):
             )
             import vllm_ascend.patch.platform.patch_profiling_chunk  # noqa
 
+        # Use upstream scheduling plus KV/preemption counters when requested.
+        # KVFit below intentionally overrides this so both runs can use the
+        # same metrics config with different scheduling behavior.
+        if (
+            ascend_config.kv_scheduler_metrics_config.enabled
+            and not ascend_config.kv_fit_config.enabled
+        ):
+            if vllm_config.scheduler_config.async_scheduling:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.scheduler_kv_metrics.AsyncKVMetricsScheduler"
+                )
+            else:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.scheduler_kv_metrics.KVMetricsScheduler"
+                )
+
         # Use KVFitScheduler when predictive KV-cache admission is on.
         if ascend_config.kv_fit_config.enabled:
             vllm_config.scheduler_config.scheduler_cls = (
