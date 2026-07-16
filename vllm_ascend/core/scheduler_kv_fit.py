@@ -85,6 +85,9 @@ class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
         self._kv_safety_margin: float = cfg.kv_safety_margin
         self._kv_fit_log: bool = cfg.log_admission
         self._kv_fit_max_sim_steps: int = cfg.max_simulation_steps
+        self._kv_fit_allow_partial_prefill_overlap: bool = (
+            cfg.allow_partial_prefill_overlap
+        )
         self._kv_fit_block_budget: int = int(
             self.cache_config.num_gpu_blocks * self._kv_safety_margin
         )
@@ -93,12 +96,19 @@ class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
             logger.info(
                 "[KVFit] Scheduler initialized: num_gpu_blocks=%d, "
                 "block_budget=%d, safety_margin=%.2f, max_sim_events=%d, "
-                "block_size=%d",
+                "block_size=%d, partial_prefill_overlap=%s, "
+                "scheduler_reserve_full_isl=%s, max_num_scheduled_tokens=%d, "
+                "max_num_batched_tokens=%d, long_prefill_token_threshold=%d",
                 self.cache_config.num_gpu_blocks,
                 self._kv_fit_block_budget,
                 self._kv_safety_margin,
                 self._kv_fit_max_sim_steps,
                 self.cache_config.block_size,
+                self._kv_fit_allow_partial_prefill_overlap,
+                self.scheduler_reserve_full_isl,
+                self.max_num_scheduled_tokens,
+                self.scheduler_config.max_num_batched_tokens,
+                self.scheduler_config.long_prefill_token_threshold,
             )
         self._init_kv_scheduler_metrics(vllm_config)
 
@@ -147,6 +157,53 @@ class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
     def _running_peak_kv_blocks(self) -> int:
         """Sum of peak KV-cache blocks for all currently running requests."""
         return sum(self._peak_kv_blocks(r) for r in self.running)
+
+    def _next_chunk_tokens(self, request: Request, current_tokens: int) -> int:
+        target = self._predicted_total_tokens(request)
+        remaining = max(target - current_tokens, 0)
+        if remaining == 0:
+            return 0
+
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < remaining:
+            remaining = threshold
+        remaining = min(remaining, self.max_num_scheduled_tokens)
+        return min(remaining, max(self.max_model_len - 1 - current_tokens, 0))
+
+    def _next_chunk_blocks(
+        self,
+        request: Request,
+        num_scheduled_tokens: dict[str, int],
+    ) -> int:
+        current = self._scheduled_progress(request, num_scheduled_tokens)
+        next_tokens = self._next_chunk_tokens(request, current)
+        if next_tokens <= 0:
+            return 0
+
+        b = self.cache_config.block_size
+        return self._cdiv(current + next_tokens, b) - self._cdiv(current, b)
+
+    def _older_request_next_chunk_reserve(
+        self,
+        request_index: int,
+        num_scheduled_tokens: dict[str, int],
+    ) -> int:
+        """Reserve one future chunk for older running requests.
+
+        This lets KVFit overlap a younger partial prefill while avoiding the
+        next-step preemption that would happen if the younger request consumed
+        all remaining pages.
+        """
+        if (
+            not self._kv_fit_enabled
+            or not self._kv_fit_allow_partial_prefill_overlap
+            or request_index <= 0
+        ):
+            return 0
+        return sum(
+            self._next_chunk_blocks(request, num_scheduled_tokens)
+            for request in self.running[:request_index]
+        )
 
     # ------------------------------------------------------------------
     # Predictive KV-usage simulation
@@ -280,6 +337,41 @@ class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
 
         return True
 
+    def _can_start_partial_overlap(
+        self,
+        candidate: Request,
+        candidate_num_new_tokens: int,
+        candidate_computed_tokens: int,
+        num_scheduled_tokens: dict[str, int],
+    ) -> bool:
+        """Allow a candidate to use KV headroom without requiring co-completion.
+
+        This is intentionally weaker than the full forward simulation: it only
+        admits the next chunk when the candidate can fit by itself and the
+        first overlapped chunk fits with the current running set. Future chunks
+        for younger running requests are gated by one-chunk reservations for
+        older requests.
+        """
+        if not self._kv_fit_allow_partial_prefill_overlap:
+            return False
+        if candidate_num_new_tokens <= 0:
+            return False
+        if self._peak_kv_blocks(candidate) > self._kv_fit_block_budget:
+            return False
+
+        b = self.cache_config.block_size
+        used_blocks = sum(
+            self._cdiv(self._scheduled_progress(request, num_scheduled_tokens), b)
+            for request in self.running
+        )
+        candidate_current = min(
+            candidate_computed_tokens + candidate_num_new_tokens,
+            self._predicted_total_tokens(candidate),
+        )
+        used_blocks += self._cdiv(candidate_current, b)
+
+        return used_blocks <= self._kv_fit_block_budget
+
     def _can_admit(
         self,
         request: Request,
@@ -309,6 +401,22 @@ class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
             num_computed_tokens,
             num_scheduled_tokens,
         ):
+            return True
+
+        if self._can_start_partial_overlap(
+            request,
+            num_new_tokens,
+            num_computed_tokens,
+            num_scheduled_tokens,
+        ):
+            if self._kv_fit_log:
+                logger.info(
+                    "[KVFit] Partially admitting %s: "
+                    "peak_blocks=%d > budget=%d; next chunk fits",
+                    request.request_id,
+                    peak,
+                    self._kv_fit_block_budget,
+                )
             return True
 
         if self._kv_fit_log:
@@ -449,11 +557,17 @@ class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
+                defer_running_request = False
                 while True:
+                    reserved_blocks = self._older_request_next_chunk_reserve(
+                        req_index,
+                        num_scheduled_tokens,
+                    )
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        reserved_blocks=reserved_blocks,
                     )
 
                     if new_blocks is not None:
@@ -461,6 +575,19 @@ class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
                         break
 
                     # The request cannot be scheduled.
+                    if (
+                        self._kv_fit_enabled
+                        and self._kv_fit_allow_partial_prefill_overlap
+                        and req_index > 0
+                        and request.num_computed_tokens < request.num_prompt_tokens
+                    ):
+                        # Keep the partially-prefilled request resident, but
+                        # park it until older requests release or need fewer
+                        # pages. This avoids turning useful overlap into a
+                        # preemption cascade.
+                        defer_running_request = True
+                        break
+
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
@@ -494,6 +621,10 @@ class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
                         break
+
+            if defer_running_request:
+                req_index += 1
+                continue
 
             if new_blocks is None:
                 # Cannot schedule this request.
@@ -761,6 +892,21 @@ class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
                     # only if it fits in (free - other in-flight reservations), to
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
+                elif (
+                    self._kv_fit_enabled
+                    and self._kv_fit_allow_partial_prefill_overlap
+                ):
+                    reserved_blocks = self._older_request_next_chunk_reserve(
+                        len(self.running),
+                        num_scheduled_tokens,
+                    )
+
+                full_sequence_must_fit = self.scheduler_reserve_full_isl
+                if (
+                    self._kv_fit_enabled
+                    and self._kv_fit_allow_partial_prefill_overlap
+                ):
+                    full_sequence_must_fit = False
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -771,7 +917,7 @@ class KVFitScheduler(KVSchedulerMetricsMixin, Scheduler):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    full_sequence_must_fit=full_sequence_must_fit,
                     reserved_blocks=reserved_blocks,
                 )
 

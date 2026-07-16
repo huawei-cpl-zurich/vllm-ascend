@@ -45,6 +45,19 @@ class KVSchedulerMetricsMixin:
         self._kv_metrics_total_preemptions: int = 0
         self._kv_metrics_peak_used_pages: int = 0
         self._kv_metrics_steps: int = 0
+        if self._kv_metrics_enabled:
+            logger.info(
+                "[KVSchedulerMetrics][%s] initialized: "
+                "max_num_scheduled_tokens=%d max_num_batched_tokens=%d "
+                "max_num_seqs=%d long_prefill_token_threshold=%d "
+                "scheduler_reserve_full_isl=%s",
+                self._kv_metrics_label,
+                self.max_num_scheduled_tokens,
+                self.scheduler_config.max_num_batched_tokens,
+                self.scheduler_config.max_num_seqs,
+                self.scheduler_config.long_prefill_token_threshold,
+                self.scheduler_reserve_full_isl,
+            )
 
     def _kv_page_counts(self) -> tuple[int, int, int, float]:
         block_pool = self.kv_cache_manager.block_pool

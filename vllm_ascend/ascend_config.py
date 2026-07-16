@@ -720,6 +720,9 @@ class KVFitConfig:
     a conservative decode-length estimate, then fast-forwards active requests
     to predicted completion events before deciding whether a candidate can join
     without causing future KV-cache overflow.
+    ``allow_partial_prefill_overlap`` lets KVFit use spare KV pages for a
+    waiting request's next prefill chunk even when the full prompts cannot
+    fit together; younger partial prefills are parked before preemption.
 
     Does not require pipeline parallelism — works for any deployment mode
     (TP only, PP, PD-disaggregation).  For PD, the P-node only accounts for
@@ -740,6 +743,9 @@ class KVFitConfig:
         self.enabled: bool = config.get("enabled", False)
         self.kv_safety_margin: float = float(config.get("kv_safety_margin", 0.85))
         self.log_admission: bool = bool(config.get("log_admission", False))
+        self.allow_partial_prefill_overlap: bool = bool(
+            config.get("allow_partial_prefill_overlap", True)
+        )
         # Legacy option from the old token-step simulator.  The current KVFit
         # simulator is event-driven, so this value is accepted for config
         # compatibility but no longer affects admission decisions.
