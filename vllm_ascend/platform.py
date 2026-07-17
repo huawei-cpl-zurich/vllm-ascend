@@ -706,9 +706,14 @@ class NPUPlatform(Platform):
 
         # Use KVFitScheduler when predictive KV-cache admission is on.
         if ascend_config.kv_fit_config.enabled:
-            vllm_config.scheduler_config.scheduler_cls = (
-                "vllm_ascend.core.scheduler_kv_fit.KVFitScheduler"
-            )
+            if vllm_config.scheduler_config.async_scheduling:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.scheduler_kv_fit.AsyncKVFitScheduler"
+                )
+            else:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.scheduler_kv_fit.KVFitScheduler"
+                )
 
         cp_size = parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
         use_sparse = model_uses_sfa_sparse(model_config)
