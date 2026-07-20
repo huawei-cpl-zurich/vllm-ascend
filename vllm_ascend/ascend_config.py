@@ -715,14 +715,11 @@ class ProfilingChunkConfig:
 class KVFitConfig:
     """Predictive KV-cache-aware admission scheduling.
 
-    When enabled, the scheduler admits waiting requests through a KV-cache
-    simulation gate.  The gate uses each request's configured ``max_tokens`` as
-    a conservative decode-length estimate, then fast-forwards active requests
-    to predicted completion events before deciding whether a candidate can join
-    without causing future KV-cache overflow.
-    ``allow_partial_prefill_overlap`` lets KVFit use spare KV pages for a
-    waiting request's next prefill chunk even when the full prompts cannot
-    fit together; younger partial prefills are parked before preemption.
+    When enabled, the scheduler admits waiting requests only when the predicted
+    lifetime KV footprint of resident running requests plus the candidate fits
+    in the usable KV-cache budget, or when a chunk-aware scheduler simulation
+    proves that the requests can complete without overflowing KV. The gate uses
+    each request's configured ``max_tokens`` as the decode-length estimate.
 
     Does not require pipeline parallelism — works for any deployment mode
     (TP only, PP, PD-disaggregation).  For PD, the P-node only accounts for
@@ -741,20 +738,10 @@ class KVFitConfig:
         if config is None:
             config = {}
         self.enabled: bool = config.get("enabled", False)
-        self.kv_safety_margin: float = float(config.get("kv_safety_margin", 0.85))
+        self.kv_safety_margin: float = float(config.get("kv_safety_margin", 1.0))
         self.log_admission: bool = bool(config.get("log_admission", False))
-        self.allow_partial_prefill_overlap: bool = bool(
-            config.get("allow_partial_prefill_overlap", True)
-        )
-        # Legacy option from the old token-step simulator.  The current KVFit
-        # simulator is event-driven, so this value is accepted for config
-        # compatibility but no longer affects admission decisions.
-        self.simulation_step_tokens: int = int(
-            config.get("simulation_step_tokens", 1024)
-        )
-        # Upper bound on simulated steps to keep the admission check O(1).
         self.max_simulation_steps: int = int(
-            config.get("max_simulation_steps", 5000)
+            config.get("max_simulation_steps", 10000)
         )
         self._validate()
 
@@ -764,10 +751,10 @@ class KVFitConfig:
                 f"kv_fit_config.kv_safety_margin must be in (0, 1], "
                 f"got {self.kv_safety_margin}"
             )
-        if self.simulation_step_tokens < 1:
+        if self.max_simulation_steps < 1:
             raise ValueError(
-                "kv_fit_config.simulation_step_tokens must be >= 1, "
-                f"got {self.simulation_step_tokens}"
+                "kv_fit_config.max_simulation_steps must be >= 1, "
+                f"got {self.max_simulation_steps}"
             )
 
 
