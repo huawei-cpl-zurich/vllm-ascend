@@ -700,6 +700,66 @@ class BatchJobSchedConfig:
             )
 
 
+class PREFLOWConfig:
+    """Configuration for PREFLOW prefill scheduling.
+
+    Usage (online)::
+
+        vllm serve <model> --additional-config \
+            '{"scheduler_config": {"preflow_config": {"enabled": true}}}'
+
+    Usage (offline)::
+
+        llm = LLM(model, additional_config={"scheduler_config": {"preflow_config": {"enabled": true}}})
+    """
+
+    _defaults = {
+        "enabled": False,
+        "work_exponent": 1.5,
+        "admission_bypass_budget": 0.2,
+        "age_priority_double": 2.0,
+    }
+
+    def __init__(self, user_config: dict | None = None):
+        user_config = user_config or {}
+        unknown = set(user_config) - set(self._defaults)
+        if unknown:
+            raise ValueError(f"Unknown preflow_config keys: {sorted(unknown)}")
+
+        self.enabled = bool(user_config.get("enabled", self._defaults["enabled"]))
+        self.work_exponent = float(
+            user_config.get("work_exponent", self._defaults["work_exponent"])
+        )
+        self.admission_bypass_budget = float(
+            user_config.get(
+                "admission_bypass_budget",
+                self._defaults["admission_bypass_budget"],
+            )
+        )
+        self.age_priority_double = float(
+            user_config.get(
+                "age_priority_double",
+                self._defaults["age_priority_double"],
+            )
+        )
+        self._validate_config()
+
+    def _validate_config(self):
+        if self.work_exponent <= 0:
+            raise ValueError(
+                f"preflow_config.work_exponent must be positive, got {self.work_exponent}"
+            )
+        if self.admission_bypass_budget < 0:
+            raise ValueError(
+                "preflow_config.admission_bypass_budget must be non-negative, "
+                f"got {self.admission_bypass_budget}"
+            )
+        if self.age_priority_double <= 0:
+            raise ValueError(
+                f"preflow_config.age_priority_double must be positive, got {self.age_priority_double}"
+            )
+
+
 class RejectionSamplerConfig:
     """Configuration for Block Verify and Entropy Verify in Rejection Sampler.
 
@@ -895,6 +955,9 @@ class SchedulerConfig:
         )
         self.batch_job_sched_config = BatchJobSchedConfig(
             self._get_config_value(scheduler_config, additional_config, "batch_job_sched_config", {})
+        )
+        self.preflow_config = PREFLOWConfig(
+            self._get_config_value(scheduler_config, additional_config, "preflow_config", {})
         )
 
     @staticmethod
