@@ -113,6 +113,7 @@ PROTOTYPE_SEEDS = [20260728]
 PREFLOW_WORK_EXPONENT = 1.5
 PREFLOW_ADMISSION_BYPASS_BUDGET = 0.3
 PREFLOW_AGE_PRIORITY_DOUBLE = 2.0
+PREFLOW_WAITING_POLICY = "wsrjf"
 
 TOKEN_ID_LOW = 100
 TOKEN_ID_HIGH_EXCLUSIVE = 32_000
@@ -175,6 +176,7 @@ class BenchmarkConfig:
     preflow_work_exponent: float
     preflow_admission_bypass_budget: float
     preflow_age_priority_double: float
+    preflow_waiting_policy: str
     token_id_low: int
     token_id_high_exclusive: int
     special_token_ids: list[int]
@@ -273,6 +275,7 @@ def make_config() -> BenchmarkConfig:
         preflow_work_exponent=PREFLOW_WORK_EXPONENT,
         preflow_admission_bypass_budget=PREFLOW_ADMISSION_BYPASS_BUDGET,
         preflow_age_priority_double=PREFLOW_AGE_PRIORITY_DOUBLE,
+        preflow_waiting_policy=PREFLOW_WAITING_POLICY,
         token_id_low=TOKEN_ID_LOW,
         token_id_high_exclusive=TOKEN_ID_HIGH_EXCLUSIVE,
         special_token_ids=sorted(SPECIAL_TOKEN_IDS),
@@ -393,6 +396,8 @@ def validate_config(cfg: BenchmarkConfig, schedulers: list[str]) -> None:
             raise ValueError("PREFLOW_ADMISSION_BYPASS_BUDGET must be finite and nonnegative.")
         if cfg.preflow_age_priority_double <= 0 or not math.isfinite(cfg.preflow_age_priority_double):
             raise ValueError("PREFLOW_AGE_PRIORITY_DOUBLE must be finite and positive.")
+        if cfg.preflow_waiting_policy not in {"fcfs_protected", "wsrjf"}:
+            raise ValueError("PREFLOW_WAITING_POLICY must be 'fcfs_protected' or 'wsrjf'.")
 
 
 def verify_preflow_importable() -> None:
@@ -528,6 +533,7 @@ def scheduler_additional_config(scheduler: str, cfg: BenchmarkConfig) -> dict[st
                 "work_exponent": cfg.preflow_work_exponent,
                 "admission_bypass_budget": cfg.preflow_admission_bypass_budget,
                 "age_priority_double": cfg.preflow_age_priority_double,
+                "waiting_policy": cfg.preflow_waiting_policy,
             }
         }
     }

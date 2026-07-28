@@ -719,6 +719,7 @@ class PREFLOWConfig:
         "work_exponent": 1.5,
         "admission_bypass_budget": 0.2,
         "age_priority_double": 2.0,
+        "waiting_policy": "fcfs_protected",
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -728,9 +729,7 @@ class PREFLOWConfig:
             raise ValueError(f"Unknown preflow_config keys: {sorted(unknown)}")
 
         self.enabled = bool(user_config.get("enabled", self._defaults["enabled"]))
-        self.work_exponent = float(
-            user_config.get("work_exponent", self._defaults["work_exponent"])
-        )
+        self.work_exponent = float(user_config.get("work_exponent", self._defaults["work_exponent"]))
         self.admission_bypass_budget = float(
             user_config.get(
                 "admission_bypass_budget",
@@ -743,29 +742,24 @@ class PREFLOWConfig:
                 self._defaults["age_priority_double"],
             )
         )
+        self.waiting_policy = str(user_config.get("waiting_policy", self._defaults["waiting_policy"]))
         self._validate_config()
 
     def _validate_config(self):
         if not math.isfinite(self.work_exponent) or self.work_exponent <= 0:
-            raise ValueError(
-                "preflow_config.work_exponent must be finite and positive, "
-                f"got {self.work_exponent}"
-            )
-        if (
-            not math.isfinite(self.admission_bypass_budget)
-            or self.admission_bypass_budget < 0
-        ):
+            raise ValueError(f"preflow_config.work_exponent must be finite and positive, got {self.work_exponent}")
+        if not math.isfinite(self.admission_bypass_budget) or self.admission_bypass_budget < 0:
             raise ValueError(
                 "preflow_config.admission_bypass_budget must be finite and non-negative, "
                 f"got {self.admission_bypass_budget}"
             )
-        if (
-            not math.isfinite(self.age_priority_double)
-            or self.age_priority_double <= 0
-        ):
+        if not math.isfinite(self.age_priority_double) or self.age_priority_double <= 0:
             raise ValueError(
-                "preflow_config.age_priority_double must be finite and positive, "
-                f"got {self.age_priority_double}"
+                f"preflow_config.age_priority_double must be finite and positive, got {self.age_priority_double}"
+            )
+        if self.waiting_policy not in {"fcfs_protected", "wsrjf"}:
+            raise ValueError(
+                f"preflow_config.waiting_policy must be one of ['fcfs_protected', 'wsrjf'], got {self.waiting_policy!r}"
             )
 
 
