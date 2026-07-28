@@ -54,6 +54,8 @@ MAX_MODEL_LEN = 131_072
 GPU_MEMORY_UTILIZATION = 0.9
 MAX_NUM_BATCHED_TOKENS = 16_384
 MAX_NUM_SEQS = 32
+MAX_NUM_PARTIAL_PREFILLS = 8
+MAX_LONG_PARTIAL_PREFILLS = 8
 ENABLE_CHUNKED_PREFILL = True
 LONG_PREFILL_TOKEN_THRESHOLD = 8_192
 SCHEDULER_RESERVE_FULL_ISL = True
@@ -131,6 +133,8 @@ class BenchmarkConfig:
     gpu_memory_utilization: float
     max_num_batched_tokens: int
     max_num_seqs: int
+    max_num_partial_prefills: int
+    max_long_partial_prefills: int
     enable_chunked_prefill: bool
     long_prefill_token_threshold: int
     scheduler_reserve_full_isl: bool
@@ -226,6 +230,8 @@ def make_config() -> BenchmarkConfig:
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         max_num_seqs=MAX_NUM_SEQS,
+        max_num_partial_prefills=MAX_NUM_PARTIAL_PREFILLS,
+        max_long_partial_prefills=MAX_LONG_PARTIAL_PREFILLS,
         enable_chunked_prefill=ENABLE_CHUNKED_PREFILL,
         long_prefill_token_threshold=LONG_PREFILL_TOKEN_THRESHOLD,
         scheduler_reserve_full_isl=SCHEDULER_RESERVE_FULL_ISL,
@@ -325,6 +331,14 @@ def validate_config(cfg: BenchmarkConfig, schedulers: list[str]) -> None:
         raise ValueError("TOKEN_ID_LOW must be less than TOKEN_ID_HIGH_EXCLUSIVE.")
     if cfg.prompt_variants_per_length <= 0:
         raise ValueError("PROMPT_VARIANTS_PER_LENGTH must be positive.")
+    if cfg.max_num_partial_prefills <= 0:
+        raise ValueError("MAX_NUM_PARTIAL_PREFILLS must be positive.")
+    if cfg.max_long_partial_prefills <= 0:
+        raise ValueError("MAX_LONG_PARTIAL_PREFILLS must be positive.")
+    if cfg.max_num_partial_prefills > cfg.max_num_seqs:
+        raise ValueError("MAX_NUM_PARTIAL_PREFILLS cannot exceed MAX_NUM_SEQS.")
+    if cfg.max_long_partial_prefills > cfg.max_num_partial_prefills:
+        raise ValueError("MAX_LONG_PARTIAL_PREFILLS cannot exceed MAX_NUM_PARTIAL_PREFILLS.")
     token_range = set(range(cfg.token_id_low, cfg.token_id_high_exclusive))
     if token_range.issubset(set(cfg.special_token_ids)):
         raise ValueError("No usable non-special token IDs remain.")
@@ -496,6 +510,8 @@ def make_engine_args(runtime: RuntimeImports, scheduler: str, cfg: BenchmarkConf
         gpu_memory_utilization=cfg.gpu_memory_utilization,
         max_num_batched_tokens=cfg.max_num_batched_tokens,
         max_num_seqs=cfg.max_num_seqs,
+        max_num_partial_prefills=cfg.max_num_partial_prefills,
+        max_long_partial_prefills=cfg.max_long_partial_prefills,
         enable_chunked_prefill=cfg.enable_chunked_prefill,
         long_prefill_token_threshold=cfg.long_prefill_token_threshold,
         scheduler_reserve_full_isl=cfg.scheduler_reserve_full_isl,
@@ -518,19 +534,34 @@ def config_value_to_text(value: Any) -> str:
     return str(getattr(value, "value", value))
 
 
+def resolved_scheduler_class_metadata(scheduler_config: Any) -> dict[str, str]:
+    scheduler_cls = scheduler_config.get_scheduler_cls()
+    return {
+        "module": scheduler_cls.__module__,
+        "name": scheduler_cls.__name__,
+        "qualname": f"{scheduler_cls.__module__}.{scheduler_cls.__qualname__}",
+    }
+
+
 def verify_engine_configuration(engine: Any, scheduler: str, cfg: BenchmarkConfig) -> None:
     load_format = config_value_to_text(engine.vllm_config.load_config.load_format)
     if load_format != cfg.load_format:
         raise RuntimeError(f"Expected vLLM load_format={cfg.load_format!r}, got {load_format!r}.")
-    scheduler_cls = engine.vllm_config.scheduler_config.scheduler_cls
-    scheduler_cls_text = str(scheduler_cls)
-    if scheduler == "preflow" and "PREFLOWScheduler" not in scheduler_cls_text:
+    scheduler_config = engine.vllm_config.scheduler_config
+    scheduler_cls_text = config_value_to_text(scheduler_config.scheduler_cls)
+    scheduler_metadata = resolved_scheduler_class_metadata(scheduler_config)
+    resolved_qualname = scheduler_metadata["qualname"]
+    if scheduler == "preflow" and scheduler_metadata["name"] not in {
+        "PREFLOWScheduler",
+        "AsyncPREFLOWScheduler",
+    }:
         raise RuntimeError(
-            "PREFLOW was requested but the effective scheduler_cls is "
-            f"{scheduler_cls_text!r}. Refusing to silently fall back."
+            "PREFLOW was requested but vLLM resolved scheduler_cls="
+            f"{scheduler_cls_text!r} to {resolved_qualname!r}. Refusing to "
+            "silently fall back."
         )
-    if scheduler == "baseline" and "PREFLOW" in scheduler_cls_text.upper():
-        raise RuntimeError(f"Baseline run unexpectedly selected PREFLOW: {scheduler_cls_text!r}.")
+    if scheduler == "baseline" and "PREFLOW" in resolved_qualname.upper():
+        raise RuntimeError(f"Baseline run unexpectedly resolved PREFLOW: {resolved_qualname!r}.")
 
 
 def effective_engine_configuration(engine: Any) -> dict[str, Any]:
@@ -574,6 +605,16 @@ def effective_engine_configuration(engine: Any) -> dict[str, Any]:
             None,
         ),
         "max_num_seqs": getattr(scheduler_config, "max_num_seqs", None),
+        "max_num_partial_prefills": getattr(
+            scheduler_config,
+            "max_num_partial_prefills",
+            None,
+        ),
+        "max_long_partial_prefills": getattr(
+            scheduler_config,
+            "max_long_partial_prefills",
+            None,
+        ),
         "enable_chunked_prefill": getattr(
             scheduler_config,
             "enable_chunked_prefill",
@@ -591,6 +632,7 @@ def effective_engine_configuration(engine: Any) -> dict[str, Any]:
         ),
         "scheduling_policy": config_value_to_text(getattr(scheduler_config, "policy", None)),
         "scheduler_cls": config_value_to_text(getattr(scheduler_config, "scheduler_cls", None)),
+        "resolved_scheduler_class": resolved_scheduler_class_metadata(scheduler_config),
         "additional_config": vllm_config.additional_config,
     }
 
@@ -996,6 +1038,7 @@ async def run_solo_calibration(
         {
             "latency_by_prompt_length": summary,
             "effective_engine_config": engine_effective_config,
+            "resolved_scheduler_class": engine_effective_config["resolved_scheduler_class"]["qualname"],
         },
     )
 
@@ -1096,6 +1139,7 @@ async def run_mixed_workload(
     summary["scheduler"] = scheduler
     summary["seed"] = seed
     summary["effective_engine_config"] = engine_effective_config
+    summary["resolved_scheduler_class"] = engine_effective_config["resolved_scheduler_class"]["qualname"]
     return records, summary
 
 
@@ -1173,7 +1217,7 @@ def print_run_summary(summary: dict[str, Any]) -> None:
     print(
         "{scheduler:8s} seed={seed} n={n:4d} "
         "meanS={mean_s!s:>9} p95S={p95_s!s:>9} "
-        "ttft={ttft!s:>9} thr={thr!s:>9}".format(
+        "ttft={ttft!s:>9} thr={thr!s:>9} scheduler_cls={scheduler_cls}".format(
             scheduler=summary["scheduler"],
             seed=summary["seed"],
             n=summary["request_count"],
@@ -1181,6 +1225,7 @@ def print_run_summary(summary: dict[str, Any]) -> None:
             p95_s=format_float(summary["p95_relative_slowdown"]),
             ttft=format_float(summary["arithmetic_mean_ttft_s"]),
             thr=format_float(summary["completion_throughput"]),
+            scheduler_cls=summary["resolved_scheduler_class"],
         )
     )
     if warning := summary.get("warning"):
@@ -1204,13 +1249,15 @@ def make_summary_markdown(summary: dict[str, Any]) -> str:
         "",
         "## Runs",
         "",
-        "| scheduler | seed | requests | mean slowdown | p95 slowdown | mean TTFT | throughput | failures |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| scheduler | resolved scheduler class | seed | requests | "
+        "mean slowdown | p95 slowdown | mean TTFT | throughput | failures |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for _, run in sorted(summary["mixed_runs"].items()):
         lines.append(
-            "| {scheduler} | {seed} | {n} | {mean_s} | {p95_s} | {ttft} | {thr} | {fail} |".format(
+            "| {scheduler} | `{scheduler_cls}` | {seed} | {n} | {mean_s} | {p95_s} | {ttft} | {thr} | {fail} |".format(
                 scheduler=run["scheduler"],
+                scheduler_cls=run["resolved_scheduler_class"],
                 seed=run["seed"],
                 n=run["request_count"],
                 mean_s=format_float(run["mean_relative_slowdown"]),
