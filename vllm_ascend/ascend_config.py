@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -745,18 +746,26 @@ class PREFLOWConfig:
         self._validate_config()
 
     def _validate_config(self):
-        if self.work_exponent <= 0:
+        if not math.isfinite(self.work_exponent) or self.work_exponent <= 0:
             raise ValueError(
-                f"preflow_config.work_exponent must be positive, got {self.work_exponent}"
+                "preflow_config.work_exponent must be finite and positive, "
+                f"got {self.work_exponent}"
             )
-        if self.admission_bypass_budget < 0:
+        if (
+            not math.isfinite(self.admission_bypass_budget)
+            or self.admission_bypass_budget < 0
+        ):
             raise ValueError(
-                "preflow_config.admission_bypass_budget must be non-negative, "
+                "preflow_config.admission_bypass_budget must be finite and non-negative, "
                 f"got {self.admission_bypass_budget}"
             )
-        if self.age_priority_double <= 0:
+        if (
+            not math.isfinite(self.age_priority_double)
+            or self.age_priority_double <= 0
+        ):
             raise ValueError(
-                f"preflow_config.age_priority_double must be positive, got {self.age_priority_double}"
+                "preflow_config.age_priority_double must be finite and positive, "
+                f"got {self.age_priority_double}"
             )
 
 
