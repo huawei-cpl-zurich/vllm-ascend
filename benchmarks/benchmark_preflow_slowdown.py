@@ -34,7 +34,7 @@ import random
 import statistics
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -43,25 +43,27 @@ from typing import Any, Literal
 # Editable Experiment Configuration
 # =============================================================================
 
-MODEL = "Qwen/Qwen2.5-7B-Instruct"
+RUN_PROFILE: Literal["prototype", "full"] = "prototype"
+
+MODEL = "/data/weights/Qwen3-30B-A3B-Instruct-2507/"
 TOKENIZER = MODEL
 TRUST_REMOTE_CODE = True
 DTYPE = "bfloat16"
 LOAD_FORMAT = "dummy"
-TENSOR_PARALLEL_SIZE = 1
+TENSOR_PARALLEL_SIZE = 2
 PIPELINE_PARALLEL_SIZE = 1
 MAX_MODEL_LEN = 131_072
-GPU_MEMORY_UTILIZATION = 0.9
-MAX_NUM_BATCHED_TOKENS = 16_384
+GPU_MEMORY_UTILIZATION = 0.7
+MAX_NUM_BATCHED_TOKENS = 32_768
 MAX_NUM_SEQS = 32
-MAX_NUM_PARTIAL_PREFILLS = 8
-MAX_LONG_PARTIAL_PREFILLS = 8
+MAX_NUM_PARTIAL_PREFILLS = 1
+MAX_LONG_PARTIAL_PREFILLS = 1
 ENABLE_CHUNKED_PREFILL = True
 LONG_PREFILL_TOKEN_THRESHOLD = 8_192
 SCHEDULER_RESERVE_FULL_ISL = True
 SCHEDULING_POLICY = "fcfs"
 ENABLE_PREFIX_CACHING = False
-ENFORCE_EAGER = True
+ENFORCE_EAGER = False
 
 PROMPT_LENGTHS = [
     4_096,
@@ -86,12 +88,30 @@ NUM_SOLO_MEASURED_RUNS = 3
 NUM_MIXED_WARMUP_REQUESTS = 16
 NUM_MIXED_MEASURED_REQUESTS = 128
 SEEDS = [20260728, 20260729, 20260730]
-ARRIVAL_MODE: Literal["all_at_once", "poisson"] = "poisson"
+ARRIVAL_MODE: Literal["all_at_once", "poisson"] = "all_at_once"  # "poisson"
 TARGET_REQUEST_RATE = 0.35
 MAX_TOKENS = 1
 
+PROTOTYPE_PROMPT_LENGTHS = [
+    4_096,
+    8_192,
+    16_384,
+    32_768,
+]
+PROTOTYPE_PROMPT_LENGTH_PROBABILITIES = [
+    0.35,
+    0.30,
+    0.22,
+    0.13,
+]
+PROTOTYPE_NUM_SOLO_WARMUP_RUNS = 0
+PROTOTYPE_NUM_SOLO_MEASURED_RUNS = 1
+PROTOTYPE_NUM_MIXED_WARMUP_REQUESTS = 0
+PROTOTYPE_NUM_MIXED_MEASURED_REQUESTS = 32
+PROTOTYPE_SEEDS = [20260728]
+
 PREFLOW_WORK_EXPONENT = 1.5
-PREFLOW_ADMISSION_BYPASS_BUDGET = 0.2
+PREFLOW_ADMISSION_BYPASS_BUDGET = 0.3
 PREFLOW_AGE_PRIORITY_DOUBLE = 2.0
 
 TOKEN_ID_LOW = 100
@@ -122,6 +142,7 @@ OUTPUT_ROOT = Path("benchmark_results")
 
 @dataclass(frozen=True)
 class BenchmarkConfig:
+    run_profile: str
     model: str
     tokenizer: str
     trust_remote_code: bool
@@ -218,7 +239,8 @@ class RuntimeImports:
 
 
 def make_config() -> BenchmarkConfig:
-    return BenchmarkConfig(
+    cfg = BenchmarkConfig(
+        run_profile=RUN_PROFILE,
         model=MODEL,
         tokenizer=TOKENIZER,
         trust_remote_code=TRUST_REMOTE_CODE,
@@ -263,6 +285,20 @@ def make_config() -> BenchmarkConfig:
         paired_tie_epsilon=PAIRED_TIE_EPSILON,
         top_paired_extremes=TOP_PAIRED_EXTREMES,
     )
+    if RUN_PROFILE == "full":
+        return cfg
+    if RUN_PROFILE == "prototype":
+        return replace(
+            cfg,
+            prompt_lengths=list(PROTOTYPE_PROMPT_LENGTHS),
+            prompt_length_probabilities=list(PROTOTYPE_PROMPT_LENGTH_PROBABILITIES),
+            num_solo_warmup_runs=PROTOTYPE_NUM_SOLO_WARMUP_RUNS,
+            num_solo_measured_runs=PROTOTYPE_NUM_SOLO_MEASURED_RUNS,
+            num_mixed_warmup_requests=PROTOTYPE_NUM_MIXED_WARMUP_REQUESTS,
+            num_mixed_measured_requests=PROTOTYPE_NUM_MIXED_MEASURED_REQUESTS,
+            seeds=list(PROTOTYPE_SEEDS),
+        )
+    raise ValueError(f"Unsupported RUN_PROFILE={RUN_PROFILE!r}.")
 
 
 # =============================================================================
@@ -301,6 +337,8 @@ def import_runtime() -> RuntimeImports:
 
 
 def validate_config(cfg: BenchmarkConfig, schedulers: list[str]) -> None:
+    if cfg.run_profile not in {"prototype", "full"}:
+        raise ValueError(f"Unsupported RUN_PROFILE={cfg.run_profile!r}.")
     if cfg.load_format != "dummy":
         raise ValueError("This benchmark must use load_format='dummy'.")
     if len(cfg.prompt_lengths) != len(cfg.prompt_length_probabilities):
@@ -1313,7 +1351,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     write_json(out_dir / "config.json", config_payload)
 
     print("Using vLLM load_format='dummy'. Results are scheduler-behavior data,")
-    print("not final real-model latency. Output:", out_dir)
+    print(f"not final real-model latency. Profile={cfg.run_profile!r}. Output: {out_dir}")
 
     solo_rows: list[dict[str, Any]] = []
     solo_summaries: dict[str, Any] = {}
