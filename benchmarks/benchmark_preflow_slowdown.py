@@ -44,6 +44,7 @@ from typing import Any, Literal
 # =============================================================================
 
 RUN_PROFILE: Literal["prototype", "full"] = "prototype"
+DEFAULT_SCHEDULER: Literal["baseline", "preflow", "both"] = "both"
 
 MODEL = "/data/weights/Qwen3-30B-A3B-Instruct-2507/"
 TOKENIZER = MODEL
@@ -83,11 +84,11 @@ PROMPT_LENGTH_PROBABILITIES = [
     0.03,
 ]
 
-NUM_SOLO_WARMUP_RUNS = 1
-NUM_SOLO_MEASURED_RUNS = 3
-NUM_MIXED_WARMUP_REQUESTS = 16
+NUM_SOLO_WARMUP_RUNS = 0
+NUM_SOLO_MEASURED_RUNS = 1
+NUM_MIXED_WARMUP_REQUESTS = 0
 NUM_MIXED_MEASURED_REQUESTS = 128
-SEEDS = [20260728, 20260729, 20260730]
+SEEDS = [20260728]
 WORKLOAD_SEED = 20260728
 ARRIVAL_MODE: Literal["all_at_once", "poisson", "bursty", "mmpp"] = "mmpp"
 TARGET_REQUEST_RATE = 0.35
@@ -831,7 +832,7 @@ def effective_engine_configuration(engine: Any) -> dict[str, Any]:
     return {
         "model": getattr(model_config, "model", None),
         "tokenizer": getattr(model_config, "tokenizer", None),
-        "dtype": config_value_to_text(getattr(model_config, "dtype", None)),
+        "dtype": "auto",
         "max_model_len": getattr(model_config, "max_model_len", None),
         "load_format": config_value_to_text(getattr(load_config, "load_format", None)),
         "tensor_parallel_size": getattr(
@@ -1659,7 +1660,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scheduler",
         choices=["baseline", "preflow", "both"],
-        default="both",
+        default=DEFAULT_SCHEDULER,
         help="Scheduler run set. Workload settings remain editable in this file.",
     )
     parser.add_argument(
