@@ -89,10 +89,13 @@ NUM_MIXED_WARMUP_REQUESTS = 16
 NUM_MIXED_MEASURED_REQUESTS = 128
 SEEDS = [20260728, 20260729, 20260730]
 WORKLOAD_SEED = 20260728
-ARRIVAL_MODE: Literal["all_at_once", "poisson", "bursty"] = "bursty"
+ARRIVAL_MODE: Literal["all_at_once", "poisson", "bursty", "mmpp"] = "mmpp"
 TARGET_REQUEST_RATE = 0.35
 BURSTY_BURST_SIZE = 16
 BURSTY_RATE_MULTIPLIER = 8.0
+MMPP_BACKGROUND_RATE_FRACTION = 0.2
+MMPP_BURST_RATE_MULTIPLIER = 8.0
+MMPP_MEAN_BURST_REQUESTS = 16.0
 MAX_TOKENS = 1
 
 PROTOTYPE_PROMPT_LENGTHS = [
@@ -178,6 +181,9 @@ class BenchmarkConfig:
     target_request_rate: float
     bursty_burst_size: int
     bursty_rate_multiplier: float
+    mmpp_background_rate_fraction: float
+    mmpp_burst_rate_multiplier: float
+    mmpp_mean_burst_requests: float
     max_tokens: int
     preflow_work_exponent: float
     preflow_admission_bypass_budget: float
@@ -280,6 +286,9 @@ def make_config() -> BenchmarkConfig:
         target_request_rate=TARGET_REQUEST_RATE,
         bursty_burst_size=BURSTY_BURST_SIZE,
         bursty_rate_multiplier=BURSTY_RATE_MULTIPLIER,
+        mmpp_background_rate_fraction=MMPP_BACKGROUND_RATE_FRACTION,
+        mmpp_burst_rate_multiplier=MMPP_BURST_RATE_MULTIPLIER,
+        mmpp_mean_burst_requests=MMPP_MEAN_BURST_REQUESTS,
         max_tokens=MAX_TOKENS,
         preflow_work_exponent=PREFLOW_WORK_EXPONENT,
         preflow_admission_bypass_budget=PREFLOW_ADMISSION_BYPASS_BUDGET,
@@ -371,14 +380,24 @@ def validate_config(cfg: BenchmarkConfig, schedulers: list[str]) -> None:
             raise ValueError(
                 f"Prompt length {length} plus MAX_TOKENS={cfg.max_tokens} exceeds MAX_MODEL_LEN={cfg.max_model_len}."
             )
-    if cfg.arrival_mode not in {"all_at_once", "poisson", "bursty"}:
+    if cfg.arrival_mode not in {"all_at_once", "poisson", "bursty", "mmpp"}:
         raise ValueError(f"Unsupported ARRIVAL_MODE={cfg.arrival_mode!r}.")
-    if cfg.arrival_mode in {"poisson", "bursty"} and cfg.target_request_rate <= 0:
-        raise ValueError("TARGET_REQUEST_RATE must be positive for poisson or bursty mode.")
+    if cfg.arrival_mode in {"poisson", "bursty", "mmpp"} and cfg.target_request_rate <= 0:
+        raise ValueError("TARGET_REQUEST_RATE must be positive for poisson, bursty, or mmpp mode.")
     if cfg.bursty_burst_size <= 1:
         raise ValueError("BURSTY_BURST_SIZE must be greater than 1.")
     if cfg.bursty_rate_multiplier <= 1.0 or not math.isfinite(cfg.bursty_rate_multiplier):
         raise ValueError("BURSTY_RATE_MULTIPLIER must be finite and greater than 1.")
+    if (
+        cfg.mmpp_background_rate_fraction < 0.0
+        or cfg.mmpp_background_rate_fraction >= 1.0
+        or not math.isfinite(cfg.mmpp_background_rate_fraction)
+    ):
+        raise ValueError("MMPP_BACKGROUND_RATE_FRACTION must be finite and in [0, 1).")
+    if cfg.mmpp_burst_rate_multiplier <= 1.0 or not math.isfinite(cfg.mmpp_burst_rate_multiplier):
+        raise ValueError("MMPP_BURST_RATE_MULTIPLIER must be finite and greater than 1.")
+    if cfg.mmpp_mean_burst_requests <= 0.0 or not math.isfinite(cfg.mmpp_mean_burst_requests):
+        raise ValueError("MMPP_MEAN_BURST_REQUESTS must be finite and positive.")
     if cfg.max_tokens != 1:
         raise ValueError("This TTFT benchmark expects MAX_TOKENS = 1.")
     if cfg.token_id_low >= cfg.token_id_high_exclusive:
@@ -442,6 +461,8 @@ def make_arrival_offsets(count: int, seed: int, phase: str, cfg: BenchmarkConfig
         return [0.0] * count
     if cfg.arrival_mode == "bursty":
         return make_bursty_arrival_offsets(count, cfg)
+    if cfg.arrival_mode == "mmpp":
+        return make_mmpp_arrival_offsets(count, seed, phase, cfg)
     rng = random.Random(stable_u64("arrival", seed, phase))
     offsets = [0.0]
     current = 0.0
@@ -449,6 +470,60 @@ def make_arrival_offsets(count: int, seed: int, phase: str, cfg: BenchmarkConfig
         current += rng.expovariate(cfg.target_request_rate)
         offsets.append(current)
     return offsets
+
+
+def normalize_arrival_span(offsets: list[float], target_rate: float) -> list[float]:
+    if len(offsets) <= 1:
+        return [0.0] * len(offsets)
+    first_offset = offsets[0]
+    normalized = [offset - first_offset for offset in offsets]
+    span_s = normalized[-1]
+    if span_s <= 0.0:
+        raise ValueError("Arrival offsets must span positive time.")
+    target_span_s = len(offsets) / target_rate
+    scale = target_span_s / span_s
+    return [offset * scale for offset in normalized]
+
+
+def make_mmpp_arrival_offsets(
+    count: int,
+    seed: int,
+    phase: str,
+    cfg: BenchmarkConfig,
+) -> list[float]:
+    if count == 1:
+        return [0.0]
+
+    low_rate = cfg.target_request_rate * cfg.mmpp_background_rate_fraction
+    high_rate = cfg.target_request_rate * cfg.mmpp_burst_rate_multiplier
+    burst_probability = (cfg.target_request_rate - low_rate) / (high_rate - low_rate)
+    mean_burst_duration_s = cfg.mmpp_mean_burst_requests / high_rate
+    mean_background_duration_s = mean_burst_duration_s * (1.0 - burst_probability) / burst_probability
+
+    rng = random.Random(stable_u64("arrival", "mmpp", seed, phase))
+    in_burst = rng.random() < burst_probability
+    current_time_s = 0.0
+    offsets: list[float] = []
+
+    while len(offsets) < count:
+        rate = high_rate if in_burst else low_rate
+        mean_state_duration_s = mean_burst_duration_s if in_burst else mean_background_duration_s
+        state_duration_s = rng.expovariate(1.0 / mean_state_duration_s)
+        state_end_s = current_time_s + state_duration_s
+
+        if rate > 0.0:
+            arrival_time_s = current_time_s
+            while len(offsets) < count:
+                arrival_time_s += rng.expovariate(rate)
+                if arrival_time_s > state_end_s:
+                    break
+                offsets.append(arrival_time_s)
+
+        current_time_s = state_end_s
+        in_burst = not in_burst
+
+    offsets.sort()
+    return normalize_arrival_span(offsets, cfg.target_request_rate)
 
 
 def make_bursty_arrival_offsets(count: int, cfg: BenchmarkConfig) -> list[float]:
@@ -1035,7 +1110,7 @@ def summarize_records(
         "max_relative_slowdown": max(slowdowns) if slowdowns else None,
         "arithmetic_mean_ttft_s": statistics.fmean(ttfts) if ttfts else None,
         "offered_request_rate": (
-            cfg.target_request_rate if cfg.arrival_mode in {"poisson", "bursty"} else "all_at_once"
+            cfg.target_request_rate if cfg.arrival_mode in {"poisson", "bursty", "mmpp"} else "all_at_once"
         ),
         "achieved_submission_rate": achieved_submission_rate,
         "completion_throughput": completion_throughput,
