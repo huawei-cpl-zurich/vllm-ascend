@@ -43,7 +43,7 @@ from typing import Any, Literal
 # Editable Experiment Configuration
 # =============================================================================
 
-RUN_PROFILE: Literal["prototype", "full"] = "prototype"
+RUN_PROFILE: Literal["prototype", "full"] = "full"
 DEFAULT_SCHEDULER: Literal["baseline", "preflow", "both"] = "both"
 RUN_THROUGHPUT_SWEEP = False
 
