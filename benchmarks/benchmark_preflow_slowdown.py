@@ -88,8 +88,11 @@ NUM_SOLO_MEASURED_RUNS = 3
 NUM_MIXED_WARMUP_REQUESTS = 16
 NUM_MIXED_MEASURED_REQUESTS = 128
 SEEDS = [20260728, 20260729, 20260730]
-ARRIVAL_MODE: Literal["all_at_once", "poisson"] = "all_at_once"  # "poisson"
+WORKLOAD_SEED = 20260728
+ARRIVAL_MODE: Literal["all_at_once", "poisson", "bursty"] = "bursty"
 TARGET_REQUEST_RATE = 0.35
+BURSTY_BURST_SIZE = 16
+BURSTY_RATE_MULTIPLIER = 8.0
 MAX_TOKENS = 1
 
 PROTOTYPE_PROMPT_LENGTHS = [
@@ -170,8 +173,11 @@ class BenchmarkConfig:
     num_mixed_warmup_requests: int
     num_mixed_measured_requests: int
     seeds: list[int]
+    workload_seed: int
     arrival_mode: str
     target_request_rate: float
+    bursty_burst_size: int
+    bursty_rate_multiplier: float
     max_tokens: int
     preflow_work_exponent: float
     preflow_admission_bypass_budget: float
@@ -269,8 +275,11 @@ def make_config() -> BenchmarkConfig:
         num_mixed_warmup_requests=NUM_MIXED_WARMUP_REQUESTS,
         num_mixed_measured_requests=NUM_MIXED_MEASURED_REQUESTS,
         seeds=list(SEEDS),
+        workload_seed=WORKLOAD_SEED,
         arrival_mode=ARRIVAL_MODE,
         target_request_rate=TARGET_REQUEST_RATE,
+        bursty_burst_size=BURSTY_BURST_SIZE,
+        bursty_rate_multiplier=BURSTY_RATE_MULTIPLIER,
         max_tokens=MAX_TOKENS,
         preflow_work_exponent=PREFLOW_WORK_EXPONENT,
         preflow_admission_bypass_budget=PREFLOW_ADMISSION_BYPASS_BUDGET,
@@ -362,10 +371,14 @@ def validate_config(cfg: BenchmarkConfig, schedulers: list[str]) -> None:
             raise ValueError(
                 f"Prompt length {length} plus MAX_TOKENS={cfg.max_tokens} exceeds MAX_MODEL_LEN={cfg.max_model_len}."
             )
-    if cfg.arrival_mode not in {"all_at_once", "poisson"}:
+    if cfg.arrival_mode not in {"all_at_once", "poisson", "bursty"}:
         raise ValueError(f"Unsupported ARRIVAL_MODE={cfg.arrival_mode!r}.")
-    if cfg.arrival_mode == "poisson" and cfg.target_request_rate <= 0:
-        raise ValueError("TARGET_REQUEST_RATE must be positive for poisson mode.")
+    if cfg.arrival_mode in {"poisson", "bursty"} and cfg.target_request_rate <= 0:
+        raise ValueError("TARGET_REQUEST_RATE must be positive for poisson or bursty mode.")
+    if cfg.bursty_burst_size <= 1:
+        raise ValueError("BURSTY_BURST_SIZE must be greater than 1.")
+    if cfg.bursty_rate_multiplier <= 1.0 or not math.isfinite(cfg.bursty_rate_multiplier):
+        raise ValueError("BURSTY_RATE_MULTIPLIER must be finite and greater than 1.")
     if cfg.max_tokens != 1:
         raise ValueError("This TTFT benchmark expects MAX_TOKENS = 1.")
     if cfg.token_id_low >= cfg.token_id_high_exclusive:
@@ -422,21 +435,14 @@ def stable_u64(*parts: object) -> int:
     return int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), "big")
 
 
-def sample_prompt_length(rng: random.Random, cfg: BenchmarkConfig) -> int:
-    draw = rng.random()
-    cumulative = 0.0
-    for length, prob in zip(cfg.prompt_lengths, cfg.prompt_length_probabilities):
-        cumulative += prob
-        if draw <= cumulative:
-            return length
-    return cfg.prompt_lengths[-1]
-
-
-def make_arrival_offsets(count: int, rng: random.Random, cfg: BenchmarkConfig) -> list[float]:
+def make_arrival_offsets(count: int, seed: int, phase: str, cfg: BenchmarkConfig) -> list[float]:
     if count <= 0:
         return []
     if cfg.arrival_mode == "all_at_once":
         return [0.0] * count
+    if cfg.arrival_mode == "bursty":
+        return make_bursty_arrival_offsets(count, cfg)
+    rng = random.Random(stable_u64("arrival", seed, phase))
     offsets = [0.0]
     current = 0.0
     for _ in range(1, count):
@@ -445,19 +451,130 @@ def make_arrival_offsets(count: int, rng: random.Random, cfg: BenchmarkConfig) -
     return offsets
 
 
+def make_bursty_arrival_offsets(count: int, cfg: BenchmarkConfig) -> list[float]:
+    if count == 1:
+        return [0.0]
+
+    burst_size = min(cfg.bursty_burst_size, count)
+    num_bursts = math.ceil(count / burst_size)
+    burst_rate = cfg.target_request_rate * cfg.bursty_rate_multiplier
+    intra_burst_interval_s = 1.0 / burst_rate
+
+    # Choose inter-burst spacing so the benchmark's achieved submission rate
+    # is exactly TARGET_REQUEST_RATE for the finite trace:
+    #   count / (last_arrival - first_arrival) == TARGET_REQUEST_RATE.
+    target_span_s = count / cfg.target_request_rate
+    last_burst_size = count - (num_bursts - 1) * burst_size
+    last_burst_span_s = (last_burst_size - 1) * intra_burst_interval_s
+    if num_bursts == 1:
+        step_s = target_span_s / (count - 1)
+        return [idx * step_s for idx in range(count)]
+
+    burst_period_s = (target_span_s - last_burst_span_s) / (num_bursts - 1)
+    min_burst_period_s = (burst_size - 1) * intra_burst_interval_s
+    if burst_period_s <= min_burst_period_s:
+        raise ValueError(
+            "BURSTY_RATE_MULTIPLIER and BURSTY_BURST_SIZE do not leave "
+            "enough inter-burst gap to preserve TARGET_REQUEST_RATE."
+        )
+
+    offsets = []
+    for idx in range(count):
+        burst_index = idx // burst_size
+        index_in_burst = idx % burst_size
+        offsets.append(burst_index * burst_period_s + index_in_burst * intra_burst_interval_s)
+    return offsets
+
+
+def make_prompt_length_counts(count: int, cfg: BenchmarkConfig) -> list[int]:
+    """Allocate exact request counts using largest-remainder rounding."""
+
+    quotas = [count * probability for probability in cfg.prompt_length_probabilities]
+    counts = [math.floor(quota) for quota in quotas]
+    remaining = count - sum(counts)
+    if remaining > 0:
+        remainders = sorted(
+            range(len(quotas)),
+            key=lambda idx: (
+                quotas[idx] - counts[idx],
+                -idx,
+            ),
+            reverse=True,
+        )
+        for idx in remainders[:remaining]:
+            counts[idx] += 1
+    elif remaining < 0:
+        remainders = sorted(
+            range(len(quotas)),
+            key=lambda idx: (
+                quotas[idx] - counts[idx],
+                idx,
+            ),
+        )
+        to_remove = -remaining
+        for idx in remainders:
+            if to_remove == 0:
+                break
+            if counts[idx] > 0:
+                counts[idx] -= 1
+                to_remove -= 1
+        if to_remove:
+            raise ValueError("Could not allocate exact prompt-length counts.")
+    assert sum(counts) == count
+    return counts
+
+
+def make_prompt_length_sequence(
+    count: int,
+    phase: str,
+    cfg: BenchmarkConfig,
+) -> list[int]:
+    counts = make_prompt_length_counts(count, cfg)
+    prompt_lengths: list[int] = []
+    for length, length_count in zip(cfg.prompt_lengths, counts):
+        prompt_lengths.extend([length] * length_count)
+    shuffle_rng = random.Random(
+        stable_u64(
+            "request_order",
+            cfg.workload_seed,
+            phase,
+            count,
+            cfg.prompt_lengths,
+            cfg.prompt_length_probabilities,
+        )
+    )
+    shuffle_rng.shuffle(prompt_lengths)
+    return prompt_lengths
+
+
 def make_trace_phase(
     seed: int,
     phase: Literal["warmup", "measured"],
     count: int,
     cfg: BenchmarkConfig,
 ) -> list[TraceRequest]:
-    rng = random.Random(stable_u64("trace", seed, phase))
-    offsets = make_arrival_offsets(count, rng, cfg)
+    # Pre-generate request sizes independently from the arrival process. This
+    # makes all_at_once, poisson, and different poisson rates directly
+    # comparable: they replay the same request IDs, prompt lengths, token
+    # variants, and token IDs, with only scheduled_arrival_offset_s changing.
+    prompt_lengths = make_prompt_length_sequence(count, phase, cfg)
+    offsets = make_arrival_offsets(count, seed, phase, cfg)
     trace = []
-    for idx in range(count):
-        prompt_length = sample_prompt_length(rng, cfg)
-        token_variant = stable_u64("variant", seed, idx, prompt_length) % cfg.prompt_variants_per_length
-        token_seed = stable_u64("tokens", seed, token_variant, prompt_length)
+    for idx, prompt_length in enumerate(prompt_lengths):
+        token_variant = stable_u64(
+            "variant",
+            cfg.workload_seed,
+            phase,
+            idx,
+            prompt_length,
+        ) % cfg.prompt_variants_per_length
+        token_seed = stable_u64(
+            "tokens",
+            cfg.workload_seed,
+            phase,
+            token_variant,
+            prompt_length,
+        )
         trace.append(
             TraceRequest(
                 seed=seed,
@@ -481,6 +598,25 @@ def make_workload_traces(cfg: BenchmarkConfig) -> dict[int, list[TraceRequest]]:
             *make_trace_phase(seed, "measured", cfg.num_mixed_measured_requests, cfg),
         ]
     return traces
+
+
+def prompt_length_count_summary(cfg: BenchmarkConfig) -> dict[str, dict[str, int]]:
+    return {
+        "warmup": {
+            str(length): count
+            for length, count in zip(
+                cfg.prompt_lengths,
+                make_prompt_length_counts(cfg.num_mixed_warmup_requests, cfg),
+            )
+        },
+        "measured": {
+            str(length): count
+            for length, count in zip(
+                cfg.prompt_lengths,
+                make_prompt_length_counts(cfg.num_mixed_measured_requests, cfg),
+            )
+        },
+    }
 
 
 def generate_token_ids(length: int, token_seed: int, cfg: BenchmarkConfig) -> list[int]:
@@ -898,7 +1034,9 @@ def summarize_records(
         "p99_relative_slowdown": percentile(slowdowns, 99),
         "max_relative_slowdown": max(slowdowns) if slowdowns else None,
         "arithmetic_mean_ttft_s": statistics.fmean(ttfts) if ttfts else None,
-        "offered_request_rate": (cfg.target_request_rate if cfg.arrival_mode == "poisson" else "all_at_once"),
+        "offered_request_rate": (
+            cfg.target_request_rate if cfg.arrival_mode in {"poisson", "bursty"} else "all_at_once"
+        ),
         "achieved_submission_rate": achieved_submission_rate,
         "completion_throughput": completion_throughput,
         "experiment_wall_time_s": experiment_wall_time,
@@ -1350,6 +1488,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
         "config": asdict(cfg),
         "selected_schedulers": schedulers,
         "vllm_checkout": str(repo_root() / "vllm"),
+        "workload_prompt_length_counts": prompt_length_count_summary(cfg),
         "dummy_weight_note": (
             "load_format='dummy' initializes random weights for profiling; latencies are for scheduler comparison only."
         ),
