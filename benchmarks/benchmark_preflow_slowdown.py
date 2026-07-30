@@ -45,6 +45,7 @@ from typing import Any, Literal
 
 RUN_PROFILE: Literal["prototype", "full"] = "prototype"
 DEFAULT_SCHEDULER: Literal["baseline", "preflow", "both"] = "both"
+RUN_THROUGHPUT_SWEEP = False
 
 MODEL = "/data/weights/Qwen3-30B-A3B-Instruct-2507/"
 TOKENIZER = MODEL
@@ -92,6 +93,14 @@ SEEDS = [20260728]
 WORKLOAD_SEED = 20260728
 ARRIVAL_MODE: Literal["all_at_once", "poisson", "bursty", "mmpp"] = "mmpp"
 TARGET_REQUEST_RATE = 0.5
+TARGET_REQUEST_RATE_SWEEP = [
+    0.25,
+    0.35,
+    0.50,
+    0.75,
+    1.00,
+]
+SWEEP_PLOT_FORMATS = ["png", "pdf"]
 BURSTY_BURST_SIZE = 16
 BURSTY_RATE_MULTIPLIER = 8.0
 MMPP_BACKGROUND_RATE_FRACTION = 0.1
@@ -151,6 +160,7 @@ OUTPUT_ROOT = Path("benchmark_results")
 @dataclass(frozen=True)
 class BenchmarkConfig:
     run_profile: str
+    run_throughput_sweep: bool
     model: str
     tokenizer: str
     trust_remote_code: bool
@@ -180,6 +190,8 @@ class BenchmarkConfig:
     workload_seed: int
     arrival_mode: str
     target_request_rate: float
+    target_request_rate_sweep: list[float]
+    sweep_plot_formats: list[str]
     bursty_burst_size: int
     bursty_rate_multiplier: float
     mmpp_background_rate_fraction: float
@@ -256,6 +268,7 @@ class RuntimeImports:
 def make_config() -> BenchmarkConfig:
     cfg = BenchmarkConfig(
         run_profile=RUN_PROFILE,
+        run_throughput_sweep=RUN_THROUGHPUT_SWEEP,
         model=MODEL,
         tokenizer=TOKENIZER,
         trust_remote_code=TRUST_REMOTE_CODE,
@@ -285,6 +298,8 @@ def make_config() -> BenchmarkConfig:
         workload_seed=WORKLOAD_SEED,
         arrival_mode=ARRIVAL_MODE,
         target_request_rate=TARGET_REQUEST_RATE,
+        target_request_rate_sweep=list(TARGET_REQUEST_RATE_SWEEP),
+        sweep_plot_formats=list(SWEEP_PLOT_FORMATS),
         bursty_burst_size=BURSTY_BURST_SIZE,
         bursty_rate_multiplier=BURSTY_RATE_MULTIPLIER,
         mmpp_background_rate_fraction=MMPP_BACKGROUND_RATE_FRACTION,
@@ -385,6 +400,13 @@ def validate_config(cfg: BenchmarkConfig, schedulers: list[str]) -> None:
         raise ValueError(f"Unsupported ARRIVAL_MODE={cfg.arrival_mode!r}.")
     if cfg.arrival_mode in {"poisson", "bursty", "mmpp"} and cfg.target_request_rate <= 0:
         raise ValueError("TARGET_REQUEST_RATE must be positive for poisson, bursty, or mmpp mode.")
+    if cfg.run_throughput_sweep:
+        if cfg.arrival_mode == "all_at_once":
+            raise ValueError("Throughput sweep requires poisson, bursty, or mmpp ARRIVAL_MODE.")
+        if not cfg.target_request_rate_sweep:
+            raise ValueError("TARGET_REQUEST_RATE_SWEEP must not be empty.")
+        if any(rate <= 0.0 or not math.isfinite(rate) for rate in cfg.target_request_rate_sweep):
+            raise ValueError("TARGET_REQUEST_RATE_SWEEP values must be finite and positive.")
     if cfg.bursty_burst_size <= 1:
         raise ValueError("BURSTY_BURST_SIZE must be greater than 1.")
     if cfg.bursty_rate_multiplier <= 1.0 or not math.isfinite(cfg.bursty_rate_multiplier):
@@ -1109,7 +1131,12 @@ def summarize_records(
         "p95_relative_slowdown": percentile(slowdowns, 95),
         "p99_relative_slowdown": percentile(slowdowns, 99),
         "max_relative_slowdown": max(slowdowns) if slowdowns else None,
+        "ttft_s": describe(ttfts),
         "arithmetic_mean_ttft_s": statistics.fmean(ttfts) if ttfts else None,
+        "median_ttft_s": statistics.median(ttfts) if ttfts else None,
+        "p95_ttft_s": percentile(ttfts, 95),
+        "p99_ttft_s": percentile(ttfts, 99),
+        "max_ttft_s": max(ttfts) if ttfts else None,
         "offered_request_rate": (
             cfg.target_request_rate if cfg.arrival_mode in {"poisson", "bursty", "mmpp"} else "all_at_once"
         ),
@@ -1548,37 +1575,18 @@ def make_summary_markdown(summary: dict[str, Any]) -> str:
 # =============================================================================
 
 
-async def run_benchmark(args: argparse.Namespace) -> None:
-    cfg = make_config()
-    schedulers = ["baseline", "preflow"] if args.scheduler == "both" else [args.scheduler]
-    validate_config(cfg, schedulers)
+def make_schedulers(scheduler_arg: str) -> list[str]:
+    return ["baseline", "preflow"] if scheduler_arg == "both" else [scheduler_arg]
 
-    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    out_dir = create_output_dir(args.output_dir)
-    traces = make_workload_traces(cfg)
-    trace_rows = [asdict(request) for seed in cfg.seeds for request in traces[seed]]
-    write_jsonl(out_dir / "workload_trace.jsonl", trace_rows)
 
-    runtime = import_runtime()
-    config_payload = {
-        "config": asdict(cfg),
-        "selected_schedulers": schedulers,
-        "vllm_checkout": str(repo_root() / "vllm"),
-        "workload_prompt_length_counts": prompt_length_count_summary(cfg),
-        "dummy_weight_note": (
-            "load_format='dummy' initializes random weights for profiling; latencies are for scheduler comparison only."
-        ),
-    }
-    write_json(out_dir / "config.json", config_payload)
-
-    print("Using vLLM load_format='dummy'. Results are scheduler-behavior data,")
-    print(f"not final real-model latency. Profile={cfg.run_profile!r}. Output: {out_dir}")
-
+async def run_solo_calibrations(
+    schedulers: list[str],
+    cfg: BenchmarkConfig,
+    runtime: RuntimeImports,
+) -> tuple[list[dict[str, Any]], dict[str, dict[int, float]], dict[str, Any]]:
     solo_rows: list[dict[str, Any]] = []
     solo_summaries: dict[str, Any] = {}
     solo_baselines_by_scheduler: dict[str, dict[int, float]] = {}
-    mixed_records: dict[tuple[str, int], list[dict[str, Any]]] = {}
-    mixed_summaries: dict[str, Any] = {}
 
     for scheduler in schedulers:
         rows, baselines, solo_summary = await run_solo_calibration(
@@ -1589,8 +1597,71 @@ async def run_benchmark(args: argparse.Namespace) -> None:
         solo_rows.extend(rows)
         solo_baselines_by_scheduler[scheduler] = baselines
         solo_summaries[scheduler] = solo_summary
-        write_csv(out_dir / "solo_latencies.csv", solo_rows, REQUEST_CSV_FIELDS)
 
+    return solo_rows, solo_baselines_by_scheduler, solo_summaries
+
+
+def make_config_payload(
+    cfg: BenchmarkConfig,
+    schedulers: list[str],
+) -> dict[str, Any]:
+    return {
+        "config": asdict(cfg),
+        "selected_schedulers": schedulers,
+        "vllm_checkout": str(repo_root() / "vllm"),
+        "workload_prompt_length_counts": prompt_length_count_summary(cfg),
+        "dummy_weight_note": (
+            "load_format='dummy' initializes random weights for profiling; "
+            "latencies are for scheduler comparison only."
+        ),
+    }
+
+
+async def run_single_rate_benchmark(
+    *,
+    cfg: BenchmarkConfig,
+    schedulers: list[str],
+    out_dir: Path | None,
+    runtime: RuntimeImports | None = None,
+    solo_cache: tuple[list[dict[str, Any]], dict[str, dict[int, float]], dict[str, Any]] | None = None,
+    print_header: bool = True,
+) -> dict[str, Any]:
+    validate_config(cfg, schedulers)
+
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    out_dir = create_output_dir(out_dir)
+    traces = make_workload_traces(cfg)
+    trace_rows = [asdict(request) for seed in cfg.seeds for request in traces[seed]]
+    write_jsonl(out_dir / "workload_trace.jsonl", trace_rows)
+
+    if runtime is None:
+        runtime = import_runtime()
+    config_payload = {
+        **make_config_payload(cfg, schedulers),
+        "output_dir": str(out_dir),
+    }
+    write_json(out_dir / "config.json", config_payload)
+
+    if print_header:
+        print("Using vLLM load_format='dummy'. Results are scheduler-behavior data,")
+        print(f"not final real-model latency. Profile={cfg.run_profile!r}. Output: {out_dir}")
+
+    mixed_records: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    mixed_summaries: dict[str, Any] = {}
+
+    if solo_cache is None:
+        solo_rows, solo_baselines_by_scheduler, solo_summaries = await run_solo_calibrations(
+            schedulers,
+            cfg,
+            runtime,
+        )
+    else:
+        solo_rows, solo_baselines_by_scheduler, solo_summaries = solo_cache
+
+    write_csv(out_dir / "solo_latencies.csv", solo_rows, REQUEST_CSV_FIELDS)
+
+    for scheduler in schedulers:
+        baselines = solo_baselines_by_scheduler[scheduler]
         for seed in cfg.seeds:
             records, run_summary = await run_mixed_workload(
                 scheduler,
@@ -1651,6 +1722,352 @@ async def run_benchmark(args: argparse.Namespace) -> None:
                     losses=data["preflow_losses"],
                 )
             )
+    return summary
+
+
+SWEEP_CSV_FIELDS = [
+    "target_request_rate",
+    "scheduler",
+    "seed",
+    "request_count",
+    "successful_request_count",
+    "failed_request_count",
+    "achieved_submission_rate",
+    "completion_throughput",
+    "arithmetic_mean_ttft_s",
+    "median_ttft_s",
+    "p95_ttft_s",
+    "p99_ttft_s",
+    "mean_relative_slowdown",
+    "median_relative_slowdown",
+    "p95_relative_slowdown",
+    "p99_relative_slowdown",
+    "max_relative_slowdown",
+    "average_unfinished_requests",
+    "peak_unfinished_requests",
+]
+
+
+SWEEP_PAIRED_CSV_FIELDS = [
+    "target_request_rate",
+    "seed",
+    "matched_request_count",
+    "mean_paired_improvement",
+    "median_paired_improvement",
+    "p95_slowdown_improvement",
+    "preflow_wins",
+    "preflow_ties",
+    "preflow_losses",
+]
+
+
+def rate_label(rate: float) -> str:
+    return f"rate_{rate:g}".replace(".", "p").replace("-", "m")
+
+
+def create_sweep_output_dir(base: Path | None) -> Path:
+    if base is not None:
+        out_dir = base
+    else:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        out_dir = OUTPUT_ROOT / f"preflow_throughput_sweep_{timestamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def sweep_rows_from_summary(rate: float, summary: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for _, run in sorted(summary["mixed_runs"].items()):
+        rows.append(
+            {
+                "target_request_rate": rate,
+                "scheduler": run["scheduler"],
+                "seed": run["seed"],
+                "request_count": run["request_count"],
+                "successful_request_count": run["successful_request_count"],
+                "failed_request_count": run["failed_request_count"],
+                "achieved_submission_rate": run["achieved_submission_rate"],
+                "completion_throughput": run["completion_throughput"],
+                "arithmetic_mean_ttft_s": run["arithmetic_mean_ttft_s"],
+                "median_ttft_s": run["median_ttft_s"],
+                "p95_ttft_s": run["p95_ttft_s"],
+                "p99_ttft_s": run["p99_ttft_s"],
+                "mean_relative_slowdown": run["mean_relative_slowdown"],
+                "median_relative_slowdown": run["median_relative_slowdown"],
+                "p95_relative_slowdown": run["p95_relative_slowdown"],
+                "p99_relative_slowdown": run["p99_relative_slowdown"],
+                "max_relative_slowdown": run["max_relative_slowdown"],
+                "average_unfinished_requests": run.get("average_unfinished_requests"),
+                "peak_unfinished_requests": run.get("peak_unfinished_requests"),
+            }
+        )
+    return rows
+
+
+def sweep_paired_rows_from_summary(rate: float, summary: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for seed, paired in sorted(summary.get("paired", {}).items()):
+        rows.append(
+            {
+                "target_request_rate": rate,
+                "seed": int(seed),
+                "matched_request_count": paired["matched_request_count"],
+                "mean_paired_improvement": paired["mean_paired_improvement"],
+                "median_paired_improvement": paired["median_paired_improvement"],
+                "p95_slowdown_improvement": paired["p95_slowdown_improvement"],
+                "preflow_wins": paired["preflow_wins"],
+                "preflow_ties": paired["preflow_ties"],
+                "preflow_losses": paired["preflow_losses"],
+            }
+        )
+    return rows
+
+
+def numeric_mean(values: list[Any]) -> float | None:
+    numeric_values = [float(value) for value in values if value is not None]
+    return statistics.fmean(numeric_values) if numeric_values else None
+
+
+def aggregate_sweep_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, float], list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault((row["scheduler"], float(row["target_request_rate"])), []).append(row)
+
+    aggregated = []
+    for (scheduler, rate), group in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1])):
+        aggregated.append(
+            {
+                "scheduler": scheduler,
+                "target_request_rate": rate,
+                "completion_throughput": numeric_mean([row["completion_throughput"] for row in group]),
+                "arithmetic_mean_ttft_s": numeric_mean([row["arithmetic_mean_ttft_s"] for row in group]),
+                "p95_ttft_s": numeric_mean([row["p95_ttft_s"] for row in group]),
+                "mean_relative_slowdown": numeric_mean([row["mean_relative_slowdown"] for row in group]),
+                "p95_relative_slowdown": numeric_mean([row["p95_relative_slowdown"] for row in group]),
+            }
+        )
+    return aggregated
+
+
+def plot_sweep_metric_pair(
+    *,
+    rows: list[dict[str, Any]],
+    out_dir: Path,
+    cfg: BenchmarkConfig,
+    filename_base: str,
+    title: str,
+    metrics: list[tuple[str, str]],
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # noqa: BLE001 - plotting is optional after data collection.
+        warning = f"Could not import matplotlib; sweep CSV/JSON were written without plots: {exc}\n"
+        (out_dir / "plotting_warning.txt").write_text(warning, encoding="utf-8")
+        print(f"WARNING: {warning.strip()}")
+        return
+
+    schedulers = sorted({row["scheduler"] for row in rows})
+    fig, axes = plt.subplots(1, len(metrics), figsize=(6.0 * len(metrics), 4.5), squeeze=False)
+    for axis, (metric, ylabel) in zip(axes[0], metrics):
+        for scheduler in schedulers:
+            points = [
+                row
+                for row in rows
+                if row["scheduler"] == scheduler
+                and row["completion_throughput"] is not None
+                and row[metric] is not None
+            ]
+            points.sort(key=lambda row: row["completion_throughput"])
+            if not points:
+                continue
+            axis.plot(
+                [row["completion_throughput"] for row in points],
+                [row[metric] for row in points],
+                marker="o",
+                label=scheduler,
+            )
+            for row in points:
+                axis.annotate(
+                    f"{row['target_request_rate']:g}",
+                    (row["completion_throughput"], row[metric]),
+                    textcoords="offset points",
+                    xytext=(4, 4),
+                    fontsize=8,
+                )
+        axis.set_xlabel("Achieved completion throughput (requests/s)")
+        axis.set_ylabel(ylabel)
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+    fig.suptitle(title)
+    fig.tight_layout()
+    for fmt in cfg.sweep_plot_formats:
+        fig.savefig(out_dir / f"{filename_base}.{fmt}", bbox_inches="tight", dpi=160)
+    plt.close(fig)
+
+
+def write_throughput_sweep_plots(
+    rows: list[dict[str, Any]],
+    out_dir: Path,
+    cfg: BenchmarkConfig,
+) -> None:
+    aggregated = aggregate_sweep_rows(rows)
+    write_json(out_dir / "throughput_sweep_aggregated.json", aggregated)
+    plot_sweep_metric_pair(
+        rows=aggregated,
+        out_dir=out_dir,
+        cfg=cfg,
+        filename_base="latency_vs_throughput",
+        title="Latency vs Achieved Throughput",
+        metrics=[
+            ("arithmetic_mean_ttft_s", "Mean TTFT (s)"),
+            ("p95_ttft_s", "P95 TTFT (s)"),
+        ],
+    )
+    plot_sweep_metric_pair(
+        rows=aggregated,
+        out_dir=out_dir,
+        cfg=cfg,
+        filename_base="slowdown_vs_throughput",
+        title="Relative Slowdown vs Achieved Throughput",
+        metrics=[
+            ("mean_relative_slowdown", "Mean relative slowdown"),
+            ("p95_relative_slowdown", "P95 relative slowdown"),
+        ],
+    )
+
+
+def make_sweep_markdown(rows: list[dict[str, Any]], paired_rows: list[dict[str, Any]]) -> str:
+    lines = [
+        "# PREFLOW Throughput Sweep",
+        "",
+        "Dummy weights were enabled with `load_format='dummy'`; these results "
+        "validate scheduler behavior, not final real-model latency.",
+        "",
+        "Offered rates are shown as point labels in the generated plots.",
+        "",
+        "## Runs",
+        "",
+        "| offered rate | scheduler | seed | achieved throughput | p95 TTFT | p95 slowdown | failures |",
+        "|---:|---|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            "| {rate} | {scheduler} | {seed} | {throughput} | {ttft} | {slowdown} | {failures} |".format(
+                rate=format_float(row["target_request_rate"]),
+                scheduler=row["scheduler"],
+                seed=row["seed"],
+                throughput=format_float(row["completion_throughput"]),
+                ttft=format_float(row["p95_ttft_s"]),
+                slowdown=format_float(row["p95_relative_slowdown"]),
+                failures=row["failed_request_count"],
+            )
+        )
+    if paired_rows:
+        lines.extend(
+            [
+                "",
+                "## Paired PREFLOW Improvements",
+                "",
+                "| offered rate | seed | mean improvement | p95 slowdown improvement | wins | ties | losses |",
+                "|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in paired_rows:
+            lines.append(
+                "| {rate} | {seed} | {mean} | {p95} | {wins} | {ties} | {losses} |".format(
+                    rate=format_float(row["target_request_rate"]),
+                    seed=row["seed"],
+                    mean=format_float(row["mean_paired_improvement"]),
+                    p95=format_float(row["p95_slowdown_improvement"]),
+                    wins=row["preflow_wins"],
+                    ties=row["preflow_ties"],
+                    losses=row["preflow_losses"],
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
+async def run_throughput_sweep(
+    *,
+    cfg: BenchmarkConfig,
+    schedulers: list[str],
+    out_dir: Path | None,
+) -> None:
+    cfg = replace(cfg, run_throughput_sweep=True)
+    validate_config(cfg, schedulers)
+
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    sweep_dir = create_sweep_output_dir(out_dir)
+    runtime = import_runtime()
+
+    print("Using vLLM load_format='dummy'. Results are scheduler-behavior data,")
+    print(f"not final real-model latency. Throughput sweep output: {sweep_dir}")
+    print("Calibrating solo TTFT once per scheduler; rate points reuse those baselines.")
+
+    solo_cache = await run_solo_calibrations(schedulers, cfg, runtime)
+    write_csv(sweep_dir / "solo_latencies.csv", solo_cache[0], REQUEST_CSV_FIELDS)
+
+    sweep_rows: list[dict[str, Any]] = []
+    sweep_paired_rows: list[dict[str, Any]] = []
+    rate_summaries: dict[str, Any] = {}
+
+    for rate in cfg.target_request_rate_sweep:
+        rate_cfg = replace(cfg, target_request_rate=rate)
+        rate_dir = sweep_dir / rate_label(rate)
+        print(f"\n=== TARGET_REQUEST_RATE={rate:g} ===")
+        summary = await run_single_rate_benchmark(
+            cfg=rate_cfg,
+            schedulers=schedulers,
+            out_dir=rate_dir,
+            runtime=runtime,
+            solo_cache=solo_cache,
+            print_header=False,
+        )
+        rate_summaries[rate_label(rate)] = summary
+        sweep_rows.extend(sweep_rows_from_summary(rate, summary))
+        sweep_paired_rows.extend(sweep_paired_rows_from_summary(rate, summary))
+
+    write_csv(sweep_dir / "throughput_sweep.csv", sweep_rows, SWEEP_CSV_FIELDS)
+    write_csv(
+        sweep_dir / "throughput_sweep_paired.csv",
+        sweep_paired_rows,
+        SWEEP_PAIRED_CSV_FIELDS,
+    )
+    write_json(
+        sweep_dir / "throughput_sweep.json",
+        {
+            **make_config_payload(cfg, schedulers),
+            "output_dir": str(sweep_dir),
+            "rate_summaries": rate_summaries,
+            "sweep_rows": sweep_rows,
+            "paired_rows": sweep_paired_rows,
+        },
+    )
+    (sweep_dir / "throughput_sweep.md").write_text(
+        make_sweep_markdown(sweep_rows, sweep_paired_rows),
+        encoding="utf-8",
+    )
+    write_throughput_sweep_plots(sweep_rows, sweep_dir, cfg)
+    print(f"\nThroughput sweep complete: {sweep_dir}")
+
+
+async def run_benchmark(args: argparse.Namespace) -> None:
+    cfg = make_config()
+    if args.throughput_sweep:
+        cfg = replace(cfg, run_throughput_sweep=True)
+    schedulers = make_schedulers(args.scheduler)
+    if cfg.run_throughput_sweep:
+        await run_throughput_sweep(
+            cfg=cfg,
+            schedulers=schedulers,
+            out_dir=args.output_dir,
+        )
+        return
+    await run_single_rate_benchmark(
+        cfg=cfg,
+        schedulers=schedulers,
+        out_dir=args.output_dir,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1668,6 +2085,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional exact output directory. Defaults to benchmark_results/...",
+    )
+    parser.add_argument(
+        "--throughput-sweep",
+        action="store_true",
+        help="Run TARGET_REQUEST_RATE_SWEEP and generate latency/slowdown-vs-throughput plots.",
     )
     return parser.parse_args()
 
