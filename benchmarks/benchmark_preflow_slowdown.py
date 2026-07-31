@@ -46,6 +46,7 @@ from typing import Any, Literal
 RUN_PROFILE: Literal["prototype", "full"] = "full"
 DEFAULT_SCHEDULER: Literal["baseline", "preflow", "both"] = "both"
 RUN_THROUGHPUT_SWEEP = False
+RUN_MMPP_PARAMETER_SWEEP = False
 
 MODEL = "/data/weights/Qwen3-30B-A3B-Instruct-2507/"
 TOKENIZER = MODEL
@@ -84,11 +85,13 @@ PROMPT_LENGTH_PROBABILITIES = [
     0.08,
     0.03,
 ]
+PROMPT_LENGTH_ORDER: Literal["random_shuffle", "space_filling"] = "space_filling"
+SPACE_FILLING_WINDOW_SIZE = 100
 
 NUM_SOLO_WARMUP_RUNS = 0
 NUM_SOLO_MEASURED_RUNS = 1
 NUM_MIXED_WARMUP_REQUESTS = 0
-NUM_MIXED_MEASURED_REQUESTS = 128
+NUM_MIXED_MEASURED_REQUESTS = 5_000
 SEEDS = [20260728]
 WORKLOAD_SEED = 20260728
 ARRIVAL_MODE: Literal["all_at_once", "poisson", "bursty", "mmpp"] = "mmpp"
@@ -106,6 +109,11 @@ BURSTY_RATE_MULTIPLIER = 8.0
 MMPP_BACKGROUND_RATE_FRACTION = 0.1
 MMPP_BURST_RATE_MULTIPLIER = 8.0
 MMPP_MEAN_BURST_REQUESTS = 16.0
+MMPP_PARAMETER_SWEEP = [
+    ("mild", 0.40, 3.0, 8.0),
+    ("moderate", 0.20, 6.0, 12.0),
+    ("strong", 0.10, 8.0, 16.0),
+]
 MAX_TOKENS = 1
 
 PROTOTYPE_PROMPT_LENGTHS = [
@@ -161,6 +169,7 @@ OUTPUT_ROOT = Path("benchmark_results")
 class BenchmarkConfig:
     run_profile: str
     run_throughput_sweep: bool
+    run_mmpp_parameter_sweep: bool
     model: str
     tokenizer: str
     trust_remote_code: bool
@@ -182,6 +191,8 @@ class BenchmarkConfig:
     enforce_eager: bool
     prompt_lengths: list[int]
     prompt_length_probabilities: list[float]
+    prompt_length_order: str
+    space_filling_window_size: int
     num_solo_warmup_runs: int
     num_solo_measured_runs: int
     num_mixed_warmup_requests: int
@@ -197,6 +208,7 @@ class BenchmarkConfig:
     mmpp_background_rate_fraction: float
     mmpp_burst_rate_multiplier: float
     mmpp_mean_burst_requests: float
+    mmpp_parameter_sweep: list[tuple[str, float, float, float]]
     max_tokens: int
     preflow_work_exponent: float
     preflow_admission_bypass_budget: float
@@ -269,6 +281,7 @@ def make_config() -> BenchmarkConfig:
     cfg = BenchmarkConfig(
         run_profile=RUN_PROFILE,
         run_throughput_sweep=RUN_THROUGHPUT_SWEEP,
+        run_mmpp_parameter_sweep=RUN_MMPP_PARAMETER_SWEEP,
         model=MODEL,
         tokenizer=TOKENIZER,
         trust_remote_code=TRUST_REMOTE_CODE,
@@ -290,6 +303,8 @@ def make_config() -> BenchmarkConfig:
         enforce_eager=ENFORCE_EAGER,
         prompt_lengths=list(PROMPT_LENGTHS),
         prompt_length_probabilities=list(PROMPT_LENGTH_PROBABILITIES),
+        prompt_length_order=PROMPT_LENGTH_ORDER,
+        space_filling_window_size=SPACE_FILLING_WINDOW_SIZE,
         num_solo_warmup_runs=NUM_SOLO_WARMUP_RUNS,
         num_solo_measured_runs=NUM_SOLO_MEASURED_RUNS,
         num_mixed_warmup_requests=NUM_MIXED_WARMUP_REQUESTS,
@@ -305,6 +320,7 @@ def make_config() -> BenchmarkConfig:
         mmpp_background_rate_fraction=MMPP_BACKGROUND_RATE_FRACTION,
         mmpp_burst_rate_multiplier=MMPP_BURST_RATE_MULTIPLIER,
         mmpp_mean_burst_requests=MMPP_MEAN_BURST_REQUESTS,
+        mmpp_parameter_sweep=list(MMPP_PARAMETER_SWEEP),
         max_tokens=MAX_TOKENS,
         preflow_work_exponent=PREFLOW_WORK_EXPONENT,
         preflow_admission_bypass_budget=PREFLOW_ADMISSION_BYPASS_BUDGET,
@@ -373,6 +389,25 @@ def import_runtime() -> RuntimeImports:
     )
 
 
+def validate_mmpp_parameters(
+    *,
+    background_rate_fraction: float,
+    burst_rate_multiplier: float,
+    mean_burst_requests: float,
+    label: str,
+) -> None:
+    if (
+        background_rate_fraction < 0.0
+        or background_rate_fraction >= 1.0
+        or not math.isfinite(background_rate_fraction)
+    ):
+        raise ValueError(f"{label} background rate fraction must be finite and in [0, 1).")
+    if burst_rate_multiplier <= 1.0 or not math.isfinite(burst_rate_multiplier):
+        raise ValueError(f"{label} burst rate multiplier must be finite and greater than 1.")
+    if mean_burst_requests <= 0.0 or not math.isfinite(mean_burst_requests):
+        raise ValueError(f"{label} mean burst requests must be finite and positive.")
+
+
 def validate_config(cfg: BenchmarkConfig, schedulers: list[str]) -> None:
     if cfg.run_profile not in {"prototype", "full"}:
         raise ValueError(f"Unsupported RUN_PROFILE={cfg.run_profile!r}.")
@@ -389,6 +424,10 @@ def validate_config(cfg: BenchmarkConfig, schedulers: list[str]) -> None:
     prob_sum = sum(cfg.prompt_length_probabilities)
     if not math.isclose(prob_sum, 1.0, rel_tol=0.0, abs_tol=1e-6):
         raise ValueError(f"Prompt length probabilities sum to {prob_sum}, not 1.")
+    if cfg.prompt_length_order not in {"random_shuffle", "space_filling"}:
+        raise ValueError("PROMPT_LENGTH_ORDER must be 'random_shuffle' or 'space_filling'.")
+    if cfg.space_filling_window_size <= 0:
+        raise ValueError("SPACE_FILLING_WINDOW_SIZE must be positive.")
     for length in cfg.prompt_lengths:
         if length > cfg.max_model_len:
             raise ValueError(f"Prompt length {length} exceeds MAX_MODEL_LEN.")
@@ -407,20 +446,36 @@ def validate_config(cfg: BenchmarkConfig, schedulers: list[str]) -> None:
             raise ValueError("TARGET_REQUEST_RATE_SWEEP must not be empty.")
         if any(rate <= 0.0 or not math.isfinite(rate) for rate in cfg.target_request_rate_sweep):
             raise ValueError("TARGET_REQUEST_RATE_SWEEP values must be finite and positive.")
+    if cfg.run_mmpp_parameter_sweep and cfg.arrival_mode != "mmpp":
+        raise ValueError("MMPP parameter sweep requires ARRIVAL_MODE = 'mmpp'.")
+    if cfg.run_mmpp_parameter_sweep and not cfg.mmpp_parameter_sweep:
+        raise ValueError("MMPP_PARAMETER_SWEEP must not be empty when MMPP parameter sweep is enabled.")
     if cfg.bursty_burst_size <= 1:
         raise ValueError("BURSTY_BURST_SIZE must be greater than 1.")
     if cfg.bursty_rate_multiplier <= 1.0 or not math.isfinite(cfg.bursty_rate_multiplier):
         raise ValueError("BURSTY_RATE_MULTIPLIER must be finite and greater than 1.")
-    if (
-        cfg.mmpp_background_rate_fraction < 0.0
-        or cfg.mmpp_background_rate_fraction >= 1.0
-        or not math.isfinite(cfg.mmpp_background_rate_fraction)
-    ):
-        raise ValueError("MMPP_BACKGROUND_RATE_FRACTION must be finite and in [0, 1).")
-    if cfg.mmpp_burst_rate_multiplier <= 1.0 or not math.isfinite(cfg.mmpp_burst_rate_multiplier):
-        raise ValueError("MMPP_BURST_RATE_MULTIPLIER must be finite and greater than 1.")
-    if cfg.mmpp_mean_burst_requests <= 0.0 or not math.isfinite(cfg.mmpp_mean_burst_requests):
-        raise ValueError("MMPP_MEAN_BURST_REQUESTS must be finite and positive.")
+    validate_mmpp_parameters(
+        background_rate_fraction=cfg.mmpp_background_rate_fraction,
+        burst_rate_multiplier=cfg.mmpp_burst_rate_multiplier,
+        mean_burst_requests=cfg.mmpp_mean_burst_requests,
+        label="MMPP",
+    )
+    mmpp_sweep_names = set()
+    for sweep_point in cfg.mmpp_parameter_sweep:
+        if len(sweep_point) != 4:
+            raise ValueError("Each MMPP_PARAMETER_SWEEP entry must be (name, background_fraction, multiplier, mean).")
+        name, background_rate_fraction, burst_rate_multiplier, mean_burst_requests = sweep_point
+        if not name:
+            raise ValueError("MMPP_PARAMETER_SWEEP names must be nonempty.")
+        if name in mmpp_sweep_names:
+            raise ValueError(f"Duplicate MMPP_PARAMETER_SWEEP name {name!r}.")
+        mmpp_sweep_names.add(name)
+        validate_mmpp_parameters(
+            background_rate_fraction=background_rate_fraction,
+            burst_rate_multiplier=burst_rate_multiplier,
+            mean_burst_requests=mean_burst_requests,
+            label=f"MMPP_PARAMETER_SWEEP[{name}]",
+        )
     if cfg.max_tokens != 1:
         raise ValueError("This TTFT benchmark expects MAX_TOKENS = 1.")
     if cfg.token_id_low >= cfg.token_id_high_exclusive:
@@ -622,7 +677,12 @@ def make_prompt_length_counts(count: int, cfg: BenchmarkConfig) -> list[int]:
     return counts
 
 
-def make_prompt_length_sequence(
+def shuffle_in_place(values: list[int], *seed_parts: object) -> None:
+    rng = random.Random(stable_u64(*seed_parts))
+    rng.shuffle(values)
+
+
+def make_random_prompt_length_sequence(
     count: int,
     phase: str,
     cfg: BenchmarkConfig,
@@ -631,18 +691,115 @@ def make_prompt_length_sequence(
     prompt_lengths: list[int] = []
     for length, length_count in zip(cfg.prompt_lengths, counts):
         prompt_lengths.extend([length] * length_count)
-    shuffle_rng = random.Random(
-        stable_u64(
-            "request_order",
+    shuffle_in_place(
+        prompt_lengths,
+        "request_order",
+        cfg.workload_seed,
+        phase,
+        count,
+        cfg.prompt_lengths,
+        cfg.prompt_length_probabilities,
+    )
+    return prompt_lengths
+
+
+def make_space_filling_window_counts(
+    *,
+    window_size: int,
+    remaining_counts: list[int],
+    remaining_total: int,
+    seed: int,
+) -> list[int]:
+    if window_size == remaining_total:
+        return list(remaining_counts)
+
+    quotas = [window_size * count / remaining_total for count in remaining_counts]
+    window_counts = [math.floor(quota) for quota in quotas]
+    remaining_window_slots = window_size - sum(window_counts)
+    tie_order = list(range(len(remaining_counts)))
+    shuffle_in_place(tie_order, "space_filling_ties", seed)
+    remainders = sorted(
+        tie_order,
+        key=lambda idx: quotas[idx] - window_counts[idx],
+        reverse=True,
+    )
+    for idx in remainders:
+        if remaining_window_slots == 0:
+            break
+        if window_counts[idx] < remaining_counts[idx]:
+            window_counts[idx] += 1
+            remaining_window_slots -= 1
+    if remaining_window_slots:
+        raise ValueError("Could not allocate a complete space-filling prompt window.")
+    return window_counts
+
+
+def make_space_filling_prompt_length_sequence(
+    count: int,
+    phase: str,
+    cfg: BenchmarkConfig,
+) -> list[int]:
+    if count <= 0:
+        return []
+
+    remaining_counts = make_prompt_length_counts(count, cfg)
+    prompt_lengths: list[int] = []
+    window_size = min(cfg.space_filling_window_size, count)
+    window_index = 0
+
+    while len(prompt_lengths) < count:
+        remaining_total = count - len(prompt_lengths)
+        current_window_size = min(window_size, remaining_total)
+        window_counts = make_space_filling_window_counts(
+            window_size=current_window_size,
+            remaining_counts=remaining_counts,
+            remaining_total=remaining_total,
+            seed=stable_u64(
+                "space_filling_counts",
+                cfg.workload_seed,
+                phase,
+                count,
+                window_index,
+                cfg.prompt_lengths,
+                cfg.prompt_length_probabilities,
+            ),
+        )
+
+        window_prompt_lengths: list[int] = []
+        for length, length_count in zip(cfg.prompt_lengths, window_counts):
+            window_prompt_lengths.extend([length] * length_count)
+        shuffle_in_place(
+            window_prompt_lengths,
+            "space_filling_window",
             cfg.workload_seed,
             phase,
             count,
+            window_index,
             cfg.prompt_lengths,
             cfg.prompt_length_probabilities,
         )
-    )
-    shuffle_rng.shuffle(prompt_lengths)
+        prompt_lengths.extend(window_prompt_lengths)
+        remaining_counts = [
+            remaining_count - window_count
+            for remaining_count, window_count in zip(remaining_counts, window_counts)
+        ]
+        window_index += 1
+
+    assert len(prompt_lengths) == count
+    assert all(count == 0 for count in remaining_counts)
     return prompt_lengths
+
+
+def make_prompt_length_sequence(
+    count: int,
+    phase: str,
+    cfg: BenchmarkConfig,
+) -> list[int]:
+    if cfg.prompt_length_order == "random_shuffle":
+        return make_random_prompt_length_sequence(count, phase, cfg)
+    if cfg.prompt_length_order == "space_filling":
+        return make_space_filling_prompt_length_sequence(count, phase, cfg)
+    raise ValueError(f"Unsupported PROMPT_LENGTH_ORDER={cfg.prompt_length_order!r}.")
 
 
 def make_trace_phase(
@@ -652,9 +809,9 @@ def make_trace_phase(
     cfg: BenchmarkConfig,
 ) -> list[TraceRequest]:
     # Pre-generate request sizes independently from the arrival process. This
-    # makes all_at_once, poisson, and different poisson rates directly
-    # comparable: they replay the same request IDs, prompt lengths, token
-    # variants, and token IDs, with only scheduled_arrival_offset_s changing.
+    # makes all_at_once, poisson, and different arrival-rate or MMPP-parameter
+    # settings directly comparable: they replay the same request IDs, prompt
+    # lengths, token variants, and token IDs, with only arrival offsets changing.
     prompt_lengths = make_prompt_length_sequence(count, phase, cfg)
     offsets = make_arrival_offsets(count, seed, phase, cfg)
     trace = []
@@ -1748,6 +1905,31 @@ SWEEP_CSV_FIELDS = [
 ]
 
 
+SWEEP_FLOAT_FIELDS = {
+    "target_request_rate",
+    "achieved_submission_rate",
+    "completion_throughput",
+    "arithmetic_mean_ttft_s",
+    "median_ttft_s",
+    "p95_ttft_s",
+    "p99_ttft_s",
+    "mean_relative_slowdown",
+    "median_relative_slowdown",
+    "p95_relative_slowdown",
+    "p99_relative_slowdown",
+    "max_relative_slowdown",
+    "average_unfinished_requests",
+}
+
+SWEEP_INT_FIELDS = {
+    "seed",
+    "request_count",
+    "successful_request_count",
+    "failed_request_count",
+    "peak_unfinished_requests",
+}
+
+
 SWEEP_PAIRED_CSV_FIELDS = [
     "target_request_rate",
     "seed",
@@ -1761,8 +1943,31 @@ SWEEP_PAIRED_CSV_FIELDS = [
 ]
 
 
+MMPP_SWEEP_CSV_FIELDS = [
+    "mmpp_profile",
+    "mmpp_background_rate_fraction",
+    "mmpp_burst_rate_multiplier",
+    "mmpp_mean_burst_requests",
+    *SWEEP_CSV_FIELDS,
+]
+
+
+MMPP_SWEEP_PAIRED_CSV_FIELDS = [
+    "mmpp_profile",
+    "mmpp_background_rate_fraction",
+    "mmpp_burst_rate_multiplier",
+    "mmpp_mean_burst_requests",
+    *SWEEP_PAIRED_CSV_FIELDS,
+]
+
+
 def rate_label(rate: float) -> str:
     return f"rate_{rate:g}".replace(".", "p").replace("-", "m")
+
+
+def safe_label(label: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in label)
+    return safe or "unnamed"
 
 
 def create_sweep_output_dir(base: Path | None) -> Path:
@@ -1771,6 +1976,16 @@ def create_sweep_output_dir(base: Path | None) -> Path:
     else:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         out_dir = OUTPUT_ROOT / f"preflow_throughput_sweep_{timestamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def create_mmpp_sweep_output_dir(base: Path | None) -> Path:
+    if base is not None:
+        out_dir = base
+    else:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        out_dir = OUTPUT_ROOT / f"preflow_mmpp_parameter_sweep_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -1823,6 +2038,26 @@ def sweep_paired_rows_from_summary(rate: float, summary: dict[str, Any]) -> list
     return rows
 
 
+def add_mmpp_profile_fields(
+    rows: list[dict[str, Any]],
+    *,
+    name: str,
+    background_rate_fraction: float,
+    burst_rate_multiplier: float,
+    mean_burst_requests: float,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "mmpp_profile": name,
+            "mmpp_background_rate_fraction": background_rate_fraction,
+            "mmpp_burst_rate_multiplier": burst_rate_multiplier,
+            "mmpp_mean_burst_requests": mean_burst_requests,
+            **row,
+        }
+        for row in rows
+    ]
+
+
 def numeric_mean(values: list[Any]) -> float | None:
     numeric_values = [float(value) for value in values if value is not None]
     return statistics.fmean(numeric_values) if numeric_values else None
@@ -1844,6 +2079,43 @@ def aggregate_sweep_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "p95_ttft_s": numeric_mean([row["p95_ttft_s"] for row in group]),
                 "mean_relative_slowdown": numeric_mean([row["mean_relative_slowdown"] for row in group]),
                 "p95_relative_slowdown": numeric_mean([row["p95_relative_slowdown"] for row in group]),
+                "average_unfinished_requests": numeric_mean([row["average_unfinished_requests"] for row in group]),
+                "peak_unfinished_requests": numeric_mean([row["peak_unfinished_requests"] for row in group]),
+            }
+        )
+    return aggregated
+
+
+def aggregate_mmpp_sweep_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, float], list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(
+            (
+                row["mmpp_profile"],
+                row["scheduler"],
+                float(row["target_request_rate"]),
+            ),
+            [],
+        ).append(row)
+
+    aggregated = []
+    for (profile, scheduler, rate), group in sorted(grouped.items()):
+        first = group[0]
+        aggregated.append(
+            {
+                "mmpp_profile": profile,
+                "scheduler": scheduler,
+                "target_request_rate": rate,
+                "mmpp_background_rate_fraction": first["mmpp_background_rate_fraction"],
+                "mmpp_burst_rate_multiplier": first["mmpp_burst_rate_multiplier"],
+                "mmpp_mean_burst_requests": first["mmpp_mean_burst_requests"],
+                "completion_throughput": numeric_mean([row["completion_throughput"] for row in group]),
+                "arithmetic_mean_ttft_s": numeric_mean([row["arithmetic_mean_ttft_s"] for row in group]),
+                "p95_ttft_s": numeric_mean([row["p95_ttft_s"] for row in group]),
+                "mean_relative_slowdown": numeric_mean([row["mean_relative_slowdown"] for row in group]),
+                "p95_relative_slowdown": numeric_mean([row["p95_relative_slowdown"] for row in group]),
+                "average_unfinished_requests": numeric_mean([row["average_unfinished_requests"] for row in group]),
+                "peak_unfinished_requests": numeric_mean([row["peak_unfinished_requests"] for row in group]),
             }
         )
     return aggregated
@@ -1874,30 +2146,81 @@ def plot_sweep_metric_pair(
                 row
                 for row in rows
                 if row["scheduler"] == scheduler
-                and row["completion_throughput"] is not None
+                and row["target_request_rate"] is not None
                 and row[metric] is not None
             ]
-            points.sort(key=lambda row: row["completion_throughput"])
+            points.sort(key=lambda row: row["target_request_rate"])
             if not points:
                 continue
             axis.plot(
-                [row["completion_throughput"] for row in points],
+                [row["target_request_rate"] for row in points],
                 [row[metric] for row in points],
                 marker="o",
                 label=scheduler,
             )
             for row in points:
-                axis.annotate(
-                    f"{row['target_request_rate']:g}",
-                    (row["completion_throughput"], row[metric]),
-                    textcoords="offset points",
-                    xytext=(4, 4),
-                    fontsize=8,
-                )
-        axis.set_xlabel("Achieved completion throughput (requests/s)")
+                completion_throughput = row.get("completion_throughput")
+                if completion_throughput is not None:
+                    axis.annotate(
+                        f"{completion_throughput:.3g}",
+                        (row["target_request_rate"], row[metric]),
+                        textcoords="offset points",
+                        xytext=(4, 4),
+                        fontsize=8,
+                    )
+        axis.set_xlabel("Average query arrival rate (requests/s)")
         axis.set_ylabel(ylabel)
         axis.grid(True, alpha=0.3)
         axis.legend()
+    fig.suptitle(title)
+    fig.tight_layout()
+    for fmt in cfg.sweep_plot_formats:
+        fig.savefig(out_dir / f"{filename_base}.{fmt}", bbox_inches="tight", dpi=160)
+    plt.close(fig)
+
+
+def plot_mmpp_sweep_metric_pair(
+    *,
+    rows: list[dict[str, Any]],
+    out_dir: Path,
+    cfg: BenchmarkConfig,
+    filename_base: str,
+    title: str,
+    metrics: list[tuple[str, str]],
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # noqa: BLE001 - plotting is optional after data collection.
+        warning = f"Could not import matplotlib; MMPP sweep plots were not written: {exc}\n"
+        (out_dir / "plotting_warning.txt").write_text(warning, encoding="utf-8")
+        print(f"WARNING: {warning.strip()}")
+        return
+
+    series_keys = sorted({(row["mmpp_profile"], row["scheduler"]) for row in rows})
+    fig, axes = plt.subplots(1, len(metrics), figsize=(6.0 * len(metrics), 4.5), squeeze=False)
+    for axis, (metric, ylabel) in zip(axes[0], metrics):
+        for profile, scheduler in series_keys:
+            points = [
+                row
+                for row in rows
+                if row["mmpp_profile"] == profile
+                and row["scheduler"] == scheduler
+                and row["target_request_rate"] is not None
+                and row[metric] is not None
+            ]
+            points.sort(key=lambda row: row["target_request_rate"])
+            if not points:
+                continue
+            axis.plot(
+                [row["target_request_rate"] for row in points],
+                [row[metric] for row in points],
+                marker="o",
+                label=f"{profile}/{scheduler}",
+            )
+        axis.set_xlabel("Average query arrival rate (requests/s)")
+        axis.set_ylabel(ylabel)
+        axis.grid(True, alpha=0.3)
+        axis.legend(fontsize=8)
     fig.suptitle(title)
     fig.tight_layout()
     for fmt in cfg.sweep_plot_formats:
@@ -1916,8 +2239,8 @@ def write_throughput_sweep_plots(
         rows=aggregated,
         out_dir=out_dir,
         cfg=cfg,
-        filename_base="latency_vs_throughput",
-        title="Latency vs Achieved Throughput",
+        filename_base="latency_vs_arrival_rate",
+        title="Latency vs Average Query Arrival Rate",
         metrics=[
             ("arithmetic_mean_ttft_s", "Mean TTFT (s)"),
             ("p95_ttft_s", "P95 TTFT (s)"),
@@ -1927,13 +2250,222 @@ def write_throughput_sweep_plots(
         rows=aggregated,
         out_dir=out_dir,
         cfg=cfg,
-        filename_base="slowdown_vs_throughput",
-        title="Relative Slowdown vs Achieved Throughput",
+        filename_base="slowdown_vs_arrival_rate",
+        title="Relative Slowdown vs Average Query Arrival Rate",
         metrics=[
             ("mean_relative_slowdown", "Mean relative slowdown"),
             ("p95_relative_slowdown", "P95 relative slowdown"),
         ],
     )
+    plot_sweep_metric_pair(
+        rows=aggregated,
+        out_dir=out_dir,
+        cfg=cfg,
+        filename_base="unfinished_requests_vs_arrival_rate",
+        title="Client-Visible Unfinished Requests vs Average Query Arrival Rate",
+        metrics=[
+            ("average_unfinished_requests", "Average unfinished requests"),
+            ("peak_unfinished_requests", "Peak unfinished requests"),
+        ],
+    )
+
+
+def write_mmpp_parameter_sweep_plots(
+    rows: list[dict[str, Any]],
+    out_dir: Path,
+    cfg: BenchmarkConfig,
+) -> None:
+    aggregated = aggregate_mmpp_sweep_rows(rows)
+    write_json(out_dir / "mmpp_parameter_sweep_aggregated.json", aggregated)
+    plot_mmpp_sweep_metric_pair(
+        rows=aggregated,
+        out_dir=out_dir,
+        cfg=cfg,
+        filename_base="mmpp_latency_vs_arrival_rate",
+        title="MMPP Latency vs Average Query Arrival Rate",
+        metrics=[
+            ("arithmetic_mean_ttft_s", "Mean TTFT (s)"),
+            ("p95_ttft_s", "P95 TTFT (s)"),
+        ],
+    )
+    plot_mmpp_sweep_metric_pair(
+        rows=aggregated,
+        out_dir=out_dir,
+        cfg=cfg,
+        filename_base="mmpp_slowdown_vs_arrival_rate",
+        title="MMPP Relative Slowdown vs Average Query Arrival Rate",
+        metrics=[
+            ("mean_relative_slowdown", "Mean relative slowdown"),
+            ("p95_relative_slowdown", "P95 relative slowdown"),
+        ],
+    )
+    plot_mmpp_sweep_metric_pair(
+        rows=aggregated,
+        out_dir=out_dir,
+        cfg=cfg,
+        filename_base="mmpp_unfinished_requests_vs_arrival_rate",
+        title="MMPP Client-Visible Unfinished Requests vs Average Query Arrival Rate",
+        metrics=[
+            ("average_unfinished_requests", "Average unfinished requests"),
+            ("peak_unfinished_requests", "Peak unfinished requests"),
+        ],
+    )
+
+
+def parse_csv_number(value: str, field: str) -> Any:
+    if value == "":
+        return None
+    if field in SWEEP_INT_FIELDS:
+        return int(value)
+    if field in SWEEP_FLOAT_FIELDS:
+        return float(value)
+    return value
+
+
+def read_throughput_sweep_rows(path: Path) -> list[dict[str, Any]]:
+    with path.open(newline="", encoding="utf-8") as f:
+        return [
+            {field: parse_csv_number(value, field) for field, value in row.items()}
+            for row in csv.DictReader(f)
+        ]
+
+
+def read_request_csv_rows(path: Path) -> list[dict[str, Any]]:
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def unfinished_request_history(rows: list[dict[str, Any]]) -> tuple[list[float], list[int]]:
+    measured = [
+        row
+        for row in rows
+        if row.get("phase") == "measured"
+        and row.get("actual_submission_time_s")
+        and row.get("completion_time_s")
+    ]
+    if not measured:
+        return [0.0], [0]
+
+    first_submission_s = min(float(row["actual_submission_time_s"]) for row in measured)
+    event_deltas: dict[float, int] = {}
+    for row in measured:
+        submit_s = float(row["actual_submission_time_s"]) - first_submission_s
+        complete_s = float(row["completion_time_s"]) - first_submission_s
+        event_deltas[submit_s] = event_deltas.get(submit_s, 0) + 1
+        event_deltas[complete_s] = event_deltas.get(complete_s, 0) - 1
+
+    times = [0.0]
+    counts = [0]
+    current = 0
+    for event_time_s in sorted(event_deltas):
+        if event_time_s > times[-1]:
+            times.append(event_time_s)
+            counts.append(current)
+        current += event_deltas[event_time_s]
+        times.append(event_time_s)
+        counts.append(current)
+    return times, counts
+
+
+def plot_queue_history_for_seed(
+    *,
+    out_dir: Path,
+    cfg: BenchmarkConfig,
+    rows: list[dict[str, Any]],
+    seed: int,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # noqa: BLE001 - plotting is optional after data collection.
+        warning = f"Could not import matplotlib; queue history plots were not written: {exc}\n"
+        (out_dir / "plotting_warning.txt").write_text(warning, encoding="utf-8")
+        print(f"WARNING: {warning.strip()}")
+        return
+
+    rates = sorted({float(row["target_request_rate"]) for row in rows if int(row["seed"]) == seed})
+    schedulers = sorted({row["scheduler"] for row in rows if int(row["seed"]) == seed})
+    if not rates or not schedulers:
+        return
+
+    num_cols = 2
+    num_rows = math.ceil(len(rates) / num_cols)
+    fig, axes = plt.subplots(
+        num_rows,
+        num_cols,
+        figsize=(6.4 * num_cols, 3.4 * num_rows),
+        squeeze=False,
+    )
+
+    for axis in axes.flat[len(rates) :]:
+        axis.axis("off")
+
+    for axis, rate in zip(axes.flat, rates):
+        rate_dir = out_dir / rate_label(rate)
+        for scheduler in schedulers:
+            csv_path = rate_dir / f"requests_{scheduler}_{seed}.csv"
+            if not csv_path.exists():
+                continue
+            request_rows = read_request_csv_rows(csv_path)
+            times, counts = unfinished_request_history(request_rows)
+            axis.step(times, counts, where="post", label=scheduler)
+        axis.set_title(f"arrival rate={rate:g} req/s")
+        axis.set_xlabel("Elapsed time since first measured submission (s)")
+        axis.set_ylabel("Unfinished requests")
+        axis.set_ylim(bottom=0)
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+
+    fig.suptitle(f"Client-Visible Unfinished Request History, seed={seed}")
+    fig.tight_layout()
+    for fmt in cfg.sweep_plot_formats:
+        fig.savefig(out_dir / f"unfinished_request_history_seed_{seed}.{fmt}", bbox_inches="tight", dpi=160)
+    plt.close(fig)
+
+
+def write_queue_history_plots(
+    rows: list[dict[str, Any]],
+    out_dir: Path,
+    cfg: BenchmarkConfig,
+) -> None:
+    for seed in sorted({int(row["seed"]) for row in rows}):
+        plot_queue_history_for_seed(
+            out_dir=out_dir,
+            cfg=cfg,
+            rows=rows,
+            seed=seed,
+        )
+
+
+def config_for_existing_sweep(out_dir: Path) -> BenchmarkConfig:
+    cfg = make_config()
+    summary_path = out_dir / "throughput_sweep.json"
+    if not summary_path.exists():
+        return cfg
+
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    config = payload.get("config", {})
+    plot_formats = config.get("sweep_plot_formats")
+    if plot_formats:
+        cfg = replace(cfg, sweep_plot_formats=list(plot_formats))
+    return cfg
+
+
+def plot_existing_throughput_sweep(out_dir: Path) -> None:
+    sweep_csv = out_dir / "throughput_sweep.csv"
+    if not sweep_csv.exists():
+        raise FileNotFoundError(
+            f"{sweep_csv} does not exist. Point --plot-existing-sweep at a "
+            "preflow_throughput_sweep_* result directory."
+        )
+
+    rows = read_throughput_sweep_rows(sweep_csv)
+    if not rows:
+        raise ValueError(f"{sweep_csv} has no sweep rows.")
+
+    cfg = config_for_existing_sweep(out_dir)
+    write_throughput_sweep_plots(rows, out_dir, cfg)
+    write_queue_history_plots(rows, out_dir, cfg)
+    print(f"Regenerated throughput sweep plots in {out_dir}")
 
 
 def make_sweep_markdown(rows: list[dict[str, Any]], paired_rows: list[dict[str, Any]]) -> str:
@@ -1943,7 +2475,8 @@ def make_sweep_markdown(rows: list[dict[str, Any]], paired_rows: list[dict[str, 
         "Dummy weights were enabled with `load_format='dummy'`; these results "
         "validate scheduler behavior, not final real-model latency.",
         "",
-        "Offered rates are shown as point labels in the generated plots.",
+        "The x-axis is the configured average query arrival rate. Point labels "
+        "show achieved completion throughput.",
         "",
         "## Runs",
         "",
@@ -1987,26 +2520,14 @@ def make_sweep_markdown(rows: list[dict[str, Any]], paired_rows: list[dict[str, 
     return "\n".join(lines) + "\n"
 
 
-async def run_throughput_sweep(
+async def collect_rate_sweep(
     *,
     cfg: BenchmarkConfig,
     schedulers: list[str],
-    out_dir: Path | None,
-) -> None:
-    cfg = replace(cfg, run_throughput_sweep=True)
-    validate_config(cfg, schedulers)
-
-    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    sweep_dir = create_sweep_output_dir(out_dir)
-    runtime = import_runtime()
-
-    print("Using vLLM load_format='dummy'. Results are scheduler-behavior data,")
-    print(f"not final real-model latency. Throughput sweep output: {sweep_dir}")
-    print("Calibrating solo TTFT once per scheduler; rate points reuse those baselines.")
-
-    solo_cache = await run_solo_calibrations(schedulers, cfg, runtime)
-    write_csv(sweep_dir / "solo_latencies.csv", solo_cache[0], REQUEST_CSV_FIELDS)
-
+    sweep_dir: Path,
+    runtime: RuntimeImports,
+    solo_cache: tuple[list[dict[str, Any]], dict[str, dict[int, float]], dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     sweep_rows: list[dict[str, Any]] = []
     sweep_paired_rows: list[dict[str, Any]] = []
     rate_summaries: dict[str, Any] = {}
@@ -2027,6 +2548,18 @@ async def run_throughput_sweep(
         sweep_rows.extend(sweep_rows_from_summary(rate, summary))
         sweep_paired_rows.extend(sweep_paired_rows_from_summary(rate, summary))
 
+    return sweep_rows, sweep_paired_rows, rate_summaries
+
+
+def write_rate_sweep_outputs(
+    *,
+    sweep_dir: Path,
+    cfg: BenchmarkConfig,
+    schedulers: list[str],
+    sweep_rows: list[dict[str, Any]],
+    sweep_paired_rows: list[dict[str, Any]],
+    rate_summaries: dict[str, Any],
+) -> None:
     write_csv(sweep_dir / "throughput_sweep.csv", sweep_rows, SWEEP_CSV_FIELDS)
     write_csv(
         sweep_dir / "throughput_sweep_paired.csv",
@@ -2048,14 +2581,244 @@ async def run_throughput_sweep(
         encoding="utf-8",
     )
     write_throughput_sweep_plots(sweep_rows, sweep_dir, cfg)
+    write_queue_history_plots(sweep_rows, sweep_dir, cfg)
+
+
+def make_mmpp_sweep_markdown(rows: list[dict[str, Any]], paired_rows: list[dict[str, Any]]) -> str:
+    lines = [
+        "# PREFLOW MMPP Parameter Sweep",
+        "",
+        "Dummy weights were enabled with `load_format='dummy'`; these results "
+        "validate scheduler behavior, not final real-model latency.",
+        "",
+        "Each MMPP profile is also written as an ordinary throughput sweep "
+        "subdirectory with its own plots.",
+        "",
+        "## Runs",
+        "",
+        "| profile | offered rate | scheduler | seed | achieved throughput | "
+        "p95 TTFT | p95 slowdown | peak unfinished | failures |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            (
+                "| {profile} | {rate} | {scheduler} | {seed} | "
+                "{throughput} | {ttft} | {slowdown} | {peak} | {failures} |"
+            ).format(
+                profile=row["mmpp_profile"],
+                rate=format_float(row["target_request_rate"]),
+                scheduler=row["scheduler"],
+                seed=row["seed"],
+                throughput=format_float(row["completion_throughput"]),
+                ttft=format_float(row["p95_ttft_s"]),
+                slowdown=format_float(row["p95_relative_slowdown"]),
+                peak=format_float(row["peak_unfinished_requests"]),
+                failures=row["failed_request_count"],
+            )
+        )
+    if paired_rows:
+        lines.extend(
+            [
+                "",
+                "## Paired PREFLOW Improvements",
+                "",
+                "| profile | offered rate | seed | mean improvement | "
+                "p95 slowdown improvement | wins | ties | losses |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in paired_rows:
+            lines.append(
+                "| {profile} | {rate} | {seed} | {mean} | {p95} | {wins} | {ties} | {losses} |".format(
+                    profile=row["mmpp_profile"],
+                    rate=format_float(row["target_request_rate"]),
+                    seed=row["seed"],
+                    mean=format_float(row["mean_paired_improvement"]),
+                    p95=format_float(row["p95_slowdown_improvement"]),
+                    wins=row["preflow_wins"],
+                    ties=row["preflow_ties"],
+                    losses=row["preflow_losses"],
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
+async def run_throughput_sweep(
+    *,
+    cfg: BenchmarkConfig,
+    schedulers: list[str],
+    out_dir: Path | None,
+) -> None:
+    cfg = replace(cfg, run_throughput_sweep=True)
+    validate_config(cfg, schedulers)
+
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    sweep_dir = create_sweep_output_dir(out_dir)
+    runtime = import_runtime()
+
+    print("Using vLLM load_format='dummy'. Results are scheduler-behavior data,")
+    print(f"not final real-model latency. Throughput sweep output: {sweep_dir}")
+    print("Calibrating solo TTFT once per scheduler; rate points reuse those baselines.")
+
+    solo_cache = await run_solo_calibrations(schedulers, cfg, runtime)
+    write_csv(sweep_dir / "solo_latencies.csv", solo_cache[0], REQUEST_CSV_FIELDS)
+
+    sweep_rows, sweep_paired_rows, rate_summaries = await collect_rate_sweep(
+        cfg=cfg,
+        schedulers=schedulers,
+        sweep_dir=sweep_dir,
+        runtime=runtime,
+        solo_cache=solo_cache,
+    )
+
+    write_rate_sweep_outputs(
+        sweep_dir=sweep_dir,
+        cfg=cfg,
+        schedulers=schedulers,
+        sweep_rows=sweep_rows,
+        sweep_paired_rows=sweep_paired_rows,
+        rate_summaries=rate_summaries,
+    )
     print(f"\nThroughput sweep complete: {sweep_dir}")
 
 
+async def run_mmpp_parameter_sweep(
+    *,
+    cfg: BenchmarkConfig,
+    schedulers: list[str],
+    out_dir: Path | None,
+) -> None:
+    cfg = replace(
+        cfg,
+        run_throughput_sweep=True,
+        run_mmpp_parameter_sweep=True,
+    )
+    validate_config(cfg, schedulers)
+
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    sweep_dir = create_mmpp_sweep_output_dir(out_dir)
+    runtime = import_runtime()
+
+    print("Using vLLM load_format='dummy'. Results are scheduler-behavior data,")
+    print(f"not final real-model latency. MMPP parameter sweep output: {sweep_dir}")
+    print("Calibrating solo TTFT once per scheduler; every MMPP profile reuses those baselines.")
+
+    solo_cache = await run_solo_calibrations(schedulers, cfg, runtime)
+    write_csv(sweep_dir / "solo_latencies.csv", solo_cache[0], REQUEST_CSV_FIELDS)
+
+    all_rows: list[dict[str, Any]] = []
+    all_paired_rows: list[dict[str, Any]] = []
+    profile_summaries: dict[str, Any] = {}
+
+    for name, background_rate_fraction, burst_rate_multiplier, mean_burst_requests in cfg.mmpp_parameter_sweep:
+        profile_label = safe_label(name)
+        profile_dir = sweep_dir / profile_label
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        profile_cfg = replace(
+            cfg,
+            mmpp_background_rate_fraction=background_rate_fraction,
+            mmpp_burst_rate_multiplier=burst_rate_multiplier,
+            mmpp_mean_burst_requests=mean_burst_requests,
+        )
+        print(
+            "\n=== MMPP profile={name} background={background:g} "
+            "burst_multiplier={multiplier:g} mean_burst_requests={mean:g} ===".format(
+                name=name,
+                background=background_rate_fraction,
+                multiplier=burst_rate_multiplier,
+                mean=mean_burst_requests,
+            )
+        )
+        sweep_rows, sweep_paired_rows, rate_summaries = await collect_rate_sweep(
+            cfg=profile_cfg,
+            schedulers=schedulers,
+            sweep_dir=profile_dir,
+            runtime=runtime,
+            solo_cache=solo_cache,
+        )
+        write_csv(profile_dir / "solo_latencies.csv", solo_cache[0], REQUEST_CSV_FIELDS)
+        write_rate_sweep_outputs(
+            sweep_dir=profile_dir,
+            cfg=profile_cfg,
+            schedulers=schedulers,
+            sweep_rows=sweep_rows,
+            sweep_paired_rows=sweep_paired_rows,
+            rate_summaries=rate_summaries,
+        )
+        profile_summaries[profile_label] = {
+            "name": name,
+            "mmpp_background_rate_fraction": background_rate_fraction,
+            "mmpp_burst_rate_multiplier": burst_rate_multiplier,
+            "mmpp_mean_burst_requests": mean_burst_requests,
+            "output_dir": str(profile_dir),
+            "rate_summaries": rate_summaries,
+        }
+        all_rows.extend(
+            add_mmpp_profile_fields(
+                sweep_rows,
+                name=name,
+                background_rate_fraction=background_rate_fraction,
+                burst_rate_multiplier=burst_rate_multiplier,
+                mean_burst_requests=mean_burst_requests,
+            )
+        )
+        all_paired_rows.extend(
+            add_mmpp_profile_fields(
+                sweep_paired_rows,
+                name=name,
+                background_rate_fraction=background_rate_fraction,
+                burst_rate_multiplier=burst_rate_multiplier,
+                mean_burst_requests=mean_burst_requests,
+            )
+        )
+
+    write_csv(sweep_dir / "mmpp_parameter_sweep.csv", all_rows, MMPP_SWEEP_CSV_FIELDS)
+    write_csv(
+        sweep_dir / "mmpp_parameter_sweep_paired.csv",
+        all_paired_rows,
+        MMPP_SWEEP_PAIRED_CSV_FIELDS,
+    )
+    write_json(
+        sweep_dir / "mmpp_parameter_sweep.json",
+        {
+            **make_config_payload(cfg, schedulers),
+            "output_dir": str(sweep_dir),
+            "profile_summaries": profile_summaries,
+            "sweep_rows": all_rows,
+            "paired_rows": all_paired_rows,
+        },
+    )
+    (sweep_dir / "mmpp_parameter_sweep.md").write_text(
+        make_mmpp_sweep_markdown(all_rows, all_paired_rows),
+        encoding="utf-8",
+    )
+    write_mmpp_parameter_sweep_plots(all_rows, sweep_dir, cfg)
+    print(f"\nMMPP parameter sweep complete: {sweep_dir}")
+
+
 async def run_benchmark(args: argparse.Namespace) -> None:
+    if args.plot_existing_sweep is not None:
+        plot_existing_throughput_sweep(args.plot_existing_sweep)
+        return
+
     cfg = make_config()
     if args.throughput_sweep:
         cfg = replace(cfg, run_throughput_sweep=True)
+    if args.mmpp_sweep:
+        cfg = replace(
+            cfg,
+            run_mmpp_parameter_sweep=True,
+            run_throughput_sweep=True,
+        )
     schedulers = make_schedulers(args.scheduler)
+    if cfg.run_mmpp_parameter_sweep:
+        await run_mmpp_parameter_sweep(
+            cfg=cfg,
+            schedulers=schedulers,
+            out_dir=args.output_dir,
+        )
+        return
     if cfg.run_throughput_sweep:
         await run_throughput_sweep(
             cfg=cfg,
@@ -2089,7 +2852,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--throughput-sweep",
         action="store_true",
-        help="Run TARGET_REQUEST_RATE_SWEEP and generate latency/slowdown-vs-throughput plots.",
+        help="Run TARGET_REQUEST_RATE_SWEEP and generate latency/slowdown-vs-arrival-rate plots.",
+    )
+    parser.add_argument(
+        "--mmpp-sweep",
+        action="store_true",
+        help="Run each MMPP_PARAMETER_SWEEP profile across TARGET_REQUEST_RATE_SWEEP.",
+    )
+    parser.add_argument(
+        "--plot-existing-sweep",
+        type=Path,
+        default=None,
+        help="Regenerate throughput sweep plots from an existing result directory.",
     )
     return parser.parse_args()
 
