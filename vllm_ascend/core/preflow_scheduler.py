@@ -72,6 +72,7 @@ logger = init_logger(__name__)
 
 
 _PREFLOW_MIN_WORK = 1e-12
+_PREFLOW_LOG_2 = math.log(2.0)
 _PREFLOW_BATCH_ID_ATTR = "_vllm_ascend_preflow_batch_id"
 
 
@@ -473,6 +474,12 @@ class PREFLOWScheduler(SchedulerInterface):
         return self._preflow_prompt_history(request) < request.num_prompt_tokens
 
     def _preflow_priority(self, request: Request) -> float | None:
+        """Return log-priority for exponential aged WSRJF ordering.
+
+        PREFLOW uses ``2 ** (A_q / age_priority_double) / (P_q R_q)``.
+        Returning its logarithm preserves the ordering while avoiding overflow
+        when long overload experiments produce large normalized ages.
+        """
         remaining_work = self._preflow_remaining_work(request)
         if remaining_work <= _PREFLOW_MIN_WORK:
             return None
@@ -480,8 +487,11 @@ class PREFLOWScheduler(SchedulerInterface):
         if required_work <= _PREFLOW_MIN_WORK:
             return None
         age = self._preflow_age.get(request.request_id, 0.0)
-        aged_weight = 1.0 + age / self.preflow_age_priority_double
-        return aged_weight / (required_work * remaining_work)
+        return (
+            age / self.preflow_age_priority_double * _PREFLOW_LOG_2
+            - math.log(required_work)
+            - math.log(remaining_work)
+        )
 
     def _preflow_order_running_requests(self) -> None:
         """Order unfinished-prefill RUNNING requests by aged weighted-SRJF."""

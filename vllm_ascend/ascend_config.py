@@ -704,6 +704,9 @@ class BatchJobSchedConfig:
 class PREFLOWConfig:
     """Configuration for PREFLOW prefill scheduling.
 
+    ``age_priority_double`` is the normalized-work age interval that doubles
+    exponential PREFLOW priority.
+
     Usage (online)::
 
         vllm serve <model> --additional-config \
