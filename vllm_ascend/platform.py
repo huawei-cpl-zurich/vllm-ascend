@@ -636,7 +636,57 @@ class NPUPlatform(Platform):
 
         short_request_first_config = scheduler_extension_config.short_request_first_config
         enable_short_request_first = short_request_first_config.enabled
+        lpm_scheduler_config = scheduler_extension_config.lpm_scheduler_config
         preflow_config = scheduler_extension_config.preflow_config
+        if lpm_scheduler_config.enabled:
+            kv_transfer_config = vllm_config.kv_transfer_config
+            kv_role = getattr(kv_transfer_config, "kv_role", None)
+            if vllm_config.scheduler_config.policy != "fcfs":
+                raise ValueError(
+                    "LPM scheduling requires scheduler_config.policy='fcfs', "
+                    f"but got {vllm_config.scheduler_config.policy!r}."
+                )
+            if scheduler_extension_config.enable_balance_scheduling:
+                raise ValueError(
+                    "LPM scheduling cannot be enabled with balance scheduling. "
+                    "Please disable one of them."
+                )
+            if preflow_config.enabled:
+                raise ValueError(
+                    "LPM scheduling cannot be enabled with preflow_config. "
+                    "Please disable one of them."
+                )
+            if enable_short_request_first:
+                raise ValueError(
+                    "LPM scheduling cannot be enabled with short_request_first_config. "
+                    "Please disable one of them."
+                )
+            if scheduler_extension_config.recompute_scheduler_enable:
+                raise ValueError(
+                    "LPM scheduling cannot be enabled with recompute_scheduler_enable. "
+                    "Please disable one of them."
+                )
+            if scheduler_extension_config.profiling_chunk_config.enabled:
+                raise ValueError(
+                    "LPM scheduling cannot be enabled with profiling_chunk_config. "
+                    "Please disable one of them."
+                )
+            if scheduler_extension_config.batch_job_sched_config.enabled:
+                raise ValueError(
+                    "LPM scheduling cannot be enabled with batch_job_sched_config. "
+                    "Please disable one of them."
+                )
+            if kv_role == "kv_consumer":
+                raise ValueError(
+                    "LPM scheduling is supported only on prefill or PD-mixed nodes, "
+                    "not PD-disaggregated D nodes (kv_role='kv_consumer')."
+                )
+            if vllm_config.scheduler_config.async_scheduling:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.lpm_scheduler.AsyncLPMScheduler"
+                )
+            else:
+                vllm_config.scheduler_config.scheduler_cls = "vllm_ascend.core.lpm_scheduler.LPMScheduler"
         if preflow_config.enabled:
             kv_transfer_config = vllm_config.kv_transfer_config
             kv_role = getattr(kv_transfer_config, "kv_role", None)

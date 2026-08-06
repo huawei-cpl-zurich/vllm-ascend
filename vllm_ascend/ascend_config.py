@@ -929,6 +929,39 @@ class ShortRequestFirstConfig:
             raise ValueError(f"short_request_first_config.long_max_wait_ms must be >= 0; got {self.long_max_wait_ms}")
 
 
+class LPMSchedulerConfig:
+    """Configuration object for ``additional_config["scheduler_config"]["lpm_scheduler_config"]``."""
+
+    _defaults = {
+        "enabled": False,
+        # SGLang falls back to FCFS when the waiting queue is larger than 128
+        # because every LPM pass probes the prefix cache for each waiting req.
+        "max_lpm_queue_size": 128,
+    }
+
+    def __init__(self, user_config: dict | None = None):
+        user_config = user_config or {}
+        unknown = set(user_config) - set(self._defaults)
+        if unknown:
+            raise ValueError(f"Unknown lpm_scheduler_config keys: {sorted(unknown)}")
+
+        self.enabled = bool(user_config.get("enabled", self._defaults["enabled"]))
+        self.max_lpm_queue_size = int(
+            user_config.get(
+                "max_lpm_queue_size",
+                self._defaults["max_lpm_queue_size"],
+            )
+        )
+        self._validate_config()
+
+    def _validate_config(self):
+        if self.max_lpm_queue_size < 0:
+            raise ValueError(
+                "lpm_scheduler_config.max_lpm_queue_size must be non-negative; "
+                f"got {self.max_lpm_queue_size}"
+            )
+
+
 class SchedulerConfig:
     """Configuration object for ``additional_config[\"scheduler_config\"]``."""
 
@@ -955,6 +988,9 @@ class SchedulerConfig:
         )
         self.short_request_first_config = ShortRequestFirstConfig(
             self._get_config_value(scheduler_config, additional_config, "short_request_first_config", {})
+        )
+        self.lpm_scheduler_config = LPMSchedulerConfig(
+            self._get_config_value(scheduler_config, additional_config, "lpm_scheduler_config", {})
         )
         self.profiling_chunk_config = ProfilingChunkConfig(
             self._get_config_value(scheduler_config, additional_config, "profiling_chunk_config", {})
