@@ -722,7 +722,7 @@ class PREFLOWConfig:
         "work_exponent": 1.5,
         "admission_bypass_budget": 0.2,
         "age_priority_double": 2.0,
-        "waiting_policy": "fcfs_protected",
+        "waiting_policy": "wsrjf",
     }
 
     def __init__(self, user_config: dict | None = None):
