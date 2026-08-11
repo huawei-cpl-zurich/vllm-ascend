@@ -704,6 +704,10 @@ class BatchJobSchedConfig:
 class PREFLOWConfig:
     """Configuration for PREFLOW prefill scheduling.
 
+    PREFLOW uses a fixed triangular attention-work proxy for scoring:
+    ``W(n) = n * (n + 1) / 2``. The ``work_exponent`` field is still accepted
+    for backward config compatibility, but no longer controls ranking.
+
     ``age_priority_double`` is the normalized-work age interval that doubles
     exponential PREFLOW priority.
 

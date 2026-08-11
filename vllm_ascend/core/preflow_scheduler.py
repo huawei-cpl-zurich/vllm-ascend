@@ -386,11 +386,10 @@ class PREFLOWScheduler(SchedulerInterface):
         self.preflow_waiting_policy = preflow_config.waiting_policy
         self._preflow_validate_config()
 
-        # PREFLOW per-request state. Waiting requests are conservatively
-        # normalized as uncached jobs until the normal admission path
-        # establishes the authoritative initial prefix history. Existing
-        # accumulated normalized age is retained when authoritative required
-        # work becomes known.
+        # PREFLOW per-request state. P is fixed from the prefix-cache state
+        # observed when the request enters the scheduler. Admission still
+        # performs the normal cache lookup/attachment for execution, but it
+        # does not rewrite this initial scoring baseline.
         self._preflow_initial_history: dict[str, int] = {}
         self._preflow_initial_history_authoritative: set[str] = set()
         self._preflow_age: dict[str, float] = {}
@@ -418,7 +417,8 @@ class PREFLOWScheduler(SchedulerInterface):
             )
 
     def _preflow_work(self, num_tokens: int) -> float:
-        return float(num_tokens) ** self.preflow_work_exponent
+        tokens = float(max(0, int(num_tokens)))
+        return tokens * (tokens + 1.0) / 2.0
 
     def _preflow_prompt_history(
         self,
@@ -435,6 +435,42 @@ class PREFLOWScheduler(SchedulerInterface):
         request_id = request.request_id
         self._preflow_age.setdefault(request_id, 0.0)
         return self._preflow_initial_history.setdefault(request_id, 0)
+
+    def _preflow_estimate_initial_history(self, request: Request) -> int:
+        prompt_history = self._preflow_prompt_history(request)
+        if prompt_history > 0:
+            return prompt_history
+        if (
+            not getattr(self.kv_cache_manager, "enable_caching", False)
+            or getattr(request, "skip_reading_prefix_cache", False)
+            or request.num_tokens <= 1
+        ):
+            return 0
+
+        max_cache_hit_length = request.num_tokens - 1
+        if (
+            self.connector is not None
+            and getattr(self, "has_mamba_layers", False)
+            and isinstance(
+                self.kv_cache_manager.coordinator,
+                HybridKVCacheCoordinator,
+            )
+        ):
+            _, per_group_hits = (
+                self.kv_cache_manager.coordinator.find_longest_cache_hit_per_group(
+                    request.block_hashes,
+                    max_cache_hit_length,
+                )
+            )
+            initial_history = max(per_group_hits, default=0)
+        else:
+            _, initial_history = (
+                self.kv_cache_manager.coordinator.find_longest_cache_hit(
+                    request.block_hashes,
+                    max_cache_hit_length,
+                )
+            )
+        return self._preflow_prompt_history(request, initial_history)
 
     def _preflow_set_authoritative_initial_history(
         self,
@@ -591,8 +627,10 @@ class PREFLOWScheduler(SchedulerInterface):
 
     def _preflow_register_request(self, request: Request) -> None:
         self._preflow_age[request.request_id] = 0.0
-        self._preflow_initial_history.pop(request.request_id, None)
-        self._preflow_initial_history_authoritative.discard(request.request_id)
+        self._preflow_initial_history[request.request_id] = (
+            self._preflow_estimate_initial_history(request)
+        )
+        self._preflow_initial_history_authoritative.add(request.request_id)
 
     def _preflow_forget_request(self, request_id: str) -> None:
         """Drop PREFLOW state for a permanently finished request.
