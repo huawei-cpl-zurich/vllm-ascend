@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -779,6 +780,100 @@ class BatchJobSchedConfig:
             )
 
 
+class PREFLOWConfig:
+    """Configuration for PREFLOW prefill scheduling.
+
+    PREFLOW is selected only on PD-disaggregated prefill nodes
+    (``kv_role="kv_producer"``). Decode and other node roles retain their
+    normal scheduler when this configuration is enabled.
+
+    PREFLOW uses a fixed triangular attention-work proxy for scoring:
+    ``W(n) = n * (n + 1) / 2``. The ``work_exponent`` field is still accepted
+    for backward config compatibility, but no longer controls ranking.
+
+    ``age_priority_double`` is the normalized-work age interval that doubles
+    exponential PREFLOW priority.
+
+    ``micro_prefill_isl_threshold`` is the maximum remaining uncached prompt
+    length that may join another micro-prefill in the same batch. Additional
+    micro-prefills are admitted up to the normal chunked-prefill token limit.
+    Set it to ``0`` to keep at most one prefill per scheduler step.
+
+    The examples below show only the scheduler extension. The node must also
+    configure a KV connector with ``kv_role="kv_producer"``.
+
+    Usage (online)::
+
+        vllm serve <model> --additional-config \
+            '{"scheduler_config": {"preflow_config": {"enabled": true}}}'
+
+    Usage (offline)::
+
+        llm = LLM(model, additional_config={"scheduler_config": {"preflow_config": {"enabled": true}}})
+    """
+
+    _defaults = {
+        "enabled": False,
+        "work_exponent": 1.5,
+        "admission_bypass_budget": 0.2,
+        "age_priority_double": 2.0,
+        "waiting_policy": "wsrjf",
+        "micro_prefill_isl_threshold": 1,
+    }
+
+    def __init__(self, user_config: dict | None = None):
+        user_config = user_config or {}
+        unknown = set(user_config) - set(self._defaults)
+        if unknown:
+            raise ValueError(f"Unknown preflow_config keys: {sorted(unknown)}")
+
+        self.enabled = bool(user_config.get("enabled", self._defaults["enabled"]))
+        self.work_exponent = float(user_config.get("work_exponent", self._defaults["work_exponent"]))
+        self.admission_bypass_budget = float(
+            user_config.get(
+                "admission_bypass_budget",
+                self._defaults["admission_bypass_budget"],
+            )
+        )
+        self.age_priority_double = float(
+            user_config.get(
+                "age_priority_double",
+                self._defaults["age_priority_double"],
+            )
+        )
+        self.waiting_policy = str(user_config.get("waiting_policy", self._defaults["waiting_policy"]))
+        self.micro_prefill_isl_threshold = int(
+            user_config.get(
+                "micro_prefill_isl_threshold",
+                self._defaults["micro_prefill_isl_threshold"],
+            )
+        )
+        self._validate_config()
+
+    def _validate_config(self):
+        if not math.isfinite(self.work_exponent) or self.work_exponent <= 0:
+            raise ValueError(f"preflow_config.work_exponent must be finite and positive, got {self.work_exponent}")
+        if not math.isfinite(self.admission_bypass_budget) or self.admission_bypass_budget < 0:
+            raise ValueError(
+                "preflow_config.admission_bypass_budget must be finite and non-negative, "
+                f"got {self.admission_bypass_budget}"
+            )
+        if not math.isfinite(self.age_priority_double) or self.age_priority_double <= 0:
+            raise ValueError(
+                f"preflow_config.age_priority_double must be finite and positive, got {self.age_priority_double}"
+            )
+        if self.waiting_policy not in {"fcfs_protected", "wsrjf"}:
+            raise ValueError(
+                f"preflow_config.waiting_policy must be one of ['fcfs_protected', 'wsrjf'], got {self.waiting_policy!r}"
+            )
+        if self.micro_prefill_isl_threshold < 0:
+            raise ValueError(
+                "preflow_config.micro_prefill_isl_threshold must be "
+                "non-negative, "
+                f"got {self.micro_prefill_isl_threshold}"
+            )
+
+
 class RejectionSamplerConfig:
     """Configuration for Block Verify and Entropy Verify in Rejection Sampler.
 
@@ -1061,6 +1156,9 @@ class SchedulerConfig:
         )
         self.batch_job_sched_config = BatchJobSchedConfig(
             self._get_config_value(scheduler_config, additional_config, "batch_job_sched_config", {})
+        )
+        self.preflow_config = PREFLOWConfig(
+            self._get_config_value(scheduler_config, additional_config, "preflow_config", {})
         )
         self.dyntra_lb_config = DyntraLBConfig(scheduler_config.get("dyntra_lb_config"))
 
