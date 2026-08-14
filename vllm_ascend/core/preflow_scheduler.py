@@ -10,7 +10,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -102,6 +102,42 @@ class _PREFLOWBypassProbeSnapshot:
 
 
 @dataclass
+class _PREFLOWPrefillBatchState:
+    """Prefill selections made during one scheduler step."""
+
+    micro_prefill_tokens_scheduled: int = 0
+    micro_prefill_tokens_by_req_id: dict[str, int] = field(default_factory=dict)
+    regular_prefill_req_ids: set[str] = field(default_factory=set)
+
+    @property
+    def has_scheduled_prefill(self) -> bool:
+        return bool(self.micro_prefill_tokens_by_req_id or self.regular_prefill_req_ids)
+
+    @property
+    def regular_prefill_scheduled(self) -> bool:
+        return bool(self.regular_prefill_req_ids)
+
+    def add(
+        self,
+        request_id: str,
+        num_prefill_tokens: int,
+        is_micro_prefill: bool,
+    ) -> None:
+        assert num_prefill_tokens > 0
+        assert request_id not in self.micro_prefill_tokens_by_req_id
+        assert request_id not in self.regular_prefill_req_ids
+        if is_micro_prefill:
+            self.micro_prefill_tokens_scheduled += num_prefill_tokens
+            self.micro_prefill_tokens_by_req_id[request_id] = num_prefill_tokens
+        else:
+            self.regular_prefill_req_ids.add(request_id)
+
+    def remove(self, request_id: str) -> None:
+        self.micro_prefill_tokens_scheduled -= self.micro_prefill_tokens_by_req_id.pop(request_id, 0)
+        self.regular_prefill_req_ids.discard(request_id)
+
+
+@dataclass
 class _PREFLOWWaitingBatchState:
     scheduled_new_reqs: list[Request]
     scheduled_resumed_reqs: list[Request]
@@ -116,6 +152,7 @@ class _PREFLOWWaitingBatchState:
     token_budget: int
     encoder_compute_budget: int
     prefill_scheduled: bool
+    prefill_batch_state: _PREFLOWPrefillBatchState
     scheduled_timestamp: float
     defer_prefills: bool
 
@@ -384,6 +421,7 @@ class PREFLOWScheduler(SchedulerInterface):
         self.preflow_admission_bypass_budget = preflow_config.admission_bypass_budget
         self.preflow_age_priority_double = preflow_config.age_priority_double
         self.preflow_waiting_policy = preflow_config.waiting_policy
+        self.preflow_micro_prefill_isl_threshold = preflow_config.micro_prefill_isl_threshold
         self._preflow_validate_config()
 
         # PREFLOW per-request state. P is fixed from the prefix-cache state
@@ -414,6 +452,10 @@ class PREFLOWScheduler(SchedulerInterface):
                 "PREFLOW requires waiting_policy to be one of "
                 "['fcfs_protected', 'wsrjf'], "
                 f"got {self.preflow_waiting_policy!r}."
+            )
+        if self.preflow_micro_prefill_isl_threshold < 0:
+            raise ValueError(
+                f"PREFLOW requires micro_prefill_isl_threshold >= 0, got {self.preflow_micro_prefill_isl_threshold}."
             )
 
     def _preflow_work(self, num_tokens: int) -> float:
@@ -508,6 +550,78 @@ class PREFLOWScheduler(SchedulerInterface):
 
     def _preflow_has_unfinished_prefill(self, request: Request) -> bool:
         return self._preflow_prompt_history(request) < request.num_prompt_tokens
+
+    def _preflow_remaining_prefill_tokens(
+        self,
+        request: Request,
+        num_computed_tokens: int | None = None,
+    ) -> int:
+        prompt_history = self._preflow_prompt_history(
+            request,
+            num_computed_tokens,
+        )
+        return request.num_prompt_tokens - prompt_history
+
+    def _preflow_is_micro_prefill(
+        self,
+        remaining_prefill_tokens: int,
+    ) -> bool:
+        return (
+            self.preflow_micro_prefill_isl_threshold > 0
+            and 0 < remaining_prefill_tokens <= self.preflow_micro_prefill_isl_threshold
+        )
+
+    def _preflow_micro_prefill_batch_token_limit(self) -> int:
+        prefill_chunk_size = self.scheduler_config.long_prefill_token_threshold
+        if prefill_chunk_size > 0:
+            return prefill_chunk_size
+        return self.max_num_scheduled_tokens
+
+    def _preflow_can_schedule_prefill(
+        self,
+        remaining_prefill_tokens: int,
+        num_new_tokens: int,
+        batch_state: _PREFLOWPrefillBatchState,
+    ) -> bool:
+        # Classify by the uncached prompt length, not the scheduled chunk:
+        # token-budget and chunk-size caps must not turn a large remaining ISL
+        # into a micro-prefill. A genuinely small final remainder does qualify.
+        # The aggregate limit counts the work actually added.
+        num_prefill_tokens = min(
+            remaining_prefill_tokens,
+            num_new_tokens,
+        )
+        if num_prefill_tokens <= 0:
+            return True
+        if not batch_state.has_scheduled_prefill:
+            return True
+        if batch_state.regular_prefill_scheduled:
+            return False
+        if not self._preflow_is_micro_prefill(remaining_prefill_tokens):
+            return False
+        return (
+            batch_state.micro_prefill_tokens_scheduled + num_prefill_tokens
+            <= self._preflow_micro_prefill_batch_token_limit()
+        )
+
+    def _preflow_record_scheduled_prefill(
+        self,
+        request_id: str,
+        remaining_prefill_tokens: int,
+        num_new_tokens: int,
+        batch_state: _PREFLOWPrefillBatchState,
+    ) -> None:
+        num_prefill_tokens = min(
+            remaining_prefill_tokens,
+            num_new_tokens,
+        )
+        if num_prefill_tokens <= 0:
+            return
+        batch_state.add(
+            request_id,
+            num_prefill_tokens,
+            self._preflow_is_micro_prefill(remaining_prefill_tokens),
+        )
 
     def _preflow_priority(self, request: Request) -> float | None:
         """Return log-priority for exponential aged WSRJF ordering.
@@ -1128,6 +1242,19 @@ class PREFLOWScheduler(SchedulerInterface):
             if num_new_tokens == 0:
                 return "blocked"
 
+        # This is evaluated after the real admission-time cache lookup, so a
+        # prefix hit reduces the ISL and an evicted prefix does not.
+        remaining_prefill_tokens = self._preflow_remaining_prefill_tokens(
+            request,
+            num_computed_tokens,
+        )
+        if not self._preflow_can_schedule_prefill(
+            remaining_prefill_tokens,
+            num_new_tokens,
+            state.prefill_batch_state,
+        ):
+            return "blocked"
+
         # During async KV load, no forward pass is run yet.
         # Allocate speculative lookahead slots later to avoid
         # mismatching local and remote block counts.
@@ -1247,6 +1374,12 @@ class PREFLOWScheduler(SchedulerInterface):
             request,
             num_computed_tokens,
             num_new_tokens,
+        )
+        self._preflow_record_scheduled_prefill(
+            request_id,
+            remaining_prefill_tokens,
+            num_new_tokens,
+            state.prefill_batch_state,
         )
         state.token_budget -= num_new_tokens
         request.status = RequestStatus.RUNNING
@@ -1434,6 +1567,9 @@ class PREFLOWScheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         self._preflow_order_running_requests()
+        # The same state is passed to waiting admission below, allowing only
+        # eligible waiting micro-prefills to extend a running microbatch.
+        prefill_batch_state = _PREFLOWPrefillBatchState()
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -1519,6 +1655,15 @@ class PREFLOWScheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            remaining_prefill_tokens = self._preflow_remaining_prefill_tokens(request)
+            if not self._preflow_can_schedule_prefill(
+                remaining_prefill_tokens,
+                num_new_tokens,
+                prefill_batch_state,
+            ):
+                req_index += 1
+                continue
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -1545,6 +1690,7 @@ class PREFLOWScheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
+                            prefill_batch_state.remove(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(preempted_req_id, None)
                             if preempted_encoder_inputs:
@@ -1579,6 +1725,12 @@ class PREFLOWScheduler(SchedulerInterface):
                 request,
                 request.num_computed_tokens,
                 num_new_tokens,
+            )
+            self._preflow_record_scheduled_prefill(
+                request_id,
+                remaining_prefill_tokens,
+                num_new_tokens,
+                prefill_batch_state,
             )
             token_budget -= num_new_tokens
             req_index += 1
@@ -1640,6 +1792,7 @@ class PREFLOWScheduler(SchedulerInterface):
                 token_budget=token_budget,
                 encoder_compute_budget=encoder_compute_budget,
                 prefill_scheduled=prefill_scheduled,
+                prefill_batch_state=prefill_batch_state,
                 scheduled_timestamp=scheduled_timestamp,
                 defer_prefills=defer_prefills,
             )

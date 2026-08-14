@@ -638,9 +638,12 @@ class NPUPlatform(Platform):
         enable_short_request_first = short_request_first_config.enabled
         lpm_scheduler_config = scheduler_extension_config.lpm_scheduler_config
         preflow_config = scheduler_extension_config.preflow_config
+        kv_transfer_config = vllm_config.kv_transfer_config
+        kv_role = getattr(kv_transfer_config, "kv_role", None)
+        enable_preflow_on_prefill = (
+            preflow_config.enabled and kv_role == "kv_producer"
+        )
         if lpm_scheduler_config.enabled:
-            kv_transfer_config = vllm_config.kv_transfer_config
-            kv_role = getattr(kv_transfer_config, "kv_role", None)
             if vllm_config.scheduler_config.policy != "fcfs":
                 raise ValueError(
                     "LPM scheduling requires scheduler_config.policy='fcfs', "
@@ -651,7 +654,7 @@ class NPUPlatform(Platform):
                     "LPM scheduling cannot be enabled with balance scheduling. "
                     "Please disable one of them."
                 )
-            if preflow_config.enabled:
+            if enable_preflow_on_prefill:
                 raise ValueError(
                     "LPM scheduling cannot be enabled with preflow_config. "
                     "Please disable one of them."
@@ -687,9 +690,7 @@ class NPUPlatform(Platform):
                 )
             else:
                 vllm_config.scheduler_config.scheduler_cls = "vllm_ascend.core.lpm_scheduler.LPMScheduler"
-        if preflow_config.enabled:
-            kv_transfer_config = vllm_config.kv_transfer_config
-            kv_role = getattr(kv_transfer_config, "kv_role", None)
+        if enable_preflow_on_prefill:
             if vllm_config.scheduler_config.policy != "fcfs":
                 raise ValueError(
                     "PREFLOW scheduling requires scheduler_config.policy='fcfs', "
@@ -720,11 +721,6 @@ class NPUPlatform(Platform):
                     "PREFLOW scheduling cannot be enabled with batch_job_sched_config. "
                     "Please disable one of them."
                 )
-            if kv_role == "kv_consumer":
-                raise ValueError(
-                    "PREFLOW scheduling is supported only on prefill or PD-mixed nodes, "
-                    "not PD-disaggregated D nodes (kv_role='kv_consumer')."
-                )
             if vllm_config.scheduler_config.async_scheduling:
                 vllm_config.scheduler_config.scheduler_cls = (
                     "vllm_ascend.core.preflow_scheduler.AsyncPREFLOWScheduler"
@@ -733,6 +729,13 @@ class NPUPlatform(Platform):
                 vllm_config.scheduler_config.scheduler_cls = (
                     "vllm_ascend.core.preflow_scheduler.PREFLOWScheduler"
                 )
+        elif preflow_config.enabled:
+            logger.info(
+                "PREFLOW scheduler is enabled but not selected for kv_role=%r; "
+                "it is used only on PD-disaggregated prefill nodes "
+                "(kv_role='kv_producer').",
+                kv_role,
+            )
         if enable_short_request_first:
             kv_transfer_config = vllm_config.kv_transfer_config
             kv_role = getattr(kv_transfer_config, "kv_role", None)

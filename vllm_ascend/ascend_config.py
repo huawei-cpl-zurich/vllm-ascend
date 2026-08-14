@@ -704,12 +704,24 @@ class BatchJobSchedConfig:
 class PREFLOWConfig:
     """Configuration for PREFLOW prefill scheduling.
 
+    PREFLOW is selected only on PD-disaggregated prefill nodes
+    (``kv_role="kv_producer"``). Decode and other node roles retain their
+    normal scheduler when this configuration is enabled.
+
     PREFLOW uses a fixed triangular attention-work proxy for scoring:
     ``W(n) = n * (n + 1) / 2``. The ``work_exponent`` field is still accepted
     for backward config compatibility, but no longer controls ranking.
 
     ``age_priority_double`` is the normalized-work age interval that doubles
     exponential PREFLOW priority.
+
+    ``micro_prefill_isl_threshold`` is the maximum remaining uncached prompt
+    length that may join another micro-prefill in the same batch. Additional
+    micro-prefills are admitted up to the normal chunked-prefill token limit.
+    Set it to ``0`` to keep at most one prefill per scheduler step.
+
+    The examples below show only the scheduler extension. The node must also
+    configure a KV connector with ``kv_role="kv_producer"``.
 
     Usage (online)::
 
@@ -727,6 +739,7 @@ class PREFLOWConfig:
         "admission_bypass_budget": 0.2,
         "age_priority_double": 2.0,
         "waiting_policy": "wsrjf",
+        "micro_prefill_isl_threshold": 1,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -750,6 +763,12 @@ class PREFLOWConfig:
             )
         )
         self.waiting_policy = str(user_config.get("waiting_policy", self._defaults["waiting_policy"]))
+        self.micro_prefill_isl_threshold = int(
+            user_config.get(
+                "micro_prefill_isl_threshold",
+                self._defaults["micro_prefill_isl_threshold"],
+            )
+        )
         self._validate_config()
 
     def _validate_config(self):
@@ -767,6 +786,12 @@ class PREFLOWConfig:
         if self.waiting_policy not in {"fcfs_protected", "wsrjf"}:
             raise ValueError(
                 f"preflow_config.waiting_policy must be one of ['fcfs_protected', 'wsrjf'], got {self.waiting_policy!r}"
+            )
+        if self.micro_prefill_isl_threshold < 0:
+            raise ValueError(
+                "preflow_config.micro_prefill_isl_threshold must be "
+                "non-negative, "
+                f"got {self.micro_prefill_isl_threshold}"
             )
 
 
