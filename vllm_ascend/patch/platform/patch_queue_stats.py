@@ -82,6 +82,8 @@ def install_queue_stats_tracer(
     vllm_config: Any,
 ) -> QueueStatsTracer | None:
     """Wrap ``scheduler.schedule`` once and return its tracer when enabled."""
+    if type(scheduler).__module__ == "vllm_ascend.core.preflow_scheduler":
+        return None
     if not config.enabled or getattr(scheduler, _PATCH_INSTALLED_ATTR, False):
         return getattr(scheduler, _TRACER_ATTR, None)
 

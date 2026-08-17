@@ -6,11 +6,13 @@
 # at vLLM v0.25.1.
 import itertools
 import math
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -71,6 +73,7 @@ from vllm.v1.utils import record_function_or_nullcontext
 _PREFLOW_MIN_WORK = 1e-12
 _PREFLOW_LOG_2 = math.log(2.0)
 _PREFLOW_BATCH_ID_ATTR = "_vllm_ascend_preflow_batch_id"
+_PREFLOW_QUEUE_STATS_DIR = Path("/tmp")
 
 
 @dataclass
@@ -432,6 +435,18 @@ class PREFLOWScheduler(SchedulerInterface):
         self._preflow_protected_debt: float = 0.0
         self._preflow_next_batch_id: int = 0
         self._preflow_pending_batch_work: dict[int, _PREFLOWBatchWork] = {}
+        self._preflow_queue_stats_path: Path | None = (
+            _PREFLOW_QUEUE_STATS_DIR / f"vllm_ascend_preflow_queue_stats_pid{os.getpid()}_{time.time_ns()}.csv"
+        )
+        try:
+            self._preflow_queue_stats_path.write_text(
+                "timestamp_ns,iteration,waiting,running,total\n",
+                encoding="utf-8",
+            )
+            logger.info("Writing PREFLOW queue-size trace to %s", self._preflow_queue_stats_path)
+        except OSError:
+            logger.exception("Unable to create PREFLOW queue-size trace: %s", self._preflow_queue_stats_path)
+            self._preflow_queue_stats_path = None
 
     def _preflow_validate_config(self) -> None:
         if not math.isfinite(self.preflow_work_exponent) or self.preflow_work_exponent <= 0:
@@ -454,6 +469,19 @@ class PREFLOWScheduler(SchedulerInterface):
             raise ValueError(
                 f"PREFLOW requires micro_prefill_isl_threshold >= 0, got {self.preflow_micro_prefill_isl_threshold}."
             )
+
+    def _preflow_dump_queue_stats(self) -> None:
+        path = self._preflow_queue_stats_path
+        if path is None:
+            return
+        waiting = len(self.waiting) + len(self.skipped_waiting)
+        running = len(self.running)
+        try:
+            with path.open("a", encoding="utf-8") as trace_file:
+                trace_file.write(f"{time.time_ns()},{self.current_step},{waiting},{running},{waiting + running}\n")
+        except OSError:
+            logger.exception("Unable to write PREFLOW queue-size trace: %s", path)
+            self._preflow_queue_stats_path = None
 
     def _preflow_work(self, num_tokens: int) -> float:
         tokens = float(max(0, int(num_tokens)))
@@ -1078,7 +1106,11 @@ class PREFLOWScheduler(SchedulerInterface):
                         preempted=request.num_preemptions > 0,
                     )
             else:
-                new_computed_blocks, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_blocks(request)
+                (
+                    new_computed_blocks,
+                    num_new_local_computed_tokens,
+                    request.shared_prefix_boundary,
+                ) = self.kv_cache_manager.get_computed_blocks(request)
 
             # In case of hybrid models, obtain hint for Marconi-style APC logic
             if self.has_mamba_layers:
@@ -1960,6 +1992,7 @@ class PREFLOWScheduler(SchedulerInterface):
         )
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._preflow_dump_queue_stats()
         return scheduler_output
 
     def _build_kv_connector_meta(
