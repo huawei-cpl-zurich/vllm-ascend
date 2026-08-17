@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
-from vllm.config import VllmConfig
+from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorBase,
     ECConnectorMetadata,
     ECConnectorRole,
 )
@@ -1001,6 +1002,7 @@ class PREFLOWScheduler(SchedulerInterface):
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
             total_computed_tokens=total_computed_tokens,
+            num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
         )
@@ -1019,6 +1021,7 @@ class PREFLOWScheduler(SchedulerInterface):
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
             total_computed_tokens=(num_local_computed_tokens + num_external_computed_tokens),
+            num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
         )
         available_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks() - reserved_blocks
@@ -2000,7 +2003,12 @@ class PREFLOWScheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
+    def _preempt_request(
+        self,
+        request: Request,
+        timestamp: float,
+        drop_stale_output: bool = False,
+    ) -> None:
         """Preempt a request and put it back to the waiting queue.
 
         NOTE: The request should be popped from the running queue outside of this
@@ -2016,6 +2024,11 @@ class PREFLOWScheduler(SchedulerInterface):
         # across preemption; recomputation loss is reflected in R_q instead.
         if request.spec_token_ids:
             request.spec_token_ids = []
+        request.drop_stale_output = drop_stale_output or (
+            request.drop_stale_output and request.num_stale_output_tokens > 0
+        )
+        request.num_stale_output_tokens = request.num_in_flight_tokens
+        request.num_output_placeholders = 0
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
@@ -2038,6 +2051,7 @@ class PREFLOWScheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+            request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
                 request.last_sched_seq = self.sched_step_seq
@@ -2393,10 +2407,17 @@ class PREFLOWScheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
+            request = self.requests.get(req_id)
+            output_is_stale = False
+            if request is not None:
+                request.num_in_flight_tokens -= num_tokens_scheduled
+                if request.num_stale_output_tokens > 0:
+                    output_is_stale = True
+                    request.num_stale_output_tokens -= num_tokens_scheduled
+                    assert request.num_stale_output_tokens >= 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
-            request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
@@ -2407,32 +2428,23 @@ class PREFLOWScheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
+            if output_is_stale and request.drop_stale_output:
+                continue
+
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
-            # Skip a stale frame still pending discard (async_tokens_to_discard
-            # > 0): its pre-reset rejection count would underflow the counters.
-            if (
-                scheduled_spec_token_ids
-                and (generated_token_ids or self.num_sampled_tokens_per_step == 0)
-                and request.async_tokens_to_discard == 0
-            ):
+            if scheduled_spec_token_ids and (generated_token_ids or self.num_sampled_tokens_per_step == 0):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
-                # num_computed_tokens represents the number of tokens
-                # processed in the current step, considering scheduled
-                # tokens and rejections. If some tokens are rejected,
-                # num_computed_tokens is decreased by the number of rejected
-                # tokens.
-                if request.num_computed_tokens > 0:
-                    request.num_computed_tokens -= num_rejected
-                # If async scheduling, num_output_placeholders also includes
-                # the scheduled spec tokens count and so is similarly adjusted.
-                if request.num_output_placeholders > 0:
-                    request.num_output_placeholders -= num_rejected
+                if not output_is_stale:
+                    if request.num_computed_tokens > 0:
+                        request.num_computed_tokens -= num_rejected
+                    if request.num_output_placeholders > 0:
+                        request.num_output_placeholders -= num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -2450,12 +2462,17 @@ class PREFLOWScheduler(SchedulerInterface):
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
+            ec_transfer_params = None
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
 
             # Check for stop and update request status.
             if new_token_ids:
-                new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                new_token_ids, stopped = self._update_request_with_output(
+                    request,
+                    new_token_ids,
+                    is_stale=output_is_stale,
+                )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -2518,7 +2535,7 @@ class PREFLOWScheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
-                    kv_transfer_params = self._free_request(request)
+                    kv_transfer_params, ec_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -2534,7 +2551,12 @@ class PREFLOWScheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+            should_emit_output = bool(new_token_ids or pooler_output is not None or stopped)
+            if should_emit_output:
+                prefill_stats = request.take_prefill_stats()
+                if prefill_stats is not None:
+                    prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
+
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -2546,8 +2568,9 @@ class PREFLOWScheduler(SchedulerInterface):
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
-                        prefill_stats=request.take_prefill_stats(),
+                        prefill_stats=prefill_stats,
                         kv_transfer_params=kv_transfer_params,
+                        ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
@@ -2563,6 +2586,7 @@ class PREFLOWScheduler(SchedulerInterface):
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+            self.skipped_waiting.remove_requests(stopped_preempted_reqs)
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
@@ -2683,7 +2707,13 @@ class PREFLOWScheduler(SchedulerInterface):
         self._enqueue_waiting_request(request)
         return False
 
-    def _update_request_with_output(self, request: Request, new_token_ids: list[int]) -> tuple[list[int], bool]:
+    def _update_request_with_output(
+        self,
+        request: Request,
+        new_token_ids: list[int],
+        is_stale: bool = False,
+    ) -> tuple[list[int], bool]:
+        del is_stale
         # Append generated tokens and check for stop. Note that if
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
@@ -2818,9 +2848,7 @@ class PREFLOWScheduler(SchedulerInterface):
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
-    def finish_requests(
-        self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
-    ) -> list[tuple[str, int]]:
+    def finish_requests(self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus) -> list[Request]:
         """Handles the finish signal from outside the scheduler.
 
         For example, the API server can abort a request when the client
@@ -2829,8 +2857,8 @@ class PREFLOWScheduler(SchedulerInterface):
         If request_ids is None, all requests will be finished.
 
         Returns:
-            Tuple of (req_id, client_index) for requests that were aborted. Will not
-            include any that were already finished.
+            List of requests that were aborted. Will not include any that were
+            already finished.
         """
         assert RequestStatus.is_finished(finished_status)
         if isinstance(request_ids, str):
@@ -2877,13 +2905,21 @@ class PREFLOWScheduler(SchedulerInterface):
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
 
-        return [(r.request_id, r.client_index) for r in valid_requests]
+        return valid_requests
 
-    def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+
+        ec_xfer_params: dict[str, Any] | None = None
+        if self.ec_connector is not None:
+            ec_delay_free, ec_xfer_params = self.ec_connector.request_finished(request)
+            connector_delay_free_blocks |= ec_delay_free
+
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self._preflow_forget_request(request_id)
@@ -2895,7 +2931,7 @@ class PREFLOWScheduler(SchedulerInterface):
         if not delay_free_blocks:
             self._free_blocks(request)
 
-        return kv_xfer_params
+        return kv_xfer_params, ec_xfer_params
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
@@ -2968,6 +3004,7 @@ class PREFLOWScheduler(SchedulerInterface):
             self.has_unfinished_requests()
             or self.has_finished_requests()
             or (self.connector is not None and self.connector.has_pending_push_work())
+            or (self.ec_connector is not None and self.ec_connector.has_pending_push_work())
         )
 
     def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
@@ -2988,15 +3025,7 @@ class PREFLOWScheduler(SchedulerInterface):
             # running queue in FIFO order.
             while self.running:
                 request = self.running.pop()
-                self._preempt_request(request, timestamp)
-                # For async scheduling, any output frames already in flight at
-                # preemption time are now stale and must be discarded when they
-                # return. num_output_placeholders is exactly that count: 0 if
-                # the engine has drained (e.g. pause_generation(keep) waited
-                # for idle), 1 for vanilla async mid-step, or 1 + spec/PP frames
-                # otherwise.
-                request.async_tokens_to_discard = request.num_output_placeholders
-                request.num_output_placeholders = 0
+                self._preempt_request(request, timestamp, drop_stale_output=True)
 
             # Clear scheduled request ids cache. Since we are forcing preemption
             # + resumption in the same step, we must act as if these requests were
@@ -3118,6 +3147,12 @@ class PREFLOWScheduler(SchedulerInterface):
     def get_kv_connector(self) -> KVConnectorBase_V1 | None:
         return self.connector
 
+    def get_ec_connector(self) -> ECConnectorBase | None:
+        return self.ec_connector
+
+    def get_kv_event_publisher_config(self) -> KVEventsConfig | None:
+        return self.kv_event_publisher.get_publisher_config()
+
     def _connector_finished(self, request: Request) -> tuple[bool, dict[str, Any] | None]:
         """
         Invoke the KV connector request_finished() method if applicable.
@@ -3129,10 +3164,11 @@ class PREFLOWScheduler(SchedulerInterface):
             return False, None
 
         # Free any out-of-window prefix blocks before we hand the block table to
-        # the connector.
+        # the connector. In-flight tokens have not completed, so they cannot be
+        # discarded yet.
         self.kv_cache_manager.remove_skipped_blocks(
             request_id=request.request_id,
-            total_computed_tokens=request.num_computed_tokens,
+            processed_computed_tokens=max(0, request.num_computed_tokens - request.num_in_flight_tokens),
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
@@ -3160,6 +3196,7 @@ class PREFLOWScheduler(SchedulerInterface):
             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
             num_encoder_tokens=0,
             total_computed_tokens=request.num_computed_tokens,
+            num_local_computed_tokens=request.num_computed_tokens,
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
         )
@@ -3459,23 +3496,18 @@ class AsyncPREFLOWScheduler(PREFLOWScheduler):
         self,
         request: Request,
         new_token_ids: list[int],
+        is_stale: bool = False,
     ) -> tuple[list[int], bool]:
-        if request.async_tokens_to_discard > 0:
-            # The request was force-preempted in reset_prefix_cache; drop one
-            # stale in-flight async output frame per call until the counter
-            # is drained.
-            request.async_tokens_to_discard -= 1
-            return [], False
-
         status_before_update = request.status
         new_token_ids, stopped = super()._update_request_with_output(
             request,
             new_token_ids,
+            is_stale=is_stale,
         )
 
-        # Update the number of output placeholders.
-        request.num_output_placeholders -= len(new_token_ids)
-        assert request.num_output_placeholders >= 0
+        if not is_stale:
+            request.num_output_placeholders -= len(new_token_ids)
+            assert request.num_output_placeholders >= 0
 
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:
