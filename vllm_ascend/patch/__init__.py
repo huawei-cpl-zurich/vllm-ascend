@@ -454,7 +454,30 @@
 #       profiling startup and per-step timing callbacks without monkey-patching
 #       `EngineCore` and the multiprocess entry point.
 #
-# ** 18. File: platform/patch_speculative_config.py**
+# ** 18. File: platform/patch_queue_stats.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.engine.core.EngineCore.__init__`
+#   2. `vllm.v1.engine.core.EngineCoreProc.run_engine_core`
+#   3. The selected scheduler instance's `schedule` method
+#    Why:
+#       PD-disaggregation diagnostics need comparable waiting, running, and
+#       total request queue sizes from both the prefill-only PREFLOW scheduler
+#       and the normal decode scheduler. Upstream has no scheduler lifecycle
+#       hook that applies to both selected scheduler implementations.
+#    How:
+#       When `scheduler_config.queue_stats_config.enabled` is set, wrap the
+#       constructed scheduler instance after EngineCore initialization. The
+#       wrapper writes one post-schedule CSV record per successful scheduling
+#       iteration. A unique, role-labelled output file is created per engine
+#       core process. The EngineCore process entry point reapplies the patch in
+#       spawned child processes.
+#    Related PR (if no, explain why):
+#       No, vllm-ascend-specific PD diagnostic instrumentation.
+#    Future Plan:
+#       Replace this patch if upstream exposes a scheduler lifecycle callback
+#       that covers custom scheduler classes.
+#
+# ** 19. File: platform/patch_speculative_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.speculative.SpeculativeConfig.hf_config_override`
 #    Why:
@@ -477,7 +500,7 @@
 #       models without a custom `hf_config_override`, or exposes a plugin hook
 #       for MTP model_type/architecture remapping.
 #
-# ** 19. File: platform/patch_structured_output.py**
+# ** 20. File: platform/patch_structured_output.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.sampling_params.SamplingParams._validate_structured_outputs`
 #      `vllm.v1.structured_output.StructuredOutputManager.grammar_init`
@@ -499,7 +522,7 @@
 #       before grammar compilation or safely handles mixed-backend grammar
 #       failures without killing the engine.
 #
-# ** 20. File: platform/patch_torch_accelerator.py**
+# ** 21. File: platform/patch_torch_accelerator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `torch.accelerator.memory_stats`, `torch.accelerator.memory_reserved`,
 #      `torch.accelerator.reset_peak_memory_stats`, `torch.accelerator.get_memory_info`,
@@ -519,7 +542,7 @@
 #       Remove this patch once `torch.accelerator` correctly routes to the NPU
 #       backend for these memory APIs.
 #
-# ** 21. File: platform/patch_tool_choice_none_content.py**
+# ** 22. File: platform/patch_tool_choice_none_content.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionResponse`
 #      `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionStreamResponse`
@@ -535,7 +558,7 @@
 #    Future Plan:
 #       Remove this patch once the supported vLLM version contains PR #44105.
 #
-# ** 22. File: platform/patch_use_v2_model_runner.py**
+# ** 23. File: platform/patch_use_v2_model_runner.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.vllm.VllmConfig.use_v2_model_runner`
 #    Why:

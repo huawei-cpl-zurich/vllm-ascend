@@ -874,6 +874,45 @@ class PREFLOWConfig:
             )
 
 
+class QueueStatsConfig:
+    """Configuration for per-iteration scheduler queue-size tracing.
+
+    When enabled, each engine-core process writes its own CSV trace. The file
+    name includes the PD role, data-parallel rank, process ID, and a UUID so
+    concurrent prefill and decode processes never share a trace file.
+
+    Usage (online)::
+
+        vllm serve <model> --additional-config \\
+            '{"scheduler_config": {"queue_stats_config": {"enabled": true, "output_dir": "/tmp/queue-stats"}}}'
+    """
+
+    _defaults = {
+        "enabled": False,
+        "output_dir": ".",
+    }
+
+    def __init__(self, user_config: dict | None = None):
+        if user_config is None:
+            user_config = {}
+        elif not isinstance(user_config, dict):
+            raise ValueError(f"queue_stats_config must be a dict, got {type(user_config).__name__}.")
+
+        unknown = set(user_config) - set(self._defaults)
+        if unknown:
+            raise ValueError(f"Unknown queue_stats_config keys: {sorted(unknown)}")
+
+        self.enabled = user_config.get("enabled", self._defaults["enabled"])
+        self.output_dir = user_config.get("output_dir", self._defaults["output_dir"])
+        self._validate_config()
+
+    def _validate_config(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError(f"queue_stats_config.enabled must be a bool, got {type(self.enabled).__name__}.")
+        if not isinstance(self.output_dir, str) or not self.output_dir.strip():
+            raise ValueError("queue_stats_config.output_dir must be a non-empty string.")
+
+
 class RejectionSamplerConfig:
     """Configuration for Block Verify and Entropy Verify in Rejection Sampler.
 
@@ -1159,6 +1198,9 @@ class SchedulerConfig:
         )
         self.preflow_config = PREFLOWConfig(
             self._get_config_value(scheduler_config, additional_config, "preflow_config", {})
+        )
+        self.queue_stats_config = QueueStatsConfig(
+            self._get_config_value(scheduler_config, additional_config, "queue_stats_config", {})
         )
         self.dyntra_lb_config = DyntraLBConfig(scheduler_config.get("dyntra_lb_config"))
 
