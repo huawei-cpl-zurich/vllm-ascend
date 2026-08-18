@@ -7,78 +7,21 @@ constructs it instruments both implementations without changing vendored
 vLLM sources or duplicating either scheduler's ``schedule()`` method.
 """
 
-import atexit
 import functools
-import os
-import threading
-import time
-import uuid
-from pathlib import Path
 from typing import Any
 
-from vllm.logger import logger
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
-from vllm_ascend.ascend_config import QueueStatsConfig, init_ascend_config
+from vllm_ascend.ascend_config import init_ascend_config
+from vllm_ascend.queue_stats import QueueStatsTracer, create_queue_stats_tracer
 
 _PATCH_INSTALLED_ATTR = "_vllm_ascend_queue_stats_installed"
 _TRACER_ATTR = "_vllm_ascend_queue_stats_tracer"
 
 
-def _get_pd_role(vllm_config: Any) -> str:
-    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-    kv_role = getattr(kv_transfer_config, "kv_role", None)
-    return {
-        "kv_producer": "prefill",
-        "kv_consumer": "decode",
-        "kv_both": "mixed",
-    }.get(kv_role, "unknown")
-
-
-class QueueStatsTracer:
-    """Write scheduler queue sizes to an engine-core-specific CSV file."""
-
-    def __init__(self, config: QueueStatsConfig, vllm_config: Any) -> None:
-        output_dir = Path(config.output_dir).expanduser()
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        role = _get_pd_role(vllm_config)
-        parallel_config = getattr(vllm_config, "parallel_config", None)
-        dp_rank = getattr(parallel_config, "data_parallel_rank", 0)
-        file_name = f"vllm_ascend_queue_stats_{role}_dp{dp_rank}_pid{os.getpid()}_{uuid.uuid4().hex}.csv"
-        self.path = output_dir / file_name
-        self._file = self.path.open("x", encoding="utf-8", buffering=1)
-        self._file.write("timestamp_ns,iteration,role,waiting,running,total\n")
-        self._role = role
-        self._lock = threading.Lock()
-        atexit.register(self.close)
-
-    def record(self, scheduler: Any) -> None:
-        """Append the state after one successful scheduler iteration."""
-        with self._lock:
-            if self._file.closed:
-                return
-            try:
-                waiting = len(scheduler.waiting) + len(scheduler.skipped_waiting)
-                running = len(scheduler.running)
-                iteration = getattr(scheduler, "current_step", 0)
-                self._file.write(f"{time.time_ns()},{iteration},{self._role},{waiting},{running},{waiting + running}\n")
-            except OSError:
-                logger.exception(
-                    "Queue-size tracing disabled because the trace file cannot be written: %s",
-                    self.path,
-                )
-                self._file.close()
-
-    def close(self) -> None:
-        with self._lock:
-            if not self._file.closed:
-                self._file.close()
-
-
 def install_queue_stats_tracer(
     scheduler: Any,
-    config: QueueStatsConfig,
+    config: Any,
     vllm_config: Any,
 ) -> QueueStatsTracer | None:
     """Wrap ``scheduler.schedule`` once and return its tracer when enabled."""
@@ -87,7 +30,9 @@ def install_queue_stats_tracer(
     if not config.enabled or getattr(scheduler, _PATCH_INSTALLED_ATTR, False):
         return getattr(scheduler, _TRACER_ATTR, None)
 
-    tracer = QueueStatsTracer(config, vllm_config)
+    tracer = create_queue_stats_tracer(config, vllm_config)
+    if tracer is None:
+        return None
     original_schedule = scheduler.schedule
 
     @functools.wraps(original_schedule)
@@ -99,7 +44,6 @@ def install_queue_stats_tracer(
     scheduler.schedule = schedule_with_queue_stats
     setattr(scheduler, _PATCH_INSTALLED_ATTR, True)
     setattr(scheduler, _TRACER_ATTR, tracer)
-    logger.info("Writing scheduler queue-size trace to %s", tracer.path)
     return tracer
 
 
