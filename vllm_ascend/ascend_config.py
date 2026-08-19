@@ -799,6 +799,13 @@ class PREFLOWConfig:
     micro-prefills are admitted up to the normal chunked-prefill token limit.
     Set it to ``0`` to keep at most one prefill per scheduler step.
 
+    ``max_num_batched_seqs`` limits the number of requests that PREFLOW sends
+    to the model runner in one scheduler step. It is deliberately separate
+    from vLLM's ``max_num_seqs``: the latter remains the resident request/KV
+    capacity, while this setting controls compute batch width. The default of
+    ``1`` lets several prefills retain their KV state while PREFLOW advances
+    only its highest-scoring request in each step.
+
     ``spill_enabled`` enables local cross-tier spill decisions. When the
     work-weighted competitive-aging pressure exceeds
     ``spill_pressure_threshold``, PREFLOW may hand short waiting work to the
@@ -834,6 +841,7 @@ class PREFLOWConfig:
         "age_priority_double": 2.0,
         "waiting_policy": "wsrjf",
         "micro_prefill_isl_threshold": 1,
+        "max_num_batched_seqs": 1,
         "spill_enabled": False,
         "spill_pressure_threshold": 0.75,
         "spill_max_batch_tokens": 1024,
@@ -864,6 +872,12 @@ class PREFLOWConfig:
             user_config.get(
                 "micro_prefill_isl_threshold",
                 self._defaults["micro_prefill_isl_threshold"],
+            )
+        )
+        self.max_num_batched_seqs = int(
+            user_config.get(
+                "max_num_batched_seqs",
+                self._defaults["max_num_batched_seqs"],
             )
         )
         self.spill_enabled = user_config.get("spill_enabled", self._defaults["spill_enabled"])
@@ -903,6 +917,8 @@ class PREFLOWConfig:
                 "non-negative, "
                 f"got {self.micro_prefill_isl_threshold}"
             )
+        if self.max_num_batched_seqs <= 0:
+            raise ValueError(f"preflow_config.max_num_batched_seqs must be positive, got {self.max_num_batched_seqs}")
         if not isinstance(self.spill_enabled, bool):
             raise ValueError(f"preflow_config.spill_enabled must be a bool, got {type(self.spill_enabled).__name__}")
         if self.spill_enabled and not self.enabled:

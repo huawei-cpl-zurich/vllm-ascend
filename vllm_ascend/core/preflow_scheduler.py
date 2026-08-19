@@ -457,6 +457,7 @@ class PREFLOWScheduler(SchedulerInterface):
         self.preflow_age_priority_double = preflow_config.age_priority_double
         self.preflow_waiting_policy = preflow_config.waiting_policy
         self.preflow_micro_prefill_isl_threshold = preflow_config.micro_prefill_isl_threshold
+        self.preflow_max_num_batched_seqs = preflow_config.max_num_batched_seqs
         self.preflow_spill_enabled = preflow_config.spill_enabled
         self.preflow_spill_pressure_threshold = preflow_config.spill_pressure_threshold
         self.preflow_spill_max_batch_tokens = preflow_config.spill_max_batch_tokens
@@ -508,6 +509,12 @@ class PREFLOWScheduler(SchedulerInterface):
         if self.preflow_micro_prefill_isl_threshold < 0:
             raise ValueError(
                 f"PREFLOW requires micro_prefill_isl_threshold >= 0, got {self.preflow_micro_prefill_isl_threshold}."
+            )
+        if not 0 < self.preflow_max_num_batched_seqs <= self.max_num_running_reqs:
+            raise ValueError(
+                "PREFLOW requires max_num_batched_seqs in "
+                f"[1, max_num_seqs={self.max_num_running_reqs}], got "
+                f"{self.preflow_max_num_batched_seqs}."
             )
         if not 0 <= self.preflow_spill_pressure_threshold <= 1:
             raise ValueError(
@@ -906,6 +913,60 @@ class PREFLOWScheduler(SchedulerInterface):
         self.running = [
             next(preflow_order) if id(request) in prefill_request_ids else request for request in self.running
         ]
+
+    @staticmethod
+    def _preflow_priority_key(request: Request, priority: float) -> tuple[float, float, str]:
+        return (-priority, request.arrival_time, request.request_id)
+
+    def _preflow_waiting_prefill_outranks_running(self) -> bool:
+        """Whether an admissible waiting prefill owns the next compute slot.
+
+        RUNNING and WAITING prefills use the same aged PREFLOW score. A waiting
+        request may win only while a resident request slot is available; the
+        normal admission path still performs the authoritative full-ISL/KV
+        feasibility check before it is admitted.
+
+        The default one-request compute batch makes this a direct arbitration
+        for the next step. This is what lets a short arrival advance while an
+        admitted long prefill keeps its KV resident.
+        """
+        if self.preflow_waiting_policy != "wsrjf":
+            return False
+        num_running = len(self.running) + self.num_waiting_for_streaming_input
+        if num_running >= self.max_num_running_reqs:
+            return False
+
+        running_prefills: list[tuple[Request, float]] = []
+        for request in self.running:
+            if not self._preflow_has_unfinished_prefill(request):
+                continue
+            priority = self._preflow_priority(request)
+            if priority is not None:
+                running_prefills.append((request, priority))
+        if not running_prefills:
+            return False
+
+        waiting_prefills: list[tuple[Request, float]] = []
+        for request in self._preflow_effective_waiting_order():
+            if self._is_blocked_waiting_status(request.status):
+                continue
+            if not self._preflow_has_unfinished_prefill(request):
+                continue
+            priority = self._preflow_priority(request)
+            if priority is not None:
+                waiting_prefills.append((request, priority))
+        if not waiting_prefills:
+            return False
+
+        best_running = min(
+            running_prefills,
+            key=lambda item: self._preflow_priority_key(*item),
+        )
+        best_waiting = min(
+            waiting_prefills,
+            key=lambda item: self._preflow_priority_key(*item),
+        )
+        return self._preflow_priority_key(*best_waiting) < self._preflow_priority_key(*best_running)
 
     def _preflow_capture_age_targets(self) -> dict[str, float]:
         required_work_by_req_id: dict[str, float] = {}
@@ -1694,6 +1755,8 @@ class PREFLOWScheduler(SchedulerInterface):
         for request_work, _, request in self._preflow_waiting_candidates(protected_request):
             if state.token_budget <= 0:
                 return False
+            if len(state.num_scheduled_tokens) >= self.preflow_max_num_batched_seqs:
+                return False
             num_running = len(self.running) + self.num_waiting_for_streaming_input
             if num_running >= self.max_num_running_reqs:
                 return False
@@ -1810,12 +1873,21 @@ class PREFLOWScheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         self._preflow_order_running_requests()
+        waiting_prefill_owns_next_slot = self._preflow_waiting_prefill_outranks_running()
         # The same state is passed to waiting admission below, allowing only
         # eligible waiting micro-prefills to extend a running microbatch.
         prefill_batch_state = _PREFLOWPrefillBatchState()
         req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
+        while (
+            req_index < len(self.running)
+            and token_budget > 0
+            and len(num_scheduled_tokens) < self.preflow_max_num_batched_seqs
+        ):
             request = self.running[req_index]
+
+            if waiting_prefill_owns_next_slot and self._preflow_has_unfinished_prefill(request):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -2044,7 +2116,11 @@ class PREFLOWScheduler(SchedulerInterface):
             if self.preflow_waiting_policy == "wsrjf":
                 self._preflow_clear_protected_request()
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            while (
+                (self.waiting or self.skipped_waiting)
+                and token_budget > 0
+                and len(num_scheduled_tokens) < self.preflow_max_num_batched_seqs
+            ):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
@@ -2113,6 +2189,7 @@ class PREFLOWScheduler(SchedulerInterface):
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert len(num_scheduled_tokens) <= self.preflow_max_num_batched_seqs
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
