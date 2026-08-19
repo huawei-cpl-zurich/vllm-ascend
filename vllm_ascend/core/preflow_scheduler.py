@@ -99,6 +99,15 @@ class _PREFLOWPressure:
     work_dispersion: float = 0.0
     pressure: float = 0.0
     num_requests: int = 0
+    blocker_request_id: str | None = None
+    blocker_aging_fraction: float = 0.0
+    blocker_score_ratio: float = 0.0
+    blocker_work_ratio: float = 0.0
+
+    @property
+    def blocker_pressure(self) -> float:
+        """Return the blocker-oriented aging pressure (A)."""
+        return self.competitive_aging
 
 
 @dataclass(frozen=True)
@@ -478,6 +487,11 @@ class PREFLOWScheduler(SchedulerInterface):
 
         # Public scalar state consumed by queue tracing and benchmark tooling.
         self.preflow_spill_competitive_aging = 0.0
+        self.preflow_spill_blocker_pressure = 0.0
+        self.preflow_spill_blocker_request_id: str | None = None
+        self.preflow_spill_blocker_aging_fraction = 0.0
+        self.preflow_spill_blocker_score_ratio = 0.0
+        self.preflow_spill_blocker_work_ratio = 0.0
         self.preflow_spill_work_dispersion = 0.0
         self.preflow_spill_pressure = 0.0
         self.preflow_spill_selected_requests = 0
@@ -703,18 +717,18 @@ class PREFLOWScheduler(SchedulerInterface):
         )
 
     def _preflow_compute_spill_pressure(self) -> _PREFLOWPressure:
-        """Return work-weighted competitive-aging pressure for local prefills.
+        """Return blocker-oriented competitive-aging pressure for prefills.
 
         For ``X_i = P_i R_i`` and ``alpha_i = age_i / age_priority_double``,
-        this computes ``A = sum(X_i a_i) / sum(X_i)`` with
-        ``a_i = (S_i - S_i^(0)) / S_max``, then
+        this computes ``b_i = (1 - 2^-alpha_i) * (S_i / S_max) *
+        (X_i / X_max)`` and ``A = max_i b_i``. It retains
         ``D = Var(X) / E[X^2]`` and ``rho = A * D``.
 
         Scores are evaluated in log space so long overload experiments cannot
         overflow ``2 ** alpha``. Requests already committed to a spill are no
         longer outstanding local prefill work and are excluded.
         """
-        entries: list[tuple[float, float, float]] = []
+        entries: list[tuple[str, float, float, float]] = []
         for request_id, request in self.requests.items():
             if request_id in self._preflow_spill_requests:
                 continue
@@ -731,21 +745,41 @@ class PREFLOWScheduler(SchedulerInterface):
                 continue
             alpha = max(0.0, self._preflow_age.get(request_id, 0.0) / self.preflow_age_priority_double)
             log_score = alpha * _PREFLOW_LOG_2 - math.log(work_product)
-            entries.append((work_product, alpha, log_score))
+            entries.append((request_id, work_product, alpha, log_score))
 
         num_requests = len(entries)
         if num_requests == 0:
             return _PREFLOWPressure()
 
-        max_log_score = max(log_score for _, _, log_score in entries)
-        total_work_product = math.fsum(work_product for work_product, _, _ in entries)
-        weighted_aging = math.fsum(
-            work_product * math.exp(log_score - max_log_score) * (-math.expm1(-alpha * _PREFLOW_LOG_2))
-            for work_product, alpha, log_score in entries
-        )
-        competitive_aging = min(1.0, max(0.0, weighted_aging / total_work_product))
+        max_log_score = max(log_score for _, _, _, log_score in entries)
+        max_work_product = max(work_product for _, work_product, _, _ in entries)
+        blocker: tuple[float, str, float, float, float] | None = None
+        for request_id, work_product, alpha, log_score in entries:
+            aging_fraction = -math.expm1(-alpha * _PREFLOW_LOG_2)
+            score_ratio = math.exp(log_score - max_log_score)
+            work_ratio = work_product / max_work_product
+            blocker_score = aging_fraction * score_ratio * work_ratio
+            details = (
+                blocker_score,
+                request_id,
+                aging_fraction,
+                score_ratio,
+                work_ratio,
+            )
+            if blocker is None or details[:2] > blocker[:2]:
+                blocker = details
+        assert blocker is not None
+        (
+            competitive_aging,
+            blocker_request_id,
+            blocker_aging_fraction,
+            blocker_score_ratio,
+            blocker_work_ratio,
+        ) = blocker
+        competitive_aging = min(1.0, max(0.0, competitive_aging))
 
-        sum_squares = math.fsum(work_product * work_product for work_product, _, _ in entries)
+        total_work_product = math.fsum(work_product for _, work_product, _, _ in entries)
+        sum_squares = math.fsum(work_product * work_product for _, work_product, _, _ in entries)
         if sum_squares <= _PREFLOW_MIN_WORK:
             work_dispersion = 0.0
         else:
@@ -759,6 +793,10 @@ class PREFLOWScheduler(SchedulerInterface):
             work_dispersion=work_dispersion,
             pressure=pressure,
             num_requests=num_requests,
+            blocker_request_id=blocker_request_id,
+            blocker_aging_fraction=blocker_aging_fraction,
+            blocker_score_ratio=blocker_score_ratio,
+            blocker_work_ratio=blocker_work_ratio,
         )
 
     def _preflow_is_spill_eligible(self, request: Request) -> bool:
@@ -854,6 +892,11 @@ class PREFLOWScheduler(SchedulerInterface):
     def _preflow_maybe_mark_spills(self) -> _PREFLOWPressure:
         sample = self._preflow_compute_spill_pressure()
         self.preflow_spill_competitive_aging = sample.competitive_aging
+        self.preflow_spill_blocker_pressure = sample.blocker_pressure
+        self.preflow_spill_blocker_request_id = sample.blocker_request_id
+        self.preflow_spill_blocker_aging_fraction = sample.blocker_aging_fraction
+        self.preflow_spill_blocker_score_ratio = sample.blocker_score_ratio
+        self.preflow_spill_blocker_work_ratio = sample.blocker_work_ratio
         self.preflow_spill_work_dispersion = sample.work_dispersion
         self.preflow_spill_pressure = sample.pressure
         self.preflow_spill_selected_requests = 0
@@ -877,11 +920,18 @@ class PREFLOWScheduler(SchedulerInterface):
         self.preflow_spill_selected_new_tokens = sum(candidate.new_prompt_tokens for candidate in selected)
         self.preflow_spill_last_request_ids = tuple(candidate.request.request_id for candidate in selected)
         logger.info(
-            "PREFLOW cross-tier spill: pressure=%.6f competitive_aging=%.6f "
-            "work_dispersion=%.6f requests=%d new_prompt_tokens=%d request_ids=%s",
+            "PREFLOW cross-tier spill: pressure=%.6f blocker_pressure=%.6f "
+            "work_dispersion=%.6f blocker_request_id=%s "
+            "blocker_aging_fraction=%.6f blocker_score_ratio=%.6f "
+            "blocker_work_ratio=%.6f requests=%d new_prompt_tokens=%d "
+            "request_ids=%s",
             sample.pressure,
-            sample.competitive_aging,
+            sample.blocker_pressure,
             sample.work_dispersion,
+            sample.blocker_request_id,
+            sample.blocker_aging_fraction,
+            sample.blocker_score_ratio,
+            sample.blocker_work_ratio,
             len(selected),
             self.preflow_spill_selected_new_tokens,
             self.preflow_spill_last_request_ids,

@@ -15,7 +15,9 @@ _CSV_HEADER = (
     "timestamp_ns,iteration,role,waiting,running,total,"
     "preflow_competitive_aging,preflow_work_dispersion,"
     "preflow_spill_pressure,preflow_spill_requests,"
-    "preflow_spill_new_tokens\n"
+    "preflow_spill_new_tokens,preflow_blocker_pressure,"
+    "preflow_blocker_request_id,preflow_blocker_aging_fraction,"
+    "preflow_blocker_score_ratio,preflow_blocker_work_ratio\n"
 )
 
 
@@ -61,6 +63,13 @@ class QueueStatsTracer:
         spill_pressure = getattr(scheduler, "preflow_spill_pressure", 0.0)
         spill_requests = getattr(scheduler, "preflow_spill_selected_requests", 0)
         spill_new_tokens = getattr(scheduler, "preflow_spill_selected_new_tokens", 0)
+        blocker_pressure = getattr(scheduler, "preflow_spill_blocker_pressure", competitive_aging)
+        blocker_request_id = getattr(scheduler, "preflow_spill_blocker_request_id", None)
+        blocker_request_id = "" if blocker_request_id is None else str(blocker_request_id)
+        blocker_request_id = blocker_request_id.replace("\r", "\\r").replace("\n", "\\n").replace('"', '""')
+        blocker_aging_fraction = getattr(scheduler, "preflow_spill_blocker_aging_fraction", 0.0)
+        blocker_score_ratio = getattr(scheduler, "preflow_spill_blocker_score_ratio", 0.0)
+        blocker_work_ratio = getattr(scheduler, "preflow_spill_blocker_work_ratio", 0.0)
         with self._lock:
             if self._file.closed:
                 return
@@ -69,7 +78,9 @@ class QueueStatsTracer:
                     f"{time.time_ns()},{iteration},{self.role},{waiting},"
                     f"{running},{waiting + running},{competitive_aging:.17g},"
                     f"{work_dispersion:.17g},{spill_pressure:.17g},"
-                    f"{spill_requests},{spill_new_tokens}\n"
+                    f"{spill_requests},{spill_new_tokens},{blocker_pressure:.17g},"
+                    f'"{blocker_request_id}",{blocker_aging_fraction:.17g},'
+                    f"{blocker_score_ratio:.17g},{blocker_work_ratio:.17g}\n"
                 )
             except OSError:
                 logger.exception(
