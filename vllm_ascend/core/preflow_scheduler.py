@@ -69,13 +69,6 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
-from vllm_ascend.core.preflow_spill import (
-    PREFLOW_SPILL_AVAILABLE_HISTORY_KEY,
-    PREFLOW_SPILL_NEW_TOKENS_KEY,
-    PREFLOW_SPILL_ORIGINAL_PROMPT_TOKENS_KEY,
-    PREFLOW_SPILL_PRESSURE_KEY,
-    PREFLOW_SPILL_REMOTE_TOKENS_KEY,
-)
 from vllm_ascend.queue_stats import QueueStatsTracer, create_queue_stats_tracer
 
 _PREFLOW_MIN_WORK = 1e-12
@@ -89,43 +82,6 @@ class _PREFLOWBatchWork:
 
     total_work: float
     required_work_by_req_id: dict[str, float]
-
-
-@dataclass(frozen=True)
-class _PREFLOWPressure:
-    """Components of the local cross-tier spill pressure."""
-
-    head_aging_fraction: float = 0.0
-    work_dispersion: float = 0.0
-    pressure: float = 0.0
-    num_requests: int = 0
-    head_request_id: str | None = None
-    head_normalized_age: float = 0.0
-    head_remaining_work: float = 0.0
-    head_required_work: float = 0.0
-    head_score: float = 0.0
-
-    @property
-    def competitive_aging(self) -> float:
-        """Backward-compatible name for the head aging fraction."""
-        return self.head_aging_fraction
-
-
-@dataclass(frozen=True)
-class _PREFLOWSpillCandidate:
-    request: Request
-    remaining_work: float
-    available_prompt_history: int
-    new_prompt_tokens: int
-
-
-@dataclass(frozen=True)
-class _PREFLOWSpillState:
-    original_prompt_tokens: int
-    available_prompt_history: int
-    new_prompt_tokens: int
-    remote_prompt_tokens: int
-    pressure: float
 
 
 @dataclass
@@ -468,9 +424,6 @@ class PREFLOWScheduler(SchedulerInterface):
         self.preflow_waiting_policy = preflow_config.waiting_policy
         self.preflow_micro_prefill_isl_threshold = preflow_config.micro_prefill_isl_threshold
         self.preflow_max_num_batched_seqs = preflow_config.max_num_batched_seqs
-        self.preflow_spill_enabled = preflow_config.spill_enabled
-        self.preflow_spill_pressure_threshold = preflow_config.spill_pressure_threshold
-        self.preflow_spill_max_batch_tokens = preflow_config.spill_max_batch_tokens
         self._preflow_validate_config()
 
         # PREFLOW per-request state. P is fixed from the prefix-cache state
@@ -484,21 +437,6 @@ class PREFLOWScheduler(SchedulerInterface):
         self._preflow_protected_debt: float = 0.0
         self._preflow_next_batch_id: int = 0
         self._preflow_pending_batch_work: dict[int, _PREFLOWBatchWork] = {}
-        self._preflow_spill_requests: dict[str, _PREFLOWSpillState] = {}
-
-        # Public scalar state consumed by queue tracing and benchmark tooling.
-        self.preflow_spill_competitive_aging = 0.0
-        self.preflow_spill_head_aging_fraction = 0.0
-        self.preflow_spill_head_request_id: str | None = None
-        self.preflow_spill_head_normalized_age = 0.0
-        self.preflow_spill_head_remaining_work = 0.0
-        self.preflow_spill_head_required_work = 0.0
-        self.preflow_spill_head_score = 0.0
-        self.preflow_spill_work_dispersion = 0.0
-        self.preflow_spill_pressure = 0.0
-        self.preflow_spill_selected_requests = 0
-        self.preflow_spill_selected_new_tokens = 0
-        self.preflow_spill_last_request_ids: tuple[str, ...] = ()
         queue_stats_config = ascend_scheduler_config.queue_stats_config
         self._queue_stats_tracer: QueueStatsTracer | None = create_queue_stats_tracer(
             queue_stats_config,
@@ -532,12 +470,6 @@ class PREFLOWScheduler(SchedulerInterface):
                 f"[1, max_num_seqs={self.max_num_running_reqs}], got "
                 f"{self.preflow_max_num_batched_seqs}."
             )
-        if not 0 <= self.preflow_spill_pressure_threshold <= 1:
-            raise ValueError(
-                f"PREFLOW requires spill_pressure_threshold in [0, 1], got {self.preflow_spill_pressure_threshold}."
-            )
-        if self.preflow_spill_max_batch_tokens <= 0:
-            raise ValueError(f"PREFLOW requires spill_max_batch_tokens > 0, got {self.preflow_spill_max_batch_tokens}.")
 
     def _preflow_work(self, num_tokens: int) -> float:
         tokens = float(max(0, int(num_tokens)))
@@ -717,235 +649,6 @@ class PREFLOWScheduler(SchedulerInterface):
         return (
             age / self.preflow_age_priority_double * _PREFLOW_LOG_2 - math.log(required_work) - math.log(remaining_work)
         )
-
-    def _preflow_compute_spill_pressure(self) -> _PREFLOWPressure:
-        """Return current-head aging pressure for unfinished local prefills.
-
-        For ``X_i = P_i R_i`` and ``alpha_i = age_i / age_priority_double``,
-        this identifies ``h = argmax_i S_i`` using the existing PREFLOW
-        ordering, computes ``g_h = 1 - 2^-alpha_h``, retains
-        ``D = Var(X) / E[X^2]``, and combines the two signals as
-        ``rho = sqrt(g_h * D)``.
-
-        Scores are evaluated in log space so long overload experiments cannot
-        overflow ``2 ** alpha``. Requests already committed to a spill are no
-        longer outstanding local prefill work and are excluded.
-        """
-        entries: list[tuple[Request, float, float, float, float, float]] = []
-        for request_id, request in self.requests.items():
-            if request_id in self._preflow_spill_requests:
-                continue
-            if request.is_finished() or not self._preflow_has_unfinished_prefill(request):
-                continue
-
-            required_work = self._preflow_total_required_work(request)
-            remaining_work = self._preflow_remaining_work(request)
-            if required_work <= _PREFLOW_MIN_WORK or remaining_work <= _PREFLOW_MIN_WORK:
-                continue
-
-            work_product = required_work * remaining_work
-            if not math.isfinite(work_product) or work_product <= _PREFLOW_MIN_WORK:
-                continue
-            alpha = max(0.0, self._preflow_age.get(request_id, 0.0) / self.preflow_age_priority_double)
-            log_score = alpha * _PREFLOW_LOG_2 - math.log(work_product)
-            entries.append(
-                (
-                    request,
-                    required_work,
-                    remaining_work,
-                    work_product,
-                    alpha,
-                    log_score,
-                )
-            )
-
-        num_requests = len(entries)
-        if num_requests == 0:
-            return _PREFLOWPressure()
-
-        (
-            head_request,
-            head_required_work,
-            head_remaining_work,
-            _,
-            head_normalized_age,
-            head_log_score,
-        ) = min(
-            entries,
-            key=lambda entry: (
-                -entry[5],
-                entry[0].arrival_time,
-                entry[0].request_id,
-            ),
-        )
-        head_aging_fraction = -math.expm1(-head_normalized_age * _PREFLOW_LOG_2)
-        try:
-            head_score = math.exp(head_log_score)
-        except OverflowError:
-            head_score = math.inf
-
-        total_work_product = math.fsum(work_product for _, _, _, work_product, _, _ in entries)
-        sum_squares = math.fsum(work_product * work_product for _, _, _, work_product, _, _ in entries)
-        if sum_squares <= _PREFLOW_MIN_WORK:
-            work_dispersion = 0.0
-        else:
-            # Var(X) / E[X^2] = 1 - E[X]^2 / E[X^2].
-            work_dispersion = 1.0 - total_work_product * total_work_product / (num_requests * sum_squares)
-            work_dispersion = min(1.0, max(0.0, work_dispersion))
-
-        pressure = math.sqrt(head_aging_fraction * work_dispersion)
-        return _PREFLOWPressure(
-            head_aging_fraction=head_aging_fraction,
-            work_dispersion=work_dispersion,
-            pressure=pressure,
-            num_requests=num_requests,
-            head_request_id=head_request.request_id,
-            head_normalized_age=head_normalized_age,
-            head_remaining_work=head_remaining_work,
-            head_required_work=head_required_work,
-            head_score=head_score,
-        )
-
-    def _preflow_is_spill_eligible(self, request: Request) -> bool:
-        """Whether V0 can safely turn this waiting request into a P handoff."""
-        if request.status != RequestStatus.WAITING or request.request_id in self._preflow_spill_requests:
-            return False
-        if request.prompt_token_ids is None or request.prompt_embeds is not None:
-            return False
-        if request.prompt_is_token_ids is not None or request.mm_features:
-            return False
-        if request.pooling_params is not None or request.sampling_params is None or request.resumable:
-            return False
-        if request.max_tokens != 1 or request.num_output_tokens != 0:
-            return False
-        params = request.kv_transfer_params
-        return self.connector is not None and params is not None and params.get("do_remote_decode") is True
-
-    def _preflow_available_prompt_history(self, request: Request) -> int:
-        history = self._preflow_prompt_history(request)
-        if history == 0:
-            history = self._preflow_estimate_initial_history(request)
-        # The source must execute at least one position to complete the normal
-        # Mooncake producer request and obtain a transfer response.
-        return max(0, min(history, request.num_prompt_tokens - 1))
-
-    def _preflow_spill_candidates(self) -> list[_PREFLOWSpillCandidate]:
-        candidates: list[_PREFLOWSpillCandidate] = []
-        for request in self._preflow_effective_waiting_order():
-            if not self._preflow_is_spill_eligible(request):
-                continue
-            remaining_work = self._preflow_remaining_work(request)
-            if remaining_work <= _PREFLOW_MIN_WORK:
-                continue
-            available_history = self._preflow_available_prompt_history(request)
-            candidates.append(
-                _PREFLOWSpillCandidate(
-                    request=request,
-                    remaining_work=remaining_work,
-                    available_prompt_history=available_history,
-                    new_prompt_tokens=request.num_prompt_tokens - available_history,
-                )
-            )
-        candidates.sort(
-            key=lambda candidate: (
-                candidate.remaining_work,
-                candidate.request.arrival_time,
-                candidate.request.request_id,
-            )
-        )
-        return candidates
-
-    @staticmethod
-    def _preflow_build_spill_batch(
-        candidates: list[_PREFLOWSpillCandidate],
-        max_batch_tokens: int,
-    ) -> list[_PREFLOWSpillCandidate]:
-        if not candidates:
-            return []
-
-        selected = [candidates[0]]
-        selected_tokens = candidates[0].new_prompt_tokens
-        if selected_tokens > max_batch_tokens:
-            return selected
-
-        for candidate in candidates[1:]:
-            if selected_tokens + candidate.new_prompt_tokens <= max_batch_tokens:
-                selected.append(candidate)
-                selected_tokens += candidate.new_prompt_tokens
-        return selected
-
-    def _preflow_mark_spill(self, candidate: _PREFLOWSpillCandidate, pressure: float) -> None:
-        request = candidate.request
-        original_prompt_tokens = request.num_prompt_tokens
-        remote_prompt_tokens = min(original_prompt_tokens, candidate.available_prompt_history + 1)
-        assert request.prompt_token_ids is not None
-        assert len(request._all_token_ids) == original_prompt_tokens
-
-        self._preflow_spill_requests[request.request_id] = _PREFLOWSpillState(
-            original_prompt_tokens=original_prompt_tokens,
-            available_prompt_history=candidate.available_prompt_history,
-            new_prompt_tokens=candidate.new_prompt_tokens,
-            remote_prompt_tokens=remote_prompt_tokens,
-            pressure=pressure,
-        )
-
-        # Present the cached prefix plus one source-computed position as a
-        # complete P request. The proxy retains the original request body, so D
-        # still receives the full prompt.
-        del request.prompt_token_ids[remote_prompt_tokens:]
-        del request._all_token_ids[remote_prompt_tokens:]
-        request.num_prompt_tokens = remote_prompt_tokens
-
-    def _preflow_maybe_mark_spills(self) -> _PREFLOWPressure:
-        sample = self._preflow_compute_spill_pressure()
-        self.preflow_spill_competitive_aging = sample.competitive_aging
-        self.preflow_spill_head_aging_fraction = sample.head_aging_fraction
-        self.preflow_spill_head_request_id = sample.head_request_id
-        self.preflow_spill_head_normalized_age = sample.head_normalized_age
-        self.preflow_spill_head_remaining_work = sample.head_remaining_work
-        self.preflow_spill_head_required_work = sample.head_required_work
-        self.preflow_spill_head_score = sample.head_score
-        self.preflow_spill_work_dispersion = sample.work_dispersion
-        self.preflow_spill_pressure = sample.pressure
-        self.preflow_spill_selected_requests = 0
-        self.preflow_spill_selected_new_tokens = 0
-        self.preflow_spill_last_request_ids = ()
-
-        if not self.preflow_spill_enabled or sample.pressure <= self.preflow_spill_pressure_threshold:
-            return sample
-
-        selected = self._preflow_build_spill_batch(
-            self._preflow_spill_candidates(),
-            self.preflow_spill_max_batch_tokens,
-        )
-        if not selected:
-            return sample
-
-        for candidate in selected:
-            self._preflow_mark_spill(candidate, sample.pressure)
-
-        self.preflow_spill_selected_requests = len(selected)
-        self.preflow_spill_selected_new_tokens = sum(candidate.new_prompt_tokens for candidate in selected)
-        self.preflow_spill_last_request_ids = tuple(candidate.request.request_id for candidate in selected)
-        logger.info(
-            "PREFLOW cross-tier spill: pressure=%.6f head_aging_fraction=%.6f "
-            "work_dispersion=%.6f head_request_id=%s "
-            "head_normalized_age=%.6f head_remaining_work=%.6g "
-            "head_required_work=%.6g head_score=%.6g requests=%d "
-            "new_prompt_tokens=%d request_ids=%s",
-            sample.pressure,
-            sample.head_aging_fraction,
-            sample.work_dispersion,
-            sample.head_request_id,
-            sample.head_normalized_age,
-            sample.head_remaining_work,
-            sample.head_required_work,
-            sample.head_score,
-            len(selected),
-            self.preflow_spill_selected_new_tokens,
-            self.preflow_spill_last_request_ids,
-        )
-        return sample
 
     def _preflow_order_running_requests(self) -> None:
         """Order unfinished-prefill RUNNING requests by aged weighted-SRJF."""
@@ -1921,7 +1624,6 @@ class PREFLOWScheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
-        self._preflow_maybe_mark_spills()
         preflow_required_work_by_req_id = self._preflow_capture_age_targets()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
@@ -3271,20 +2973,6 @@ class PREFLOWScheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         request_id = request.request_id
-        spill_state = self._preflow_spill_requests.pop(request_id, None)
-        if spill_state is not None:
-            if kv_xfer_params is None:
-                logger.warning(
-                    "PREFLOW spill for request %s completed without KV transfer "
-                    "metadata; the decode tier will recompute its full prompt",
-                    request_id,
-                )
-            else:
-                kv_xfer_params[PREFLOW_SPILL_REMOTE_TOKENS_KEY] = spill_state.remote_prompt_tokens
-                kv_xfer_params[PREFLOW_SPILL_ORIGINAL_PROMPT_TOKENS_KEY] = spill_state.original_prompt_tokens
-                kv_xfer_params[PREFLOW_SPILL_AVAILABLE_HISTORY_KEY] = spill_state.available_prompt_history
-                kv_xfer_params[PREFLOW_SPILL_NEW_TOKENS_KEY] = spill_state.new_prompt_tokens
-                kv_xfer_params[PREFLOW_SPILL_PRESSURE_KEY] = spill_state.pressure
 
         ec_xfer_params: dict[str, Any] | None = None
         if self.ec_connector is not None:
@@ -3496,7 +3184,6 @@ class PREFLOWScheduler(SchedulerInterface):
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
         self._preflow_pending_batch_work.clear()
-        self._preflow_spill_requests.clear()
         self._preflow_clear_protected_request()
         self._preflow_age.clear()
         self._preflow_initial_history.clear()
