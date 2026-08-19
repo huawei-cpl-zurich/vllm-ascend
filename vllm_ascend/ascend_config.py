@@ -799,6 +799,16 @@ class PREFLOWConfig:
     micro-prefills are admitted up to the normal chunked-prefill token limit.
     Set it to ``0`` to keep at most one prefill per scheduler step.
 
+    ``spill_enabled`` enables local cross-tier spill decisions. When the
+    work-weighted competitive-aging pressure exceeds
+    ``spill_pressure_threshold``, PREFLOW may hand short waiting work to the
+    decode tier. ``spill_max_batch_tokens`` caps aggregate uncached prompt
+    tokens when adding requests after the shortest candidate; the first
+    candidate is always selected even when it alone exceeds the cap.
+    Configure the same spill-enabled block on the P and D processes: P uses
+    the full PREFLOW scheduler, while D uses the standard FCFS scheduler with
+    only the partial-prefill receive shim.
+
     The examples below show only the scheduler extension. The node must also
     configure a KV connector with ``kv_role="kv_producer"``.
 
@@ -810,6 +820,11 @@ class PREFLOWConfig:
     Usage (offline)::
 
         llm = LLM(model, additional_config={"scheduler_config": {"preflow_config": {"enabled": true}}})
+
+    Cross-tier spill::
+
+        {"scheduler_config": {"preflow_config": {
+            "enabled": true, "spill_enabled": true}}}
     """
 
     _defaults = {
@@ -819,6 +834,9 @@ class PREFLOWConfig:
         "age_priority_double": 2.0,
         "waiting_policy": "wsrjf",
         "micro_prefill_isl_threshold": 1,
+        "spill_enabled": False,
+        "spill_pressure_threshold": 0.75,
+        "spill_max_batch_tokens": 1024,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -848,6 +866,19 @@ class PREFLOWConfig:
                 self._defaults["micro_prefill_isl_threshold"],
             )
         )
+        self.spill_enabled = user_config.get("spill_enabled", self._defaults["spill_enabled"])
+        self.spill_pressure_threshold = float(
+            user_config.get(
+                "spill_pressure_threshold",
+                self._defaults["spill_pressure_threshold"],
+            )
+        )
+        self.spill_max_batch_tokens = int(
+            user_config.get(
+                "spill_max_batch_tokens",
+                self._defaults["spill_max_batch_tokens"],
+            )
+        )
         self._validate_config()
 
     def _validate_config(self):
@@ -871,6 +902,19 @@ class PREFLOWConfig:
                 "preflow_config.micro_prefill_isl_threshold must be "
                 "non-negative, "
                 f"got {self.micro_prefill_isl_threshold}"
+            )
+        if not isinstance(self.spill_enabled, bool):
+            raise ValueError(f"preflow_config.spill_enabled must be a bool, got {type(self.spill_enabled).__name__}")
+        if self.spill_enabled and not self.enabled:
+            raise ValueError("preflow_config.spill_enabled requires preflow_config.enabled=true")
+        if not math.isfinite(self.spill_pressure_threshold) or not 0 <= self.spill_pressure_threshold <= 1:
+            raise ValueError(
+                "preflow_config.spill_pressure_threshold must be finite and in [0, 1], "
+                f"got {self.spill_pressure_threshold}"
+            )
+        if self.spill_max_batch_tokens <= 0:
+            raise ValueError(
+                f"preflow_config.spill_max_batch_tokens must be positive, got {self.spill_max_batch_tokens}"
             )
 
 

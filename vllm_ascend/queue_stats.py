@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared scheduler queue-size tracing for PD benchmark diagnostics."""
+"""Shared scheduler queue and PREFLOW-pressure tracing for PD diagnostics."""
 
 import atexit
 import os
@@ -11,7 +11,12 @@ from typing import Any
 
 from vllm.logger import logger
 
-_CSV_HEADER = "timestamp_ns,iteration,role,waiting,running,total\n"
+_CSV_HEADER = (
+    "timestamp_ns,iteration,role,waiting,running,total,"
+    "preflow_competitive_aging,preflow_work_dispersion,"
+    "preflow_spill_pressure,preflow_spill_requests,"
+    "preflow_spill_new_tokens\n"
+)
 
 
 def get_pd_role(vllm_config: Any) -> str:
@@ -47,15 +52,25 @@ class QueueStatsTracer:
         """Append one post-schedule sample when the worker has active work."""
         waiting = len(scheduler.waiting) + len(scheduler.skipped_waiting)
         running = len(scheduler.running)
-        if running == 0:
+        if waiting + running == 0:
             return
 
         iteration = getattr(scheduler, "current_step", 0)
+        competitive_aging = getattr(scheduler, "preflow_spill_competitive_aging", 0.0)
+        work_dispersion = getattr(scheduler, "preflow_spill_work_dispersion", 0.0)
+        spill_pressure = getattr(scheduler, "preflow_spill_pressure", 0.0)
+        spill_requests = getattr(scheduler, "preflow_spill_selected_requests", 0)
+        spill_new_tokens = getattr(scheduler, "preflow_spill_selected_new_tokens", 0)
         with self._lock:
             if self._file.closed:
                 return
             try:
-                self._file.write(f"{time.time_ns()},{iteration},{self.role},{waiting},{running},{waiting + running}\n")
+                self._file.write(
+                    f"{time.time_ns()},{iteration},{self.role},{waiting},"
+                    f"{running},{waiting + running},{competitive_aging:.17g},"
+                    f"{work_dispersion:.17g},{spill_pressure:.17g},"
+                    f"{spill_requests},{spill_new_tokens}\n"
+                )
             except OSError:
                 logger.exception(
                     "Queue-size tracing disabled because the trace file cannot be written: %s",

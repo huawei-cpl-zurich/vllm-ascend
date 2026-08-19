@@ -71,6 +71,7 @@ else:
     FlexibleArgumentParser = None
 
 _CUSTOM_OP_REGISTERED = False
+_PREFLOW_SPILL_CONNECTOR = "MooncakeConnectorV1"
 # Delete after the driver is released; temporarily hard-coded to 4
 MAX_CAPTURE_SIZES_FOR_950 = 4
 
@@ -852,6 +853,12 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
     preflow_config = scheduler_extension_config.preflow_config
     kv_transfer_config = vllm_config.kv_transfer_config
     kv_role = getattr(kv_transfer_config, "kv_role", None)
+    if preflow_config.spill_enabled and kv_role in {"kv_producer", "kv_consumer"}:
+        kv_connector = getattr(kv_transfer_config, "kv_connector", None)
+        if kv_connector != _PREFLOW_SPILL_CONNECTOR:
+            raise ValueError(
+                f"PREFLOW spill currently requires kv_connector={_PREFLOW_SPILL_CONNECTOR!r}, got {kv_connector!r}."
+            )
     enable_preflow_on_prefill = preflow_config.enabled and kv_role == "kv_producer"
     if enable_preflow_on_prefill:
         if vllm_config.scheduler_config.policy != "fcfs":
@@ -878,6 +885,25 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         if scheduler_extension_config.batch_job_sched_config.enabled:
             raise ValueError(
                 "PREFLOW scheduling cannot be enabled with batch_job_sched_config. Please disable one of them."
+            )
+    elif preflow_config.spill_enabled and kv_role == "kv_consumer":
+        if vllm_config.scheduler_config.policy != "fcfs":
+            raise ValueError(
+                "PREFLOW spill decode handling requires scheduler_config.policy='fcfs', "
+                f"but got {vllm_config.scheduler_config.policy!r}."
+            )
+        conflicting_schedulers = {
+            "batch_job_sched_config": scheduler_extension_config.batch_job_sched_config.enabled,
+            "dyntra_lb_config": scheduler_extension_config.dyntra_lb_config.enabled,
+            "profiling_chunk_config": scheduler_extension_config.profiling_chunk_config.enabled,
+            "recompute_scheduler_enable": scheduler_extension_config.recompute_scheduler_enable,
+            "short_request_first_config": scheduler_extension_config.short_request_first_config.enabled,
+        }
+        enabled_conflicts = [name for name, enabled in conflicting_schedulers.items() if enabled]
+        if enabled_conflicts:
+            raise ValueError(
+                "PREFLOW spill decode handling requires the standard FCFS "
+                "scheduler; disable: " + ", ".join(enabled_conflicts)
             )
     elif preflow_config.enabled:
         logger.info(
@@ -1195,6 +1221,15 @@ def _setup_worker_and_scheduler(
             vllm_config.scheduler_config.scheduler_cls = "vllm_ascend.core.preflow_scheduler.AsyncPREFLOWScheduler"
         else:
             vllm_config.scheduler_config.scheduler_cls = "vllm_ascend.core.preflow_scheduler.PREFLOWScheduler"
+    elif preflow_config.enabled and preflow_config.spill_enabled and kv_role == "kv_consumer":
+        if vllm_config.scheduler_config.async_scheduling:
+            vllm_config.scheduler_config.scheduler_cls = (
+                "vllm_ascend.core.preflow_decode_scheduler.AsyncPREFLOWSpillDecodeScheduler"
+            )
+        else:
+            vllm_config.scheduler_config.scheduler_cls = (
+                "vllm_ascend.core.preflow_decode_scheduler.PREFLOWSpillDecodeScheduler"
+            )
 
     if scheduler_config.dyntra_lb_config.enabled and not scheduler_config.recompute_scheduler_enable:
         vllm_config.scheduler_config.scheduler_cls = _get_dyntra_lb_scheduler_cls(
