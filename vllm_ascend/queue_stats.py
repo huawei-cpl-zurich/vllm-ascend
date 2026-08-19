@@ -15,9 +15,10 @@ _CSV_HEADER = (
     "timestamp_ns,iteration,role,waiting,running,total,"
     "preflow_competitive_aging,preflow_work_dispersion,"
     "preflow_spill_pressure,preflow_spill_requests,"
-    "preflow_spill_new_tokens,preflow_blocker_pressure,"
-    "preflow_blocker_request_id,preflow_blocker_aging_fraction,"
-    "preflow_blocker_score_ratio,preflow_blocker_work_ratio\n"
+    "preflow_spill_new_tokens,preflow_head_aging_fraction,"
+    "preflow_head_request_id,preflow_head_normalized_age,"
+    "preflow_head_remaining_work,preflow_head_required_work,"
+    "preflow_head_score\n"
 )
 
 
@@ -63,13 +64,14 @@ class QueueStatsTracer:
         spill_pressure = getattr(scheduler, "preflow_spill_pressure", 0.0)
         spill_requests = getattr(scheduler, "preflow_spill_selected_requests", 0)
         spill_new_tokens = getattr(scheduler, "preflow_spill_selected_new_tokens", 0)
-        blocker_pressure = getattr(scheduler, "preflow_spill_blocker_pressure", competitive_aging)
-        blocker_request_id = getattr(scheduler, "preflow_spill_blocker_request_id", None)
-        blocker_request_id = "" if blocker_request_id is None else str(blocker_request_id)
-        blocker_request_id = blocker_request_id.replace("\r", "\\r").replace("\n", "\\n").replace('"', '""')
-        blocker_aging_fraction = getattr(scheduler, "preflow_spill_blocker_aging_fraction", 0.0)
-        blocker_score_ratio = getattr(scheduler, "preflow_spill_blocker_score_ratio", 0.0)
-        blocker_work_ratio = getattr(scheduler, "preflow_spill_blocker_work_ratio", 0.0)
+        head_aging_fraction = getattr(scheduler, "preflow_spill_head_aging_fraction", competitive_aging)
+        head_request_id = getattr(scheduler, "preflow_spill_head_request_id", None)
+        head_request_id = "" if head_request_id is None else str(head_request_id)
+        head_request_id = head_request_id.replace("\r", "\\r").replace("\n", "\\n").replace('"', '""')
+        head_normalized_age = getattr(scheduler, "preflow_spill_head_normalized_age", 0.0)
+        head_remaining_work = getattr(scheduler, "preflow_spill_head_remaining_work", 0.0)
+        head_required_work = getattr(scheduler, "preflow_spill_head_required_work", 0.0)
+        head_score = getattr(scheduler, "preflow_spill_head_score", 0.0)
         with self._lock:
             if self._file.closed:
                 return
@@ -78,9 +80,10 @@ class QueueStatsTracer:
                     f"{time.time_ns()},{iteration},{self.role},{waiting},"
                     f"{running},{waiting + running},{competitive_aging:.17g},"
                     f"{work_dispersion:.17g},{spill_pressure:.17g},"
-                    f"{spill_requests},{spill_new_tokens},{blocker_pressure:.17g},"
-                    f'"{blocker_request_id}",{blocker_aging_fraction:.17g},'
-                    f"{blocker_score_ratio:.17g},{blocker_work_ratio:.17g}\n"
+                    f"{spill_requests},{spill_new_tokens},{head_aging_fraction:.17g},"
+                    f'"{head_request_id}",{head_normalized_age:.17g},'
+                    f"{head_remaining_work:.17g},{head_required_work:.17g},"
+                    f"{head_score:.17g}\n"
                 )
             except OSError:
                 logger.exception(

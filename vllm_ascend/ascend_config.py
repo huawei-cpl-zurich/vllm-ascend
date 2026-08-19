@@ -807,7 +807,7 @@ class PREFLOWConfig:
     only its highest-scoring request in each step.
 
     ``spill_enabled`` enables local cross-tier spill decisions. When the
-    blocker-oriented competitive-aging pressure exceeds
+    current-head aging pressure exceeds
     ``spill_pressure_threshold``, PREFLOW may hand short waiting work to the
     decode tier. ``spill_max_batch_tokens`` caps aggregate uncached prompt
     tokens when adding requests after the shortest candidate; the first
