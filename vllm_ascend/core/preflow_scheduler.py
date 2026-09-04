@@ -5,11 +5,9 @@
 # Adapted from vllm-project/vllm/vllm/v1/core/sched/scheduler.py
 # at vLLM v0.25.1.
 import itertools
-import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -72,33 +70,15 @@ from vllm.v1.utils import record_function_or_nullcontext
 from vllm_ascend.queue_stats import QueueStatsTracer, create_queue_stats_tracer
 
 _PREFLOW_MIN_WORK = 1e-12
-_PREFLOW_LOG_2 = math.log(2.0)
 _PREFLOW_BATCH_ID_ATTR = "_vllm_ascend_preflow_batch_id"
 
 
 @dataclass
 class _PREFLOWBatchWork:
-    """PREFLOW age metadata captured before a scheduled batch advances."""
+    """Triangular prefill work dispatched but not yet completed."""
 
     total_work: float
-    required_work_by_req_id: dict[str, float]
-
-
-@dataclass
-class _PREFLOWBypassProbeSnapshot:
-    """State touched before an unsuccessful bypass admission can commit."""
-
-    request_status: RequestStatus
-    request_num_computed_tokens: int
-    request_prefill_stats: Any
-    preflow_age_present: bool
-    preflow_age: float | None
-    preflow_initial_history_present: bool
-    preflow_initial_history: int | None
-    preflow_initial_history_authoritative: bool
-    prefix_cache_stats: PrefixCacheStats | None
-    connector_prefix_cache_stats: PrefixCacheStats | None
-    encoder_cache_state: dict[str, Any]
+    work_by_req_id: dict[str, float]
 
 
 @dataclass
@@ -418,23 +398,21 @@ class PREFLOWScheduler(SchedulerInterface):
         init_ascend_config(vllm_config)
         ascend_scheduler_config = get_ascend_config().scheduler_config
         preflow_config = ascend_scheduler_config.preflow_config
-        self.preflow_work_exponent = preflow_config.work_exponent
-        self.preflow_admission_bypass_budget = preflow_config.admission_bypass_budget
-        self.preflow_age_priority_double = preflow_config.age_priority_double
-        self.preflow_waiting_policy = preflow_config.waiting_policy
+        self.preflow_max_fcfs_inflation = preflow_config.max_fcfs_inflation
+        self.preflow_rho = 1.0 + self.preflow_max_fcfs_inflation
         self.preflow_micro_prefill_isl_threshold = preflow_config.micro_prefill_isl_threshold
         self.preflow_max_num_batched_seqs = preflow_config.max_num_batched_seqs
         self._preflow_validate_config()
 
-        # PREFLOW per-request state. P is fixed from the prefix-cache state
-        # observed when the request enters the scheduler. Admission still
-        # performs the normal cache lookup/attachment for execution, but it
-        # does not rewrite this initial scoring baseline.
+        # PREFLOW per-request state. Initial history, FCFS baseline, and
+        # deadline are frozen when the request enters the scheduler.
         self._preflow_initial_history: dict[str, int] = {}
         self._preflow_initial_history_authoritative: set[str] = set()
-        self._preflow_age: dict[str, float] = {}
-        self._preflow_protected_request_id: str | None = None
-        self._preflow_protected_debt: float = 0.0
+        self._preflow_fcfs_baseline: dict[str, float] = {}
+        self._preflow_deadline: dict[str, float] = {}
+        self._preflow_arrival_order: dict[str, int] = {}
+        self._preflow_next_arrival_order: int = 0
+        self._preflow_service_clock: float = 0.0
         self._preflow_next_batch_id: int = 0
         self._preflow_pending_batch_work: dict[int, _PREFLOWBatchWork] = {}
         queue_stats_config = ascend_scheduler_config.queue_stats_config
@@ -444,22 +422,8 @@ class PREFLOWScheduler(SchedulerInterface):
         )
 
     def _preflow_validate_config(self) -> None:
-        if not math.isfinite(self.preflow_work_exponent) or self.preflow_work_exponent <= 0:
-            raise ValueError(f"PREFLOW requires finite work_exponent > 0, got {self.preflow_work_exponent}.")
-        if not math.isfinite(self.preflow_admission_bypass_budget) or self.preflow_admission_bypass_budget < 0:
-            raise ValueError(
-                f"PREFLOW requires finite admission_bypass_budget >= 0, got {self.preflow_admission_bypass_budget}."
-            )
-        if not math.isfinite(self.preflow_age_priority_double) or self.preflow_age_priority_double <= 0:
-            raise ValueError(
-                f"PREFLOW requires finite age_priority_double > 0, got {self.preflow_age_priority_double}."
-            )
-        if self.preflow_waiting_policy not in {"fcfs_protected", "wsrjf"}:
-            raise ValueError(
-                "PREFLOW requires waiting_policy to be one of "
-                "['fcfs_protected', 'wsrjf'], "
-                f"got {self.preflow_waiting_policy!r}."
-            )
+        if self.preflow_max_fcfs_inflation < 0:
+            raise ValueError(f"PREFLOW requires max_fcfs_inflation >= 0, got {self.preflow_max_fcfs_inflation}.")
         if self.preflow_micro_prefill_isl_threshold < 0:
             raise ValueError(
                 f"PREFLOW requires micro_prefill_isl_threshold >= 0, got {self.preflow_micro_prefill_isl_threshold}."
@@ -488,7 +452,6 @@ class PREFLOWScheduler(SchedulerInterface):
         request: Request,
     ) -> int:
         request_id = request.request_id
-        self._preflow_age.setdefault(request_id, 0.0)
         return self._preflow_initial_history.setdefault(request_id, 0)
 
     def _preflow_estimate_initial_history(self, request: Request) -> int:
@@ -534,7 +497,6 @@ class PREFLOWScheduler(SchedulerInterface):
         initial_history = self._preflow_prompt_history(request, num_computed_tokens)
         self._preflow_initial_history[request_id] = initial_history
         self._preflow_initial_history_authoritative.add(request_id)
-        self._preflow_age.setdefault(request_id, 0.0)
         return initial_history
 
     def _preflow_total_required_work(
@@ -554,6 +516,9 @@ class PREFLOWScheduler(SchedulerInterface):
         # includes recomputation while P_q remains the original isolated work.
         prompt_tokens = request.num_prompt_tokens
         history = self._preflow_prompt_history(request)
+        if history == 0 and getattr(request, "num_preemptions", 0) == 0:
+            # Before first admission, use the cache estimate frozen at enqueue.
+            history = self._preflow_initial_history.get(request.request_id, 0)
         remaining_work = self._preflow_work(prompt_tokens) - self._preflow_work(history)
         return max(0.0, remaining_work)
 
@@ -632,113 +597,167 @@ class PREFLOWScheduler(SchedulerInterface):
             self._preflow_is_micro_prefill(remaining_prefill_tokens),
         )
 
-    def _preflow_priority(self, request: Request) -> float | None:
-        """Return log-priority for exponential aged WSRJF ordering.
+    def _preflow_outstanding_work(self, request_id: str | None = None) -> float:
+        if request_id is None:
+            return sum(batch.total_work for batch in self._preflow_pending_batch_work.values())
+        return sum(batch.work_by_req_id.get(request_id, 0.0) for batch in self._preflow_pending_batch_work.values())
 
-        PREFLOW uses ``2 ** (A_q / age_priority_double) / (P_q R_q)``.
-        Returning its logarithm preserves the ordering while avoiding overflow
-        when long overload experiments produce large normalized ages.
+    def _preflow_logical_remaining_work(self, request: Request) -> float:
+        """Return remaining work including dispatched, unfinished chunks.
+
+        vLLM advances ``num_computed_tokens`` at dispatch. Adding the request's
+        pending chunk work reconstructs the logical history at completed
+        service, so asynchronous batches are neither omitted nor double-counted.
         """
-        remaining_work = self._preflow_remaining_work(request)
-        if remaining_work <= _PREFLOW_MIN_WORK:
-            return None
-        required_work = self._preflow_total_required_work(request)
-        if required_work <= _PREFLOW_MIN_WORK:
-            return None
-        age = self._preflow_age.get(request.request_id, 0.0)
-        return (
-            age / self.preflow_age_priority_double * _PREFLOW_LOG_2 - math.log(required_work) - math.log(remaining_work)
-        )
+        return self._preflow_remaining_work(request) + self._preflow_outstanding_work(request.request_id)
 
-    def _preflow_order_running_requests(self) -> None:
-        """Order unfinished-prefill RUNNING requests by aged weighted-SRJF."""
-        prioritized_prefills: list[tuple[Request, float]] = []
-        for request in self.running:
-            if not self._preflow_has_unfinished_prefill(request):
+    def _preflow_deadline_requests(self) -> list[Request]:
+        requests: list[Request] = []
+        for request in self.requests.values():
+            if request.is_finished() or request.request_id not in self._preflow_deadline:
                 continue
-            priority = self._preflow_priority(request)
-            if priority is not None:
-                prioritized_prefills.append((request, priority))
-        if len(prioritized_prefills) <= 1:
-            return
+            if self._preflow_has_unfinished_prefill(request) or self._preflow_outstanding_work(request.request_id) > 0:
+                requests.append(request)
+        return requests
 
-        sorted_prefills = sorted(
-            prioritized_prefills,
-            key=lambda item: (
-                -item[1],
-                item[0].arrival_time,
-                item[0].request_id,
-            ),
+    def _preflow_candidate_key(self, request: Request) -> tuple[float, float, int, str]:
+        request_id = request.request_id
+        return (
+            self._preflow_logical_remaining_work(request),
+            self._preflow_deadline[request_id],
+            self._preflow_arrival_order[request_id],
+            request_id,
         )
-        preflow_order = iter(request for request, _ in sorted_prefills)
-        prefill_request_ids = {id(request) for request, _ in prioritized_prefills}
+
+    def _preflow_edf_key(self, request: Request) -> tuple[float, int, str]:
+        request_id = request.request_id
+        return (
+            self._preflow_deadline[request_id],
+            self._preflow_arrival_order[request_id],
+            request_id,
+        )
+
+    def _preflow_log_admission_not_evaluable(self, request: Request) -> None:
+        deadline_requests = self._preflow_deadline_requests()
+        if deadline_requests and request is min(deadline_requests, key=self._preflow_edf_key):
+            logger.warning_once(
+                "PREFLOW's earliest-deadline request %s was not legal under "
+                "existing admission constraints; the compute-side "
+                "FCFS-inflation guarantee is not evaluable for this decision.",
+                request.request_id,
+            )
+
+    def _preflow_chunk_work(self, history: int, chunk_size: int) -> float:
+        return self._preflow_work(history + chunk_size) - self._preflow_work(history)
+
+    def _preflow_chunk_is_safe(
+        self,
+        request: Request,
+        chunk_work: float,
+        candidate_remaining_work: float | None = None,
+    ) -> bool:
+        """Apply the EDF-prefix feasibility condition for one exact chunk."""
+        if chunk_work <= _PREFLOW_MIN_WORK:
+            return True
+
+        edf_requests = sorted(self._preflow_deadline_requests(), key=self._preflow_edf_key)
+        try:
+            candidate_position = next(
+                index for index, item in enumerate(edf_requests) if item.request_id == request.request_id
+            )
+        except StopIteration:
+            return False
+
+        # Pending work for a request no longer represented in the deadline set
+        # (for example, an aborted in-flight request) is already committed and
+        # delays every EDF prefix.
+        represented_outstanding = sum(self._preflow_outstanding_work(item.request_id) for item in edf_requests)
+        committed_work = max(0.0, self._preflow_outstanding_work() - represented_outstanding)
+        prefix_work = 0.0
+        minimum_slack = float("inf")
+        for index, item in enumerate(edf_requests):
+            remaining_work = self._preflow_logical_remaining_work(item)
+            if item is request and candidate_remaining_work is not None:
+                remaining_work = candidate_remaining_work + self._preflow_outstanding_work(item.request_id)
+            prefix_work += remaining_work
+            if index >= candidate_position:
+                break
+            slack = self._preflow_deadline[item.request_id] - self._preflow_service_clock - committed_work - prefix_work
+            minimum_slack = min(minimum_slack, slack)
+        return chunk_work <= minimum_slack
+
+    def _preflow_select_candidate_action(
+        self,
+        actions: Iterable[tuple[Request, float]],
+    ) -> Request | None:
+        """Select the first safe SRW action, or the EDF rescue action."""
+        candidates = sorted(actions, key=lambda item: self._preflow_candidate_key(item[0]))
+        for request, chunk_work in candidates:
+            if self._preflow_chunk_is_safe(request, chunk_work):
+                return request
+        if not candidates:
+            return None
+        return min((request for request, _ in candidates), key=self._preflow_edf_key)
+
+    def _preflow_nominal_chunk_work(self, request: Request, token_budget: int) -> float:
+        """Estimate the normal next chunk before admission-time adjustments.
+
+        Both running and waiting scheduling paths recheck the shield after the
+        existing code has determined the exact chunk. This preliminary value
+        is used only to arbitrate between those paths.
+        """
+        history = self._preflow_prompt_history(request)
+        if history == 0 and getattr(request, "num_preemptions", 0) == 0:
+            history = self._preflow_initial_history.get(request.request_id, 0)
+        num_new_tokens = request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < num_new_tokens:
+            num_new_tokens = threshold
+        num_new_tokens = min(
+            num_new_tokens,
+            token_budget,
+            self.max_model_len - request.num_computed_tokens - self.num_sampled_tokens_per_step,
+        )
+        prefill_chunk = min(max(0, num_new_tokens), request.num_prompt_tokens - history)
+        return self._preflow_chunk_work(history, prefill_chunk)
+
+    def _preflow_preferred_request(self, token_budget: int) -> Request | None:
+        actions = []
+        for request in self.requests.values():
+            if request.is_finished() or not self._preflow_has_unfinished_prefill(request):
+                continue
+            if self._is_blocked_waiting_status(request.status):
+                continue
+            chunk_work = self._preflow_nominal_chunk_work(request, token_budget)
+            if chunk_work > _PREFLOW_MIN_WORK:
+                actions.append((request, chunk_work))
+        return self._preflow_select_candidate_action(actions)
+
+    def _preflow_order_running_requests(self, token_budget: int) -> None:
+        """Order running prefills by the hard-constraint candidate policy."""
+        preferred = self._preflow_preferred_request(token_budget)
+        prefills = [request for request in self.running if self._preflow_has_unfinished_prefill(request)]
+        if len(prefills) <= 1:
+            return
+        prefills.sort(
+            key=lambda request: (
+                request is not preferred,
+                self._preflow_candidate_key(request),
+            )
+        )
+        preflow_order = iter(prefills)
+        prefill_request_ids = {id(request) for request in prefills}
         self.running = [
             next(preflow_order) if id(request) in prefill_request_ids else request for request in self.running
         ]
 
-    @staticmethod
-    def _preflow_priority_key(request: Request, priority: float) -> tuple[float, float, str]:
-        return (-priority, request.arrival_time, request.request_id)
-
-    def _preflow_waiting_prefill_outranks_running(self) -> bool:
-        """Whether an admissible waiting prefill owns the next compute slot.
-
-        RUNNING and WAITING prefills use the same aged PREFLOW score. A waiting
-        request may win only while a resident request slot is available; the
-        normal admission path still performs the authoritative full-ISL/KV
-        feasibility check before it is admitted.
-
-        The default one-request compute batch makes this a direct arbitration
-        for the next step. This is what lets a short arrival advance while an
-        admitted long prefill keeps its KV resident.
-        """
-        if self.preflow_waiting_policy != "wsrjf":
-            return False
+    def _preflow_waiting_prefill_outranks_running(self, token_budget: int) -> bool:
+        """Whether the globally preferred action belongs to a waiting request."""
         num_running = len(self.running) + self.num_waiting_for_streaming_input
         if num_running >= self.max_num_running_reqs:
             return False
-
-        running_prefills: list[tuple[Request, float]] = []
-        for request in self.running:
-            if not self._preflow_has_unfinished_prefill(request):
-                continue
-            priority = self._preflow_priority(request)
-            if priority is not None:
-                running_prefills.append((request, priority))
-        if not running_prefills:
-            return False
-
-        waiting_prefills: list[tuple[Request, float]] = []
-        for request in self._preflow_effective_waiting_order():
-            if self._is_blocked_waiting_status(request.status):
-                continue
-            if not self._preflow_has_unfinished_prefill(request):
-                continue
-            priority = self._preflow_priority(request)
-            if priority is not None:
-                waiting_prefills.append((request, priority))
-        if not waiting_prefills:
-            return False
-
-        best_running = min(
-            running_prefills,
-            key=lambda item: self._preflow_priority_key(*item),
-        )
-        best_waiting = min(
-            waiting_prefills,
-            key=lambda item: self._preflow_priority_key(*item),
-        )
-        return self._preflow_priority_key(*best_waiting) < self._preflow_priority_key(*best_running)
-
-    def _preflow_capture_age_targets(self) -> dict[str, float]:
-        required_work_by_req_id: dict[str, float] = {}
-        for request_id, request in self.requests.items():
-            if request.is_finished():
-                continue
-            if not self._preflow_has_unfinished_prefill(request):
-                continue
-            required_work_by_req_id[request_id] = self._preflow_total_required_work(request)
-        return required_work_by_req_id
+        preferred = self._preflow_preferred_request(token_budget)
+        return preferred is not None and self._preflow_waiting_queue_for_request(preferred) is not None
 
     def _preflow_add_scheduled_chunk(
         self,
@@ -758,13 +777,13 @@ class PREFLOWScheduler(SchedulerInterface):
         self,
         scheduler_output: SchedulerOutput,
         scheduled_chunks: list[tuple[str, int, int]],
-        required_work_by_req_id: dict[str, float],
     ) -> None:
         if not scheduled_chunks:
             return
-        total_work = 0.0
-        for _, history, chunk_size in scheduled_chunks:
-            total_work += self._preflow_work(history + chunk_size) - (self._preflow_work(history))
+        work_by_req_id: dict[str, float] = defaultdict(float)
+        for request_id, history, chunk_size in scheduled_chunks:
+            work_by_req_id[request_id] += self._preflow_chunk_work(history, chunk_size)
+        total_work = sum(work_by_req_id.values())
         if total_work <= _PREFLOW_MIN_WORK:
             return
         batch_id = self._preflow_next_batch_id
@@ -772,10 +791,10 @@ class PREFLOWScheduler(SchedulerInterface):
         setattr(scheduler_output, _PREFLOW_BATCH_ID_ATTR, batch_id)
         self._preflow_pending_batch_work[batch_id] = _PREFLOWBatchWork(
             total_work=total_work,
-            required_work_by_req_id=required_work_by_req_id,
+            work_by_req_id=dict(work_by_req_id),
         )
 
-    def _preflow_apply_batch_age(self, scheduler_output: SchedulerOutput) -> None:
+    def _preflow_apply_completed_batch_work(self, scheduler_output: SchedulerOutput) -> None:
         batch_id = getattr(scheduler_output, _PREFLOW_BATCH_ID_ATTR, None)
         if batch_id is None:
             return
@@ -786,24 +805,23 @@ class PREFLOWScheduler(SchedulerInterface):
         delattr(scheduler_output, _PREFLOW_BATCH_ID_ATTR)
         if batch_work is None:
             return
-        for request_id, required_work in batch_work.required_work_by_req_id.items():
-            if required_work <= _PREFLOW_MIN_WORK:
-                continue
-            request = self.requests.get(request_id)
-            if request is None or request.is_finished():
-                continue
-            self._preflow_age[request_id] = (
-                self._preflow_age.get(
-                    request_id,
-                    0.0,
-                )
-                + batch_work.total_work / required_work
-            )
+        self._preflow_service_clock += batch_work.total_work
 
     def _preflow_register_request(self, request: Request) -> None:
-        self._preflow_age[request.request_id] = 0.0
-        self._preflow_initial_history[request.request_id] = self._preflow_estimate_initial_history(request)
-        self._preflow_initial_history_authoritative.add(request.request_id)
+        request_id = request.request_id
+        self._preflow_initial_history[request_id] = self._preflow_estimate_initial_history(request)
+        self._preflow_initial_history_authoritative.add(request_id)
+        isolated_work = self._preflow_total_required_work(request)
+        queued_work = self._preflow_outstanding_work()
+        for existing in self.requests.values():
+            if existing.request_id == request_id or existing.is_finished():
+                continue
+            queued_work += self._preflow_remaining_work(existing)
+        baseline = queued_work + isolated_work
+        self._preflow_fcfs_baseline[request_id] = baseline
+        self._preflow_deadline[request_id] = self._preflow_service_clock + self.preflow_rho * baseline
+        self._preflow_arrival_order[request_id] = self._preflow_next_arrival_order
+        self._preflow_next_arrival_order += 1
 
     def _preflow_forget_request(self, request_id: str) -> None:
         """Drop PREFLOW state for a permanently finished request.
@@ -811,93 +829,52 @@ class PREFLOWScheduler(SchedulerInterface):
         This is intentionally idempotent because upstream cleanup can enter via
         _free_request() or direct connector-delayed _free_blocks() paths.
         """
-        self._preflow_age.pop(request_id, None)
         self._preflow_initial_history.pop(request_id, None)
         self._preflow_initial_history_authoritative.discard(request_id)
-        if self._preflow_protected_request_id == request_id:
-            self._preflow_clear_protected_request()
-        for batch_work in self._preflow_pending_batch_work.values():
-            batch_work.required_work_by_req_id.pop(request_id, None)
-
-    def _preflow_clear_protected_request(self) -> None:
-        self._preflow_protected_request_id = None
-        self._preflow_protected_debt = 0.0
-
-    def _preflow_pin_protected_request(
-        self,
-        request: Request,
-        num_computed_tokens: int,
-    ) -> None:
-        if self._preflow_protected_request_id != request.request_id:
-            self._preflow_protected_request_id = request.request_id
-            self._preflow_protected_debt = 0.0
-        self._preflow_set_authoritative_initial_history(request, num_computed_tokens)
-
-    def _preflow_refresh_protected_request(self) -> None:
-        request_id = self._preflow_protected_request_id
-        if request_id is None:
-            return
-        request = self.requests.get(request_id)
-        if request is None or request.is_finished():
-            self._preflow_clear_protected_request()
-            return
-        if self._preflow_waiting_queue_for_request(request) is None:
-            self._preflow_clear_protected_request()
-            return
-        if self._is_blocked_waiting_status(request.status):
-            self._preflow_clear_protected_request()
+        self._preflow_fcfs_baseline.pop(request_id, None)
+        self._preflow_deadline.pop(request_id, None)
+        self._preflow_arrival_order.pop(request_id, None)
 
     def _preflow_effective_waiting_order(self) -> list[Request]:
         """Return FCFS waiting order using upstream's two-queue convention."""
         assert self.policy == SchedulingPolicy.FCFS
         return list(itertools.chain(self.skipped_waiting, self.waiting))
 
-    def _preflow_wsrjf_waiting_order(
+    def _preflow_waiting_order(
         self,
         blocked_request_ids: set[str],
+        preferred: Request | None = None,
     ) -> list[Request]:
-        """Return waiting order with unfinished prefills ranked by WSRJF.
-
-        This policy moves PREFLOW's aged WSRJF choice to admission while still
-        preserving vLLM's non-prefill positional slots. The selected request is
-        admitted through the normal copied vLLM admission routine; this changes
-        traversal order, not feasibility.
-        """
-        waiting_order = self._preflow_effective_waiting_order()
-        prioritized_prefills: list[tuple[Request, float]] = []
-        for request in waiting_order:
-            if request.request_id in blocked_request_ids:
-                continue
-            if not self._preflow_has_unfinished_prefill(request):
-                continue
-            priority = self._preflow_priority(request)
-            if priority is not None:
-                prioritized_prefills.append((request, priority))
-
-        if len(prioritized_prefills) <= 1:
-            return [request for request in waiting_order if request.request_id not in blocked_request_ids]
-
-        sorted_prefills = sorted(
-            prioritized_prefills,
-            key=lambda item: (
-                -item[1],
-                item[0].arrival_time,
-                item[0].request_id,
-            ),
-        )
-        preflow_order = iter(request for request, _ in sorted_prefills)
-        prefill_request_ids = {id(request) for request, _ in prioritized_prefills}
-        return [
-            next(preflow_order) if id(request) in prefill_request_ids else request
-            for request in waiting_order
+        """Rank prefills while preserving non-prefill positional slots."""
+        waiting_order = [
+            request
+            for request in self._preflow_effective_waiting_order()
             if request.request_id not in blocked_request_ids
         ]
+        prefills = [request for request in waiting_order if self._preflow_has_unfinished_prefill(request)]
+        prefills.sort(
+            key=lambda request: (
+                request is not preferred,
+                self._preflow_candidate_key(request),
+            )
+        )
+        preflow_order = iter(prefills)
+        prefill_request_ids = {id(request) for request in prefills}
+        return [next(preflow_order) if id(request) in prefill_request_ids else request for request in waiting_order]
 
-    def _preflow_next_wsrjf_waiting_request(
+    def _preflow_next_waiting_request(
         self,
         blocked_request_ids: set[str],
+        token_budget: int,
     ) -> tuple[RequestQueue, Request] | None:
-        for request in self._preflow_wsrjf_waiting_order(blocked_request_ids):
+        waiting_order = self._preflow_waiting_order(blocked_request_ids)
+        actions = [
+            (request, self._preflow_nominal_chunk_work(request, token_budget))
+            for request in waiting_order
+            if self._preflow_has_unfinished_prefill(request) and not self._is_blocked_waiting_status(request.status)
+        ]
+        preferred = self._preflow_select_candidate_action(actions)
+        for request in self._preflow_waiting_order(blocked_request_ids, preferred):
             request_queue = self._preflow_waiting_queue_for_request(request)
             if request_queue is not None:
                 return request_queue, request
@@ -911,21 +888,6 @@ class PREFLOWScheduler(SchedulerInterface):
             if any(queued is request for queued in request_queue):
                 return request_queue
         return None
-
-    def _preflow_protected_request(self) -> tuple[RequestQueue, Request] | None:
-        self._preflow_refresh_protected_request()
-        request_id = self._preflow_protected_request_id
-        if request_id is None:
-            return None
-        request = self.requests.get(request_id)
-        if request is None:
-            self._preflow_clear_protected_request()
-            return None
-        request_queue = self._preflow_waiting_queue_for_request(request)
-        if request_queue is None:
-            self._preflow_clear_protected_request()
-            return None
-        return request_queue, request
 
     @staticmethod
     def _preflow_take_request_from_queue(
@@ -945,137 +907,16 @@ class PREFLOWScheduler(SchedulerInterface):
         request_queue: RequestQueue,
         request: Request,
         state: _PREFLOWWaitingBatchState,
-        mutate_on_skip: bool,
     ) -> str:
-        if mutate_on_skip:
-            request = self._preflow_take_request_from_queue(request_queue, request)
-            state.step_skipped_waiting.prepend_request(request)
-            return "skipped"
-        return "not_feasible"
-
-    def _preflow_snapshot_bypass_probe(
-        self,
-        request: Request,
-    ) -> _PREFLOWBypassProbeSnapshot:
-        request_id = request.request_id
-        prefix_cache_stats = self.kv_cache_manager.prefix_cache_stats
-        connector_prefix_cache_stats = self.connector_prefix_cache_stats
-        return _PREFLOWBypassProbeSnapshot(
-            request_status=request.status,
-            request_num_computed_tokens=request.num_computed_tokens,
-            request_prefill_stats=deepcopy(request.prefill_stats),
-            preflow_age_present=request_id in self._preflow_age,
-            preflow_age=self._preflow_age.get(request_id),
-            preflow_initial_history_present=(request_id in self._preflow_initial_history),
-            preflow_initial_history=self._preflow_initial_history.get(request_id),
-            preflow_initial_history_authoritative=(request_id in self._preflow_initial_history_authoritative),
-            prefix_cache_stats=(replace(prefix_cache_stats) if prefix_cache_stats is not None else None),
-            connector_prefix_cache_stats=(
-                replace(connector_prefix_cache_stats) if connector_prefix_cache_stats is not None else None
-            ),
-            encoder_cache_state=deepcopy(self.encoder_cache_manager.__dict__),
-        )
-
-    def _preflow_restore_bypass_probe(
-        self,
-        request: Request,
-        snapshot: _PREFLOWBypassProbeSnapshot,
-    ) -> None:
-        request_id = request.request_id
-        request.status = snapshot.request_status
-        request.num_computed_tokens = snapshot.request_num_computed_tokens
-        request.prefill_stats = snapshot.request_prefill_stats
-        if snapshot.preflow_age_present:
-            assert snapshot.preflow_age is not None
-            self._preflow_age[request_id] = snapshot.preflow_age
-        else:
-            self._preflow_age.pop(request_id, None)
-        if snapshot.preflow_initial_history_present:
-            assert snapshot.preflow_initial_history is not None
-            self._preflow_initial_history[request_id] = snapshot.preflow_initial_history
-        else:
-            self._preflow_initial_history.pop(request_id, None)
-        if snapshot.preflow_initial_history_authoritative:
-            self._preflow_initial_history_authoritative.add(request_id)
-        else:
-            self._preflow_initial_history_authoritative.discard(request_id)
-        self.kv_cache_manager.prefix_cache_stats = snapshot.prefix_cache_stats
-        self.connector_prefix_cache_stats = snapshot.connector_prefix_cache_stats
-        self.encoder_cache_manager.__dict__.clear()
-        self.encoder_cache_manager.__dict__.update(deepcopy(snapshot.encoder_cache_state))
-
-    def _preflow_can_allocate_slots_for_bypass(
-        self,
-        request: Request,
-        num_new_tokens: int,
-        num_new_computed_tokens: int,
-        new_computed_blocks: KVCacheBlocks,
-        num_lookahead_tokens: int,
-        num_external_computed_tokens: int,
-        num_encoder_tokens: int,
-        reserved_blocks: int,
-        has_scheduled_reqs: bool,
-    ) -> bool:
-        """Non-mutating copy of allocate_slots admission checks for probes.
-
-        Bypass admission still commits through KVCacheManager.allocate_slots();
-        this gate prevents unsuccessful probes from reaching allocator code
-        paths that may mutate skipped-block bookkeeping before returning None.
-        """
-        new_computed_block_list = new_computed_blocks.blocks
-        num_local_computed_tokens = request.num_computed_tokens + num_new_computed_tokens
-        total_computed_tokens = min(
-            num_local_computed_tokens + num_external_computed_tokens,
-            self.max_model_len,
-        )
-
-        watermark_blocks = 0
-        if has_scheduled_reqs and request.status in (
-            RequestStatus.WAITING,
-            RequestStatus.PREEMPTED,
-        ):
-            watermark_blocks = self.kv_cache_manager.watermark_blocks
-
-        full_num_tokens = min(request.num_tokens, self.max_model_len)
-        num_blocks_to_allocate = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
-            request_id=request.request_id,
-            num_tokens=full_num_tokens,
-            new_computed_blocks=new_computed_block_list,
-            num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=total_computed_tokens,
-            num_local_computed_tokens=num_local_computed_tokens,
-            num_tokens_main_model=full_num_tokens,
-            apply_admission_cap=True,
-        )
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > self.kv_cache_manager.block_pool.get_num_free_blocks():
-            return False
-
-        num_tokens_main_model = total_computed_tokens + num_new_tokens
-        num_tokens_need_slot = min(
-            num_tokens_main_model + num_lookahead_tokens,
-            self.max_model_len,
-        )
-        num_blocks_to_allocate = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
-            request_id=request.request_id,
-            num_tokens=num_tokens_need_slot,
-            new_computed_blocks=new_computed_block_list,
-            num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=(num_local_computed_tokens + num_external_computed_tokens),
-            num_local_computed_tokens=num_local_computed_tokens,
-            num_tokens_main_model=num_tokens_main_model,
-        )
-        available_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        return required_blocks <= available_blocks
+        request = self._preflow_take_request_from_queue(request_queue, request)
+        state.step_skipped_waiting.prepend_request(request)
+        return "skipped"
 
     def _preflow_schedule_waiting_request(
         self,
         request_queue: RequestQueue,
         request: Request,
         state: _PREFLOWWaitingBatchState,
-        *,
-        mutate_on_skip: bool = True,
     ) -> str:
         request_id = request.request_id
 
@@ -1090,7 +931,6 @@ class PREFLOWScheduler(SchedulerInterface):
                 request_queue,
                 request,
                 state,
-                mutate_on_skip,
             )
 
         # Check that adding the request still respects the max_loras
@@ -1108,7 +948,6 @@ class PREFLOWScheduler(SchedulerInterface):
                 request_queue,
                 request,
                 state,
-                mutate_on_skip,
             )
 
         num_external_computed_tokens = 0
@@ -1179,7 +1018,6 @@ class PREFLOWScheduler(SchedulerInterface):
                         request_queue,
                         request,
                         state,
-                        mutate_on_skip,
                     )
 
                 num_external_computed_tokens = ext_tokens
@@ -1208,7 +1046,6 @@ class PREFLOWScheduler(SchedulerInterface):
                     request_queue,
                     request,
                     state,
-                    mutate_on_skip,
                 )
 
             # Track first scheduled prefill, not post-preemption repeat prefills
@@ -1320,6 +1157,17 @@ class PREFLOWScheduler(SchedulerInterface):
         ):
             return "blocked"
 
+        prefill_chunk = min(remaining_prefill_tokens, num_new_tokens)
+        if prefill_chunk > 0:
+            chunk_work = self._preflow_chunk_work(num_computed_tokens, prefill_chunk)
+            remaining_work = self._preflow_work(request.num_prompt_tokens) - self._preflow_work(num_computed_tokens)
+            if not self._preflow_chunk_is_safe(
+                request,
+                chunk_work,
+                candidate_remaining_work=remaining_work,
+            ):
+                return "unsafe"
+
         # During async KV load, no forward pass is run yet.
         # Allocate speculative lookahead slots later to avoid
         # mismatching local and remote block counts.
@@ -1338,21 +1186,6 @@ class PREFLOWScheduler(SchedulerInterface):
             # only if it fits in (free - other in-flight reservations), to
             # avoid deadlock and predictable preemptions.
             reserved_blocks = self._inflight_prefill_reserved_blocks()
-
-        if not mutate_on_skip and not self._preflow_can_allocate_slots_for_bypass(
-            request=request,
-            num_new_tokens=num_new_tokens,
-            num_new_computed_tokens=num_new_local_computed_tokens,
-            new_computed_blocks=new_computed_blocks,
-            num_lookahead_tokens=effective_lookahead_tokens,
-            num_external_computed_tokens=num_external_computed_tokens,
-            num_encoder_tokens=num_encoder_tokens,
-            reserved_blocks=reserved_blocks,
-            has_scheduled_reqs=bool(self.running),
-        ):
-            if request.has_encoder_inputs:
-                self.encoder_cache_manager.free(request)
-            return "kv_blocked"
 
         new_blocks = self.kv_cache_manager.allocate_slots(
             request,
@@ -1471,74 +1304,6 @@ class PREFLOWScheduler(SchedulerInterface):
                     self.ec_connector.update_state_after_alloc(request, i)
         return "scheduled"
 
-    def _preflow_waiting_candidates(
-        self,
-        protected_request: Request,
-    ) -> list[tuple[float, int, Request]]:
-        protected_work = self._preflow_total_required_work(protected_request)
-        if protected_work <= _PREFLOW_MIN_WORK:
-            return []
-        candidates: list[tuple[float, int, Request]] = []
-        waiting_order = self._preflow_effective_waiting_order()
-        try:
-            protected_index = next(
-                index
-                for index, request in enumerate(waiting_order)
-                if request.request_id == protected_request.request_id
-            )
-        except StopIteration:
-            return []
-
-        for index, request in enumerate(
-            waiting_order[protected_index + 1 :],
-            start=protected_index + 1,
-        ):
-            if request.request_id == protected_request.request_id:
-                continue
-            if self._is_blocked_waiting_status(request.status):
-                continue
-            request_work = self._preflow_total_required_work(request)
-            if request_work <= _PREFLOW_MIN_WORK:
-                continue
-            debt = request_work / protected_work
-            if self._preflow_protected_debt + debt <= self.preflow_admission_bypass_budget:
-                candidates.append((request_work, index, request))
-        candidates.sort(key=lambda item: (item[0], item[1], item[2].request_id))
-        return candidates
-
-    def _preflow_try_bypass_protected_request(
-        self,
-        protected_request: Request,
-        state: _PREFLOWWaitingBatchState,
-    ) -> bool:
-        protected_work = self._preflow_total_required_work(protected_request)
-        if protected_work <= _PREFLOW_MIN_WORK:
-            return False
-        for request_work, _, request in self._preflow_waiting_candidates(protected_request):
-            if state.token_budget <= 0:
-                return False
-            if len(state.num_scheduled_tokens) >= self.preflow_max_num_batched_seqs:
-                return False
-            num_running = len(self.running) + self.num_waiting_for_streaming_input
-            if num_running >= self.max_num_running_reqs:
-                return False
-            request_queue = self._preflow_waiting_queue_for_request(request)
-            if request_queue is None:
-                continue
-            snapshot = self._preflow_snapshot_bypass_probe(request)
-            result = self._preflow_schedule_waiting_request(
-                request_queue,
-                request,
-                state,
-                mutate_on_skip=False,
-            )
-            if result == "scheduled":
-                debt = request_work / protected_work
-                self._preflow_protected_debt += debt
-                return True
-            self._preflow_restore_bypass_probe(request, snapshot)
-        return False
-
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -1624,7 +1389,6 @@ class PREFLOWScheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
-        preflow_required_work_by_req_id = self._preflow_capture_age_targets()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -1633,8 +1397,8 @@ class PREFLOWScheduler(SchedulerInterface):
         )
 
         # First, schedule the RUNNING requests.
-        self._preflow_order_running_requests()
-        waiting_prefill_owns_next_slot = self._preflow_waiting_prefill_outranks_running()
+        self._preflow_order_running_requests(token_budget)
+        waiting_prefill_owns_next_slot = self._preflow_waiting_prefill_outranks_running(token_budget)
         # The same state is passed to waiting admission below, allowing only
         # eligible waiting micro-prefills to extend a running microbatch.
         prefill_batch_state = _PREFLOWPrefillBatchState()
@@ -1740,6 +1504,13 @@ class PREFLOWScheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            prefill_chunk = min(remaining_prefill_tokens, num_new_tokens)
+            if prefill_chunk > 0:
+                chunk_work = self._preflow_chunk_work(request.num_computed_tokens, prefill_chunk)
+                if not self._preflow_chunk_is_safe(request, chunk_work):
+                    req_index += 1
+                    continue
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -1788,6 +1559,7 @@ class PREFLOWScheduler(SchedulerInterface):
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                self._preflow_log_admission_not_evaluable(request)
                 break
 
             # Schedule the request.
@@ -1873,9 +1645,7 @@ class PREFLOWScheduler(SchedulerInterface):
                 defer_prefills=defer_prefills,
             )
 
-            wsrjf_blocked_request_ids: set[str] = set()
-            if self.preflow_waiting_policy == "wsrjf":
-                self._preflow_clear_protected_request()
+            blocked_request_ids: set[str] = set()
 
             while (
                 (self.waiting or self.skipped_waiting)
@@ -1886,24 +1656,20 @@ class PREFLOWScheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
+                    deadline_requests = self._preflow_deadline_requests()
+                    if deadline_requests:
+                        earliest = min(deadline_requests, key=self._preflow_edf_key)
+                        if self._preflow_waiting_queue_for_request(earliest) is not None:
+                            self._preflow_log_admission_not_evaluable(earliest)
                     break
 
-                if self.preflow_waiting_policy == "wsrjf":
-                    next_waiting = self._preflow_next_wsrjf_waiting_request(wsrjf_blocked_request_ids)
-                    if next_waiting is None:
-                        break
-                    request_queue, request = next_waiting
-                    is_protected_request = False
-                else:
-                    protected = self._preflow_protected_request()
-                    if protected is not None:
-                        request_queue, request = protected
-                        is_protected_request = True
-                    else:
-                        request_queue = self._select_waiting_queue_for_scheduling()
-                        assert request_queue is not None
-                        request = request_queue.peek_request()
-                        is_protected_request = False
+                next_waiting = self._preflow_next_waiting_request(
+                    blocked_request_ids,
+                    token_budget,
+                )
+                if next_waiting is None:
+                    break
+                request_queue, request = next_waiting
                 result = self._preflow_schedule_waiting_request(
                     request_queue,
                     request,
@@ -1912,30 +1678,14 @@ class PREFLOWScheduler(SchedulerInterface):
                 token_budget = waiting_state.token_budget
                 encoder_compute_budget = waiting_state.encoder_compute_budget
                 if result in ("scheduled", "skipped"):
-                    if is_protected_request:
-                        self._preflow_clear_protected_request()
+                    if result == "skipped":
+                        self._preflow_log_admission_not_evaluable(request)
                     continue
-                if result == "kv_blocked":
-                    if self.preflow_waiting_policy == "wsrjf":
-                        wsrjf_blocked_request_ids.add(request.request_id)
-                        continue
-                    if not is_protected_request:
-                        self._preflow_pin_protected_request(
-                            request,
-                            request.num_computed_tokens,
-                        )
-                    if self._preflow_try_bypass_protected_request(
-                        request,
-                        waiting_state,
-                    ):
-                        token_budget = waiting_state.token_budget
-                        encoder_compute_budget = waiting_state.encoder_compute_budget
-                        continue
-                elif result == "blocked" and self.preflow_waiting_policy == "wsrjf":
-                    wsrjf_blocked_request_ids.add(request.request_id)
+                if result in ("kv_blocked", "blocked", "unsafe"):
+                    if result != "unsafe":
+                        self._preflow_log_admission_not_evaluable(request)
+                    blocked_request_ids.add(request.request_id)
                     continue
-                elif is_protected_request:
-                    self._preflow_clear_protected_request()
                 break
 
             # re-queue requests skipped in this pass ahead of older skipped items.
@@ -2048,7 +1798,6 @@ class PREFLOWScheduler(SchedulerInterface):
         self._preflow_remember_batch_work(
             scheduler_output,
             preflow_scheduled_chunks,
-            preflow_required_work_by_req_id,
         )
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -2078,8 +1827,8 @@ class PREFLOWScheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
-        # PREFLOW keeps normalized age and the original authoritative h_0
-        # across preemption; recomputation loss is reflected in R_q instead.
+        # PREFLOW keeps the frozen FCFS contract and original h_0 across
+        # preemption; recomputation loss is reflected in current remaining work.
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.drop_stale_output = drop_stale_output or (
@@ -2404,7 +2153,7 @@ class PREFLOWScheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        self._preflow_apply_batch_age(scheduler_output)
+        self._preflow_apply_completed_batch_work(scheduler_output)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -3184,10 +2933,11 @@ class PREFLOWScheduler(SchedulerInterface):
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
         self._preflow_pending_batch_work.clear()
-        self._preflow_clear_protected_request()
-        self._preflow_age.clear()
         self._preflow_initial_history.clear()
         self._preflow_initial_history_authoritative.clear()
+        self._preflow_fcfs_baseline.clear()
+        self._preflow_deadline.clear()
+        self._preflow_arrival_order.clear()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
