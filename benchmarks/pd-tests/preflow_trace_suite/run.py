@@ -388,8 +388,6 @@ def server_command(
         str(TENSOR_PARALLEL_SIZE),
         "--max-model-len",
         str(MAX_MODEL_LEN),
-        "--chunk-size",
-        str(MAX_NUM_BATCHED_TOKENS),
         "--max-num-batched-tokens",
         str(MAX_NUM_BATCHED_TOKENS),
         "--max-num-seqs",
