@@ -20,7 +20,7 @@ from typing import Any
 
 from vllm.v1.request import Request
 
-from vllm_ascend.core.preflow_scheduler import PREFLOWScheduler
+from vllm_ascend.core.preflow_scheduler import AsyncPREFLOWScheduler, PREFLOWScheduler
 
 
 class _UnshieldedPrefillPolicyMixin:
@@ -195,7 +195,27 @@ class EDFPrefillScheduler(_EDFPolicyMixin, PREFLOWScheduler):
     """Single-request preemptive FCFS-relative EDF baseline."""
 
 
+class AsyncFCFSPrefillScheduler(_FCFSPolicyMixin, AsyncPREFLOWScheduler):
+    """Asynchronous single-request chunked FCFS baseline."""
+
+
+class AsyncSJFPrefillScheduler(_SJFPolicyMixin, AsyncPREFLOWScheduler):
+    """Asynchronous single-request non-preemptive triangular-SJF baseline."""
+
+
+class AsyncSRPTPrefillScheduler(_SRPTPolicyMixin, AsyncPREFLOWScheduler):
+    """Asynchronous single-request preemptive triangular-SRPT baseline."""
+
+
+class AsyncEDFPrefillScheduler(_EDFPolicyMixin, AsyncPREFLOWScheduler):
+    """Asynchronous single-request preemptive FCFS-relative EDF baseline."""
+
+
 __all__ = [
+    "AsyncEDFPrefillScheduler",
+    "AsyncFCFSPrefillScheduler",
+    "AsyncSJFPrefillScheduler",
+    "AsyncSRPTPrefillScheduler",
     "EDFPrefillScheduler",
     "FCFSPrefillScheduler",
     "SJFPrefillScheduler",
