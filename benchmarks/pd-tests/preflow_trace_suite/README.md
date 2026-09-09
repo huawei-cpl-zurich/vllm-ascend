@@ -50,6 +50,12 @@ python run.py
 Use `python run.py --plan` to print the 88-condition plan without needing
 vLLM, the model, or NPUs. `VLLM_BIN` may point to a non-default vLLM executable.
 
+Run `python status.py` at any time for a read-only progress and ETA snapshot.
+It takes one filesystem snapshot from the suite inputs and existing result
+metadata; it never polls the servers, reads their logs, or modifies benchmark
+output. Add `--unfinished` to hide completed conditions, or `--output-root
+PATH` when the run uses a non-default directory.
+
 Results are written to `benchmark_output/`. A condition is complete only when
 its status is `completed`, its `summary.json` exists, and every request
 succeeded. Running `python run.py` again skips those conditions and retries only
