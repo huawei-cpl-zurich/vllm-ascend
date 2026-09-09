@@ -902,6 +902,45 @@ class PREFLOWConfig:
             raise ValueError(f"preflow_config.max_num_batched_seqs must be positive, got {self.max_num_batched_seqs}")
 
 
+class PrefillOnlyConfig:
+    """Configuration for the PrefillOnly paper's scheduling policy.
+
+    The policy is selected only on a PD-disaggregated prefill node
+    (``kv_role="kv_producer"``). It continuously ranks unfinished prefills by
+    the paper's default JCT proxy::
+
+        prompt_tokens - currently_cached_tokens - aging_rate * queue_time
+
+    ``aging_rate`` is the paper's fairness parameter lambda, measured
+    in cache-miss-token score reduction per second. The paper uses ``500`` by
+    default. PrefillOnly schedules one request at a time; batch width is not a
+    configurable part of this policy.
+    """
+
+    _defaults = {
+        "enabled": False,
+        "aging_rate": 500.0,
+    }
+
+    def __init__(self, user_config: dict | None = None):
+        if user_config is None:
+            user_config = {}
+        elif not isinstance(user_config, dict):
+            raise ValueError(f"prefill_only_config must be a dict, got {type(user_config).__name__}.")
+
+        unknown = set(user_config) - set(self._defaults)
+        if unknown:
+            raise ValueError(f"Unknown prefill_only_config keys: {sorted(unknown)}")
+
+        self.enabled = bool(user_config.get("enabled", self._defaults["enabled"]))
+        self.aging_rate = float(user_config.get("aging_rate", self._defaults["aging_rate"]))
+        self._validate_config()
+
+    def _validate_config(self) -> None:
+        if not math.isfinite(self.aging_rate) or self.aging_rate < 0:
+            raise ValueError(f"prefill_only_config.aging_rate must be finite and non-negative, got {self.aging_rate}")
+
+
 class QueueStatsConfig:
     """Configuration for per-iteration scheduler queue-size tracing.
 
@@ -1226,6 +1265,9 @@ class SchedulerConfig:
         )
         self.preflow_config = PREFLOWConfig(
             self._get_config_value(scheduler_config, additional_config, "preflow_config", {})
+        )
+        self.prefill_only_config = PrefillOnlyConfig(
+            self._get_config_value(scheduler_config, additional_config, "prefill_only_config", {})
         )
         self.queue_stats_config = QueueStatsConfig(
             self._get_config_value(scheduler_config, additional_config, "queue_stats_config", {})

@@ -816,7 +816,8 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
 
     Covers the fused-MC2 / hierarchy-communication exclusivity and the scheduler
     extension policies (enable_balance_scheduling / preflow_config /
-    short_request_first_config / dyntra_lb_config / recompute_scheduler_enable).
+    prefill_only_config / short_request_first_config / dyntra_lb_config /
+    recompute_scheduler_enable).
     Reads from the AscendConfig singleton
     initialized from vllm_config; env fallbacks are handled inside AscendConfig.
     """
@@ -850,6 +851,7 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
     _validate_kv_load_failure_policy(vllm_config)
 
     preflow_config = scheduler_extension_config.preflow_config
+    prefill_only_config = scheduler_extension_config.prefill_only_config
     kv_transfer_config = vllm_config.kv_transfer_config
     kv_role = getattr(kv_transfer_config, "kv_role", None)
     enable_preflow_on_prefill = preflow_config.enabled and kv_role == "kv_producer"
@@ -879,9 +881,48 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             raise ValueError(
                 "PREFLOW scheduling cannot be enabled with batch_job_sched_config. Please disable one of them."
             )
+        if prefill_only_config.enabled:
+            raise ValueError(
+                "PREFLOW scheduling cannot be enabled with prefill_only_config. Please disable one of them."
+            )
     elif preflow_config.enabled:
         logger.info(
             "PREFLOW scheduler is enabled but not selected for kv_role=%r; "
+            "it is used only on PD-disaggregated prefill nodes "
+            "(kv_role='kv_producer').",
+            kv_role,
+        )
+
+    enable_prefill_only_on_prefill = prefill_only_config.enabled and kv_role == "kv_producer"
+    if enable_prefill_only_on_prefill:
+        if vllm_config.scheduler_config.policy != "fcfs":
+            raise ValueError(
+                "PrefillOnly scheduling requires scheduler_config.policy='fcfs', "
+                f"but got {vllm_config.scheduler_config.policy!r}."
+            )
+        if scheduler_extension_config.enable_balance_scheduling:
+            raise ValueError(
+                "PrefillOnly scheduling cannot be enabled with balance scheduling. Please disable one of them."
+            )
+        if scheduler_extension_config.short_request_first_config.enabled:
+            raise ValueError(
+                "PrefillOnly scheduling cannot be enabled with short_request_first_config. Please disable one of them."
+            )
+        if scheduler_extension_config.recompute_scheduler_enable:
+            raise ValueError(
+                "PrefillOnly scheduling cannot be enabled with recompute_scheduler_enable. Please disable one of them."
+            )
+        if scheduler_extension_config.profiling_chunk_config.enabled:
+            raise ValueError(
+                "PrefillOnly scheduling cannot be enabled with profiling_chunk_config. Please disable one of them."
+            )
+        if scheduler_extension_config.batch_job_sched_config.enabled:
+            raise ValueError(
+                "PrefillOnly scheduling cannot be enabled with batch_job_sched_config. Please disable one of them."
+            )
+    elif prefill_only_config.enabled:
+        logger.info(
+            "PrefillOnly scheduler is enabled but not selected for kv_role=%r; "
             "it is used only on PD-disaggregated prefill nodes "
             "(kv_role='kv_producer').",
             kv_role,
@@ -1188,6 +1229,7 @@ def _setup_worker_and_scheduler(
     # Select specialized scheduler class
     scheduler_config = ascend_config.scheduler_config
     preflow_config = scheduler_config.preflow_config
+    prefill_only_config = scheduler_config.prefill_only_config
     kv_transfer_config = vllm_config.kv_transfer_config
     kv_role = getattr(kv_transfer_config, "kv_role", None)
     if preflow_config.enabled and kv_role == "kv_producer":
@@ -1195,6 +1237,13 @@ def _setup_worker_and_scheduler(
             vllm_config.scheduler_config.scheduler_cls = "vllm_ascend.core.preflow_scheduler.AsyncPREFLOWScheduler"
         else:
             vllm_config.scheduler_config.scheduler_cls = "vllm_ascend.core.preflow_scheduler.PREFLOWScheduler"
+    elif prefill_only_config.enabled and kv_role == "kv_producer":
+        if vllm_config.scheduler_config.async_scheduling:
+            vllm_config.scheduler_config.scheduler_cls = (
+                "vllm_ascend.core.prefill_only_scheduler.AsyncPrefillOnlyScheduler"
+            )
+        else:
+            vllm_config.scheduler_config.scheduler_cls = "vllm_ascend.core.prefill_only_scheduler.PrefillOnlyScheduler"
 
     if scheduler_config.dyntra_lb_config.enabled and not scheduler_config.recompute_scheduler_enable:
         vllm_config.scheduler_config.scheduler_cls = _get_dyntra_lb_scheduler_cls(

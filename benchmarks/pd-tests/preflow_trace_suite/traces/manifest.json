@@ -1,0 +1,95 @@
+{
+  "description": "Derived traces retain timestamp, input_length, and original row index. Output length and prefix fields are intentionally omitted because this suite disables prefix caching and always requests one output token.",
+  "schema_version": 1,
+  "source_root_at_generation": "/home/m84434548/preflow_traces",
+  "traces": {
+    "mooncake_arxiv": {
+      "derived_relative_path": "traces/mooncake_arxiv.jsonl",
+      "derived_sha256": "db806483ad22409e8772ecfc6336250ad82dba6f5710fafc2683bc252d5e9e3c",
+      "first_timestamp": 0.0,
+      "last_timestamp": 3600000.0,
+      "maximum_input_length": 125546,
+      "minimum_input_length": 890,
+      "rows": 23608,
+      "source_relative_path": "mooncake/mooncake_arxiv_trace.jsonl",
+      "source_sha256": "b434f1816a707f4bac697235588184ebc374c9907cb981bb65fb0643471fe711"
+    },
+    "mooncake_conversation": {
+      "derived_relative_path": "traces/mooncake_conversation.jsonl",
+      "derived_sha256": "02c344411d5ab1d8a2c5c15c38089235a0ffe04baf8540b685539aa1cb2fe10d",
+      "first_timestamp": 0.0,
+      "last_timestamp": 3536999.0,
+      "maximum_input_length": 126195,
+      "minimum_input_length": 891,
+      "rows": 12031,
+      "source_relative_path": "mooncake/conversation_trace.jsonl",
+      "source_sha256": "b8cbb061a85206d729d91cdc2981f43c9e0d99209dce588d3af5f7934408b9df"
+    },
+    "mooncake_synthetic": {
+      "derived_relative_path": "traces/mooncake_synthetic.jsonl",
+      "derived_sha256": "4437ce269655755bfae38ff8246d8a30ab0b4fa192b0d5b0c2b4c1396453458d",
+      "first_timestamp": 0.0,
+      "last_timestamp": 1022025.0,
+      "maximum_input_length": 191378,
+      "minimum_input_length": 13,
+      "rows": 3993,
+      "source_relative_path": "mooncake/synthetic_trace.jsonl",
+      "source_sha256": "bd070915a98fc0ed264d7cfef2ce746002eb3076a695ec31ba2674c0111ec131"
+    },
+    "mooncake_toolagent": {
+      "derived_relative_path": "traces/mooncake_toolagent.jsonl",
+      "derived_sha256": "3bca3289a06d89ceeb2be4887261b48dbeb6025c1242ee726b206984f84b3b9e",
+      "first_timestamp": 0.0,
+      "last_timestamp": 3536999.0,
+      "maximum_input_length": 126195,
+      "minimum_input_length": 891,
+      "rows": 23608,
+      "source_relative_path": "mooncake/toolagent_trace.jsonl",
+      "source_sha256": "48a2db1a13d3bc05e6330140c64f604ba366df20d3c9e128b5c35a01c1fa5f71"
+    },
+    "qwen_coder": {
+      "derived_relative_path": "traces/qwen_coder.jsonl",
+      "derived_sha256": "31f83a3243064bb886a997c2ea42c4dbdecc183ec1403d867b8b6932e1c6e018",
+      "first_timestamp": 0.0,
+      "last_timestamp": 7198.879,
+      "maximum_input_length": 25777,
+      "minimum_input_length": 9,
+      "rows": 43011,
+      "source_relative_path": "qwen-bailian/qwen_coder_blksz_16.jsonl",
+      "source_sha256": "3d74974cebb7bccb69b1ca6ea210a44d9a3033443c0271ed015327284dea1aff"
+    },
+    "qwen_thinking": {
+      "derived_relative_path": "traces/qwen_thinking.jsonl",
+      "derived_sha256": "ba9d4f41ff50ffa25a0e1187ad70dc35cc36af511606c98f9729f3c62f1f5d18",
+      "first_timestamp": 0.0,
+      "last_timestamp": 7191.734,
+      "maximum_input_length": 51622,
+      "minimum_input_length": 11,
+      "rows": 10812,
+      "source_relative_path": "qwen-bailian/qwen_thinking_blksz_16.jsonl",
+      "source_sha256": "41ac36d9d1b54d084eeb6b05e9d142ba9d02f8bf79cfc9fff418d8ab7cdee906"
+    },
+    "qwen_trace_a": {
+      "derived_relative_path": "traces/qwen_trace_a.jsonl",
+      "derived_sha256": "a7f905931de264340c93dfb265af9d1a1f96e3881ca697d12e2cdfa327013370",
+      "first_timestamp": 0.0,
+      "last_timestamp": 7199.464,
+      "maximum_input_length": 89286,
+      "minimum_input_length": 56,
+      "rows": 43058,
+      "source_relative_path": "qwen-bailian/qwen_traceA_blksz_16.jsonl",
+      "source_sha256": "07cedc9ed8aff301994ac68ed4aede8123b7603673575eeba9dd677de663db17"
+    },
+    "qwen_trace_b": {
+      "derived_relative_path": "traces/qwen_trace_b.jsonl",
+      "derived_sha256": "ded59a7b491f2ba211fd6ed5dea3e6f0c60854997a9fcb2ad2cd6b58b01222d2",
+      "first_timestamp": 0.0,
+      "last_timestamp": 7199.97,
+      "maximum_input_length": 66446,
+      "minimum_input_length": 19,
+      "rows": 172800,
+      "source_relative_path": "qwen-bailian/qwen_traceB_blksz_16.jsonl",
+      "source_sha256": "68e3f98e2d601d60d0abf4b89bc8a3654372abab7b1cde6373a13d0054379d59"
+    }
+  }
+}
