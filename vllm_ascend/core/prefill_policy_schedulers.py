@@ -10,7 +10,8 @@ The policies are intended both as experimental baselines and as precise
 ablations of hard PREFLOW:
 
 * FCFS selects the oldest unfinished prefill at every chunk boundary.
-* SJF selects the smallest isolated prefill and locks it until completion.
+* SJF selects the smallest isolated prefill and locks it until its final
+  prefill chunk has been dispatched.
 * SRPT selects the smallest triangular remaining work at every boundary.
 * EDF selects the earliest frozen FCFS-relative deadline at every boundary.
 """
@@ -62,31 +63,47 @@ class _SJFPolicyMixin(_UnshieldedPrefillPolicyMixin):
 
     Physical execution remains chunked. Once the first chunk of a request is
     actually scheduled, the logical lock prevents another prefill from being
-    selected until that request's final prompt chunk has completed.
+    selected until that request's final prompt chunk has been dispatched. In
+    async mode, a later request may then be queued behind that final chunk;
+    FIFO batch execution still preserves non-preemptive SJF service order.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._sjf_locked_request_id: str | None = None
 
-    def _sjf_request_is_active(self, request: Request) -> bool:
-        return self._preflow_has_unfinished_prefill(request) or self._preflow_outstanding_work(request.request_id) > 0
+    def _sjf_active_locked_request(self) -> Request | None:
+        """Return the lock holder while it has undispatched prefill work."""
+        request_id = self._sjf_locked_request_id
+        if request_id is None:
+            return None
+        request = self.requests.get(request_id)
+        if request is None or request.is_finished() or not self._preflow_has_unfinished_prefill(request):
+            self._sjf_locked_request_id = None
+            return None
+        return request
 
     def _sjf_locked_request(
         self,
         actions: Iterable[tuple[Request, float]],
     ) -> Request | None:
-        request_id = self._sjf_locked_request_id
-        if request_id is None:
-            return None
-        request = self.requests.get(request_id)
-        if request is None or request.is_finished() or not self._sjf_request_is_active(request):
-            self._sjf_locked_request_id = None
+        request = self._sjf_active_locked_request()
+        if request is None:
             return None
         return next(
-            (candidate for candidate, _ in actions if candidate.request_id == request_id),
+            (candidate for candidate, _ in actions if candidate.request_id == request.request_id),
             None,
         )
+
+    def _preflow_chunk_is_safe(
+        self,
+        request: Request,
+        chunk_work: float,
+        candidate_remaining_work: float | None = None,
+    ) -> bool:
+        """Prevent a genuine mid-prefill switch away from the SJF lock."""
+        locked = self._sjf_active_locked_request()
+        return locked is None or locked.request_id == request.request_id
 
     def _preflow_candidate_key(self, request: Request) -> tuple[float, int, str]:
         request_id = request.request_id
@@ -126,7 +143,8 @@ class _SJFPolicyMixin(_UnshieldedPrefillPolicyMixin):
             batch_state,
         )
         if min(remaining_prefill_tokens, num_new_tokens) > 0:
-            if self._sjf_locked_request_id not in (None, request_id):
+            locked = self._sjf_active_locked_request()
+            if locked is not None and locked.request_id != request_id:
                 raise AssertionError("SJF scheduled a different prefill while its non-preemptive lock was active")
             self._sjf_locked_request_id = request_id
 

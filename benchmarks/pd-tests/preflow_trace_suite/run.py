@@ -55,6 +55,13 @@ ASYNC_SCHEDULING = True
 STARTUP_TIMEOUT_S = 1_200.0
 SHUTDOWN_TIMEOUT_S = 60.0
 BASE_PORT = 18_000
+STARTUP_LOG_TAIL_BYTES = 128 * 1024
+FATAL_SERVER_MARKERS = (
+    "EngineCore failed to start.",
+    "EngineCore encountered a fatal error.",
+    "EngineDeadError: EngineCore encountered an issue.",
+    "Engine core initialization failed",
+)
 
 
 class SuiteError(RuntimeError):
@@ -408,6 +415,14 @@ def server_command(
     ]
 
 
+def read_log_tail(log_path: Path) -> str:
+    with log_path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - STARTUP_LOG_TAIL_BYTES))
+        return handle.read().decode(encoding="utf-8", errors="replace")
+
+
 def wait_for_health(process: subprocess.Popen[Any], port: int, log_path: Path) -> None:
     pool = urllib3.PoolManager(num_pools=1, maxsize=1)
     deadline = time.monotonic() + STARTUP_TIMEOUT_S
@@ -415,9 +430,12 @@ def wait_for_health(process: subprocess.Popen[Any], port: int, log_path: Path) -
     while time.monotonic() < deadline:
         if STOP_EVENT.is_set():
             raise SuiteError("termination requested")
+        tail = read_log_tail(log_path)
+        if any(marker in tail for marker in FATAL_SERVER_MARKERS):
+            raise SuiteError(f"server reported a fatal startup failure\n{tail}")
         return_code = process.poll()
         if return_code is not None:
-            tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:])
+            tail = "\n".join(tail.splitlines()[-80:])
             raise SuiteError(f"server exited with code {return_code} before health check\n{tail}")
         try:
             response = pool.request(
@@ -493,6 +511,19 @@ class ManagedServer:
             self.log_handle.close()
             self.log_handle = None
 
+    def failure(self) -> str | None:
+        if self.process is None or self.attempt_dir is None:
+            return "server is not running"
+        log_path = self.attempt_dir / "server.log"
+        tail = read_log_tail(log_path)
+        marker = next((item for item in FATAL_SERVER_MARKERS if item in tail), None)
+        if marker is not None:
+            return f"server log contains {marker!r}\n{tail}"
+        return_code = self.process.poll()
+        if return_code is not None:
+            return f"server exited with code {return_code}\n{tail}"
+        return None
+
 
 def client_command(server: ManagedServer, trace: str, result_dir: Path) -> list[str]:
     return [
@@ -523,7 +554,12 @@ def client_command(server: ManagedServer, trace: str, result_dir: Path) -> list[
     ]
 
 
-def run_client(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
+def run_client(
+    command: list[str],
+    log_path: Path,
+    environment: dict[str, str],
+    server: ManagedServer,
+) -> int:
     with log_path.open("w", encoding="utf-8") as log_handle:
         process = subprocess.Popen(
             command,
@@ -539,6 +575,10 @@ def run_client(command: list[str], log_path: Path, environment: dict[str, str]) 
                 if STOP_EVENT.wait(1.0):
                     PROCESS_REGISTRY.terminate(process)
                     raise SuiteError("termination requested")
+                server_failure = server.failure()
+                if server_failure is not None:
+                    PROCESS_REGISTRY.terminate(process)
+                    raise SuiteError(server_failure)
             return int(process.returncode)
         finally:
             PROCESS_REGISTRY.discard(process)
@@ -583,6 +623,7 @@ def execute_trace(output_root: Path, server: ManagedServer, trace: str) -> None:
             command,
             attempt / "client.log",
             child_environment(server.npu_ids),
+            server,
         )
         if return_code != 0:
             raise SuiteError(f"client exited with code {return_code}; see {attempt / 'client.log'}")
