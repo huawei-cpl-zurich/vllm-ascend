@@ -149,7 +149,8 @@ When an FCFS run is available, the same directory also contains paired
 request-level relative-TTFT distributions and a hard-PREFLOW constraint-check
 figure. The latter compares observed wall-clock TTFT with the nominal FCFS
 ratio for each slack setting and reports scheduler warnings where admission
-made the compute-side guarantee non-evaluable. These are empirical diagnostics:
+constraints outside the conservative resident-drain shield made the guarantee
+non-evaluable. These are empirical diagnostics:
 the formal constraint is expressed in triangular-work time, not cross-run
 wall-clock time.
 

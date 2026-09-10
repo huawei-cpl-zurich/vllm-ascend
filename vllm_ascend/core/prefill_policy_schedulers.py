@@ -36,8 +36,20 @@ class _UnshieldedPrefillPolicyMixin:
         return True
 
     def _preflow_log_admission_not_evaluable(self, request: Request) -> None:
-        # Only hard PREFLOW makes a compute-side deadline guarantee.
+        # Only hard PREFLOW makes an FCFS-relative deadline guarantee.
         return None
+
+    def _preflow_admission_action_is_safe(
+        self,
+        request: Request,
+        chunk_work: float,
+        *,
+        admission: bool,
+        candidate_remaining_work: float | None = None,
+    ) -> bool:
+        # Experimental baselines preserve vLLM admission without PREFLOW's
+        # resident-drain protection.
+        return True
 
 
 class _FCFSPolicyMixin(_UnshieldedPrefillPolicyMixin):

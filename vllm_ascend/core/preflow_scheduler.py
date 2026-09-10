@@ -611,6 +611,16 @@ class PREFLOWScheduler(SchedulerInterface):
         """
         return self._preflow_remaining_work(request) + self._preflow_outstanding_work(request.request_id)
 
+    def _preflow_virtual_service_clock(self) -> float:
+        """Return service time at the boundary where a new action can run.
+
+        Async scheduling may choose another chunk before older dispatched
+        batches complete. Those batches are irrevocably ahead of the new
+        action, so feasibility must project through all of their work without
+        counting it as completed service in ``_preflow_service_clock``.
+        """
+        return self._preflow_service_clock + self._preflow_outstanding_work()
+
     def _preflow_deadline_requests(self) -> list[Request]:
         requests: list[Request] = []
         for request in self.requests.values():
@@ -622,8 +632,12 @@ class PREFLOWScheduler(SchedulerInterface):
 
     def _preflow_candidate_key(self, request: Request) -> tuple[float, float, int, str]:
         request_id = request.request_id
+        isolated_work = self._preflow_total_required_work(request)
+        # A newly selected action runs after all dispatched batches. Rank it
+        # using the work that will remain at that virtual boundary.
+        remaining_work = self._preflow_remaining_work(request)
         return (
-            self._preflow_logical_remaining_work(request),
+            isolated_work * remaining_work,
             self._preflow_deadline[request_id],
             self._preflow_arrival_order[request_id],
             request_id,
@@ -642,8 +656,9 @@ class PREFLOWScheduler(SchedulerInterface):
         if deadline_requests and request is min(deadline_requests, key=self._preflow_edf_key):
             logger.warning_once(
                 "PREFLOW's earliest-deadline request %s was not legal under "
-                "existing admission constraints; the compute-side "
-                "FCFS-inflation guarantee is not evaluable for this decision.",
+                "an admission constraint outside the conservative resident-"
+                "drain shield; the FCFS-inflation guarantee is not evaluable "
+                "for this decision.",
                 request.request_id,
             )
 
@@ -660,7 +675,17 @@ class PREFLOWScheduler(SchedulerInterface):
         if chunk_work <= _PREFLOW_MIN_WORK:
             return True
 
-        edf_requests = sorted(self._preflow_deadline_requests(), key=self._preflow_edf_key)
+        # A new async action runs only after every already-dispatched batch.
+        # Requests whose entire remaining prefill is in those batches complete
+        # before this action and therefore cannot be delayed by it.
+        edf_requests = sorted(
+            (
+                item
+                for item in self._preflow_deadline_requests()
+                if self._preflow_remaining_work(item) > _PREFLOW_MIN_WORK or item.request_id == request.request_id
+            ),
+            key=self._preflow_edf_key,
+        )
         try:
             candidate_position = next(
                 index for index, item in enumerate(edf_requests) if item.request_id == request.request_id
@@ -668,29 +693,136 @@ class PREFLOWScheduler(SchedulerInterface):
         except StopIteration:
             return False
 
-        # Pending work for a request no longer represented in the deadline set
-        # (for example, an aborted in-flight request) is already committed and
-        # delays every EDF prefix.
-        represented_outstanding = sum(self._preflow_outstanding_work(item.request_id) for item in edf_requests)
-        committed_work = max(0.0, self._preflow_outstanding_work() - represented_outstanding)
         prefix_work = 0.0
         minimum_slack = float("inf")
         for index, item in enumerate(edf_requests):
-            remaining_work = self._preflow_logical_remaining_work(item)
+            remaining_work = self._preflow_remaining_work(item)
             if item is request and candidate_remaining_work is not None:
-                remaining_work = candidate_remaining_work + self._preflow_outstanding_work(item.request_id)
+                remaining_work = candidate_remaining_work
             prefix_work += remaining_work
             if index >= candidate_position:
                 break
-            slack = self._preflow_deadline[item.request_id] - self._preflow_service_clock - committed_work - prefix_work
+            slack = self._preflow_deadline[item.request_id] - self._preflow_virtual_service_clock() - prefix_work
             minimum_slack = min(minimum_slack, slack)
         return chunk_work <= minimum_slack
+
+    def _preflow_pending_deadline_requests(
+        self,
+        excluded_request_id: str | None = None,
+    ) -> list[Request]:
+        """Return unfinished prefills that do not currently own a run slot."""
+        pending_ids = {
+            request.request_id
+            for request in itertools.chain(
+                self.skipped_waiting,
+                self.waiting,
+            )
+        }
+        resident_ids = {request.request_id for request in self._inflight_prefills}
+        return [
+            request
+            for request in self._preflow_deadline_requests()
+            if request.request_id != excluded_request_id
+            and request.request_id in pending_ids
+            and request.request_id not in resident_ids
+        ]
+
+    def _preflow_resident_drain_work_after_action(
+        self,
+        request: Request,
+        chunk_work: float,
+        *,
+        admission: bool,
+        candidate_remaining_work: float | None = None,
+    ) -> float:
+        """Conservative work envelope for releasing a resident slot.
+
+        All resident prefill work is a valid upper bound: completing it must
+        release a slot, while any earlier completion permits admission sooner.
+        The candidate action is projected to completion so advancing any
+        resident prefill decreases the drain envelope by exactly the same work
+        by which it advances the logical service clock.
+        """
+        drain_work = 0.0
+        resident_ids: set[str] = set()
+        for resident in self.running:
+            resident_id = resident.request_id
+            resident_ids.add(resident_id)
+            if resident_id not in self._preflow_deadline or resident.is_finished():
+                continue
+            remaining_work = self._preflow_remaining_work(resident)
+            if resident is request and not admission:
+                remaining_work = max(0.0, remaining_work - chunk_work)
+            drain_work += remaining_work
+
+        # Async KV loads retain a model-runner slot and KV allocation outside
+        # `running`. Include their modeled prefill work when it is available.
+        for resident in self._inflight_prefills:
+            resident_id = resident.request_id
+            if resident_id in resident_ids or resident_id not in self._preflow_deadline or resident.is_finished():
+                continue
+            resident_ids.add(resident_id)
+            drain_work += self._preflow_remaining_work(resident)
+
+        if admission:
+            remaining_work = (
+                self._preflow_remaining_work(request) if candidate_remaining_work is None else candidate_remaining_work
+            )
+            drain_work += max(0.0, remaining_work - chunk_work)
+
+        return drain_work
+
+    def _preflow_admission_action_is_safe(
+        self,
+        request: Request,
+        chunk_work: float,
+        *,
+        admission: bool,
+        candidate_remaining_work: float | None = None,
+    ) -> bool:
+        """Check the paper's conservative resident-drain obligation.
+
+        A pending request blocked by the resident limit reserves enough time
+        to drain all resident prefill work and then execute itself. Admission
+        actions are checked in their successor state so younger work cannot
+        consume a slot that an older fixed deadline needs.
+        """
+        pending = self._preflow_pending_deadline_requests(
+            request.request_id if admission else None,
+        )
+        if not pending:
+            return True
+
+        # Do not predict whether a queue slot or enough KV blocks will become
+        # available early. Charge every still-pending request for the
+        # conservative witness in which all resident prefills drain first.
+        # Existing vLLM admission remains responsible for testing the actual
+        # max-num-seqs and full-ISL KV conditions.
+        drain_work = self._preflow_resident_drain_work_after_action(
+            request,
+            chunk_work,
+            admission=admission,
+            candidate_remaining_work=candidate_remaining_work,
+        )
+
+        successor_clock = self._preflow_virtual_service_clock() + chunk_work
+        pending_prefix_work = 0.0
+        for pending_request in sorted(pending, key=self._preflow_edf_key):
+            pending_prefix_work += self._preflow_remaining_work(
+                pending_request,
+            )
+            admission_slack = (
+                self._preflow_deadline[pending_request.request_id] - successor_clock - drain_work - pending_prefix_work
+            )
+            if admission_slack < -_PREFLOW_MIN_WORK:
+                return False
+        return True
 
     def _preflow_select_candidate_action(
         self,
         actions: Iterable[tuple[Request, float]],
     ) -> Request | None:
-        """Select the first safe SRW action, or the EDF rescue action."""
+        """Select the first safe weighted-stretch action, or EDF rescue."""
         candidates = sorted(actions, key=lambda item: self._preflow_candidate_key(item[0]))
         for request, chunk_work in candidates:
             if self._preflow_chunk_is_safe(request, chunk_work):
@@ -722,16 +854,41 @@ class PREFLOWScheduler(SchedulerInterface):
         return self._preflow_chunk_work(history, prefill_chunk)
 
     def _preflow_preferred_request(self, token_budget: int) -> Request | None:
-        actions = []
+        actions: list[tuple[Request, float]] = []
+        num_running = len(self.running) + self.num_waiting_for_streaming_input
+        waiting_ids = {
+            request.request_id
+            for request in itertools.chain(
+                self.skipped_waiting,
+                self.waiting,
+            )
+        }
         for request in self.requests.values():
             if request.is_finished() or not self._preflow_has_unfinished_prefill(request):
                 continue
             if self._is_blocked_waiting_status(request.status):
                 continue
+            waiting = request.request_id in waiting_ids
+            if waiting and num_running >= self.max_num_running_reqs:
+                continue
             chunk_work = self._preflow_nominal_chunk_work(request, token_budget)
             if chunk_work > _PREFLOW_MIN_WORK:
                 actions.append((request, chunk_work))
-        return self._preflow_select_candidate_action(actions)
+        while actions:
+            preferred = self._preflow_select_candidate_action(actions)
+            if preferred is None:
+                return None
+            if preferred.request_id not in waiting_ids:
+                return preferred
+            chunk_work = next(chunk_work for request, chunk_work in actions if request is preferred)
+            if self._preflow_admission_action_is_safe(
+                preferred,
+                chunk_work,
+                admission=True,
+            ):
+                return preferred
+            actions = [action for action in actions if action[0] is not preferred]
+        return None
 
     def _preflow_order_running_requests(self, token_budget: int) -> None:
         """Order running prefills by the hard-constraint candidate policy."""
@@ -868,12 +1025,31 @@ class PREFLOWScheduler(SchedulerInterface):
         token_budget: int,
     ) -> tuple[RequestQueue, Request] | None:
         waiting_order = self._preflow_waiting_order(blocked_request_ids)
-        actions = [
+        remaining_actions = [
             (request, self._preflow_nominal_chunk_work(request, token_budget))
             for request in waiting_order
             if self._preflow_has_unfinished_prefill(request) and not self._is_blocked_waiting_status(request.status)
         ]
-        preferred = self._preflow_select_candidate_action(actions)
+        preferred = None
+        while remaining_actions:
+            preferred = self._preflow_select_candidate_action(remaining_actions)
+            if preferred is None:
+                break
+            chunk_work = next(chunk_work for request, chunk_work in remaining_actions if request is preferred)
+            if self._preflow_admission_action_is_safe(
+                preferred,
+                chunk_work,
+                admission=True,
+            ):
+                break
+            remaining_actions = [action for action in remaining_actions if action[0] is not preferred]
+            preferred = None
+        has_schedulable_prefill = any(
+            self._preflow_has_unfinished_prefill(request) and not self._is_blocked_waiting_status(request.status)
+            for request in waiting_order
+        )
+        if has_schedulable_prefill and preferred is None:
+            return None
         for request in self._preflow_waiting_order(blocked_request_ids, preferred):
             request_queue = self._preflow_waiting_queue_for_request(request)
             if request_queue is not None:
@@ -1164,6 +1340,13 @@ class PREFLOWScheduler(SchedulerInterface):
             if not self._preflow_chunk_is_safe(
                 request,
                 chunk_work,
+                candidate_remaining_work=remaining_work,
+            ):
+                return "unsafe"
+            if not self._preflow_admission_action_is_safe(
+                request,
+                chunk_work,
+                admission=True,
                 candidate_remaining_work=remaining_work,
             ):
                 return "unsafe"
@@ -1507,7 +1690,14 @@ class PREFLOWScheduler(SchedulerInterface):
             prefill_chunk = min(remaining_prefill_tokens, num_new_tokens)
             if prefill_chunk > 0:
                 chunk_work = self._preflow_chunk_work(request.num_computed_tokens, prefill_chunk)
-                if not self._preflow_chunk_is_safe(request, chunk_work):
+                if not self._preflow_chunk_is_safe(
+                    request,
+                    chunk_work,
+                ) or not self._preflow_admission_action_is_safe(
+                    request,
+                    chunk_work,
+                    admission=False,
+                ):
                     req_index += 1
                     continue
 
@@ -1656,11 +1846,6 @@ class PREFLOWScheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
-                    deadline_requests = self._preflow_deadline_requests()
-                    if deadline_requests:
-                        earliest = min(deadline_requests, key=self._preflow_edf_key)
-                        if self._preflow_waiting_queue_for_request(earliest) is not None:
-                            self._preflow_log_admission_not_evaluable(earliest)
                     break
 
                 next_waiting = self._preflow_next_waiting_request(
