@@ -58,9 +58,37 @@ PATH` when the run uses a non-default directory.
 
 Results are written to `benchmark_output/`. A condition is complete only when
 its status is `completed`, its `summary.json` exists, and every request
-succeeded. Running `python run.py` again skips those conditions and retries only
-missing or failed work. Each retry gets a new `attempt-NNN` directory, so failed
-logs are retained.
+succeeded. It must also use the current replay-client protocol and pass the
+arrival-fidelity check described below. Running `python run.py` again skips
+those conditions and retries only missing, failed, stale, or transport-invalid
+work. Each retry gets a new `attempt-NNN` directory, so failed logs are
+retained. Results produced by the former 128-connection client are deliberately
+stale and will be rerun once with the new client.
+
+## Open-loop replay client
+
+The replay client uses one asynchronous `aiohttp` session with no connector or
+per-host concurrency limit. It creates each request task at the start of the
+campaign and sleeps it until its trace timestamp; there is no 128-request
+semaphore or thread pool in front of the server. Prompt token arrays and JSON
+bodies are prepared before the timed replay so serialization of a long prompt
+cannot delay other arrivals. Individual responses have no read timeout because
+long scheduler queues are a valid measurement; a six-hour whole-campaign
+watchdog still detects a genuinely wedged run, while `run.py` independently
+terminates the client if its vLLM server dies.
+
+Completed request rows are flushed incrementally to
+`requests.partial.jsonl`. A successful campaign atomically publishes the
+source-ordered `requests.jsonl` and removes the partial file. If the campaign
+watchdog fires, the partial file is retained for diagnosis but the condition is
+not considered complete.
+
+Every result records both coroutine wake-up lag and actual HTTP dispatch lag
+relative to the requested trace timestamp. The condition fails when p99 HTTP
+dispatch lag exceeds one second. This validates the client-side arrival path;
+it does not claim to measure the server's internal admission timestamp. The
+client checks and, when permitted, raises its soft file-descriptor limit before
+replay because all queued HTTP responses are allowed to remain outstanding.
 
 ## Extend the suite without repeating completed work
 
@@ -97,10 +125,38 @@ After a complete run, `run.py` invokes `analyze_results.py` to produce
 request IDs across policies; they are empirical wall-clock comparisons, not
 the hard scheduler's formal triangular-work guarantee.
 
+Partial campaigns can be audited and rendered without changing raw benchmark
+artifacts:
+
+```bash
+python plot_preliminary.py
+```
+
+The command writes CSVs, an integrity report, and PNG figures under
+`benchmark_output/preliminary_analysis/`. Runs with a small number of dropped
+connections are marked and shown only as preliminary data; timeout-censored or
+malformed runs are excluded from performance plots. Both analysis commands
+relocate recorded result paths by attempt name, so an output tree copied from
+the NPU host remains analyzable.
+
+The `preliminary_analysis/per_trace/` figures overlay the available policies
+for each trace. Every figure shows the empirical TTFT CDF, complementary CDF,
+and inverse CDF (quantile function); the inverse-CDF axis expands the upper
+percentiles through p99.9. Exact plotted quantiles are also exported to
+`preliminary_analysis/ttft_quantiles.csv`.
+
+When an FCFS run is available, the same directory also contains paired
+request-level relative-TTFT distributions and a hard-PREFLOW constraint-check
+figure. The latter compares observed wall-clock TTFT with the nominal FCFS
+ratio for each slack setting and reports scheduler warnings where admission
+made the compute-side guarantee non-evaluable. These are empirical diagnostics:
+the formal constraint is expressed in triangular-work time, not cross-run
+wall-clock time.
+
 `run_index.csv` is refreshed during the campaign. Each result contains:
 
 - per-request scheduled and actual arrival times, TTFT, completion latency,
-  prompt serialization time, prompt length, and calibrated work;
+  pre-replay prompt serialization time, prompt length, and calibrated work;
 - a summary with TTFT and client-lag distributions;
 - server queue/KV metric samples;
 - the exact selected trace window and arrival stretch;

@@ -12,10 +12,10 @@ import json
 import math
 import os
 import re
+import resource
 import statistics
 import time
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -23,6 +23,13 @@ from typing import Any
 from urllib.parse import urljoin
 
 import urllib3
+
+CLIENT_PROTOCOL_VERSION = 2
+UNBOUNDED_CONNECTION_LIMIT = 0
+RESULT_FLUSH_INTERVAL = 16
+DEFAULT_CAMPAIGN_TIMEOUT_S = 6 * 60 * 60
+DEFAULT_WARMUP_TIMEOUT_S = 15 * 60
+DEFAULT_MAX_P99_DISPATCH_LAG_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,13 @@ class TraceRequest:
     @property
     def request_id(self) -> str:
         return f"{self.trace_name}-{self.source_index:08d}"
+
+
+@dataclass(frozen=True)
+class PreparedTraceRequest:
+    request: TraceRequest
+    body: bytes
+    preparation_s: float
 
 
 @dataclass(frozen=True)
@@ -235,6 +249,60 @@ def deterministic_prompt(request: TraceRequest) -> list[int]:
     return [1_000 + ((offset + position * 15_485_863) % 29_000) for position in range(request.prompt_tokens)]
 
 
+def prepare_request(request: TraceRequest, model: str) -> PreparedTraceRequest:
+    """Build the request body before the timed replay begins.
+
+    Constructing long token arrays or serializing their JSON on the event loop
+    would delay unrelated arrivals. Keeping this work outside the replay makes
+    the measured dispatch lag describe transport scheduling rather than prompt
+    construction.
+    """
+    started = time.perf_counter()
+    body = json.dumps(
+        {
+            "model": model,
+            "prompt": deterministic_prompt(request),
+            "max_tokens": 1,
+            "min_tokens": 1,
+            "temperature": 0.0,
+            "ignore_eos": True,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "seed": request.source_index % (2**31 - 1),
+        },
+        separators=(",", ":"),
+    ).encode()
+    return PreparedTraceRequest(
+        request=request,
+        body=body,
+        preparation_s=time.perf_counter() - started,
+    )
+
+
+def ensure_file_descriptor_capacity(request_count: int) -> dict[str, int | str]:
+    """Ensure the unbounded connector can keep every request outstanding."""
+    margin = 512
+    required = request_count + margin
+    soft_before, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    soft_after = soft_before
+    if soft_before != resource.RLIM_INFINITY and soft_before < required:
+        target = required if hard == resource.RLIM_INFINITY else min(required, hard)
+        if target > soft_before:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            soft_after = target
+    if soft_after != resource.RLIM_INFINITY and soft_after < required:
+        raise RuntimeError(
+            f"open-file limit {soft_after} is too small for {request_count} unbounded requests; "
+            f"raise 'ulimit -n' to at least {required}"
+        )
+    return {
+        "required": required,
+        "soft_before": "unlimited" if soft_before == resource.RLIM_INFINITY else int(soft_before),
+        "soft_after": "unlimited" if soft_after == resource.RLIM_INFINITY else int(soft_after),
+        "hard": "unlimited" if hard == resource.RLIM_INFINITY else int(hard),
+    }
+
+
 def read_sse_event(line: bytes) -> dict[str, Any] | None:
     stripped = line.strip()
     if not stripped.startswith(b"data:"):
@@ -249,88 +317,74 @@ def read_sse_event(line: bytes) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def send_request(
-    pool: urllib3.PoolManager,
+async def send_request(
+    session: Any,
     url: str,
-    model: str,
-    request: TraceRequest,
+    prepared: PreparedTraceRequest,
     benchmark_start: float,
-    timeout: urllib3.Timeout,
+    task_wakeup: float,
 ) -> dict[str, Any]:
-    worker_start = time.perf_counter()
-    response = None
+    request = prepared.request
+    request_start = time.perf_counter()
+    response_headers: float | None = None
     first_token: float | None = None
     completed: float | None = None
+    trace_timing: dict[str, float] = {}
     usage: dict[str, Any] = {}
     status = 0
     error = ""
     try:
-        body = json.dumps(
-            {
-                "model": model,
-                "prompt": deterministic_prompt(request),
-                "max_tokens": 1,
-                "min_tokens": 1,
-                "temperature": 0.0,
-                "ignore_eos": True,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-                "seed": request.source_index % (2**31 - 1),
-            },
-            separators=(",", ":"),
-        ).encode()
-        request_start = time.perf_counter()
-        response = pool.request(
-            "POST",
+        async with session.post(
             url,
-            body=body,
+            data=prepared.body,
             headers={
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
                 "X-Request-ID": request.request_id,
             },
-            timeout=timeout,
-            retries=False,
-            preload_content=False,
-        )
-        status = int(response.status)
-        if not 200 <= status < 300:
-            message = response.read(16_384).decode(errors="replace")
-            raise RuntimeError(f"HTTP {status}: {message}")
-        buffer = b""
-        for chunk in response.stream(amt=65_536, decode_content=True):
-            buffer += chunk
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                event = read_sse_event(line)
-                if event is None:
-                    continue
-                if isinstance(event.get("usage"), dict):
-                    usage = event["usage"]
-                choices = event.get("choices") or []
-                if choices and first_token is None:
-                    first_token = time.perf_counter()
-        completed = time.perf_counter()
-        if first_token is None:
-            raise RuntimeError("stream ended without an observable completion event")
+            trace_request_ctx=trace_timing,
+        ) as response:
+            response_headers = time.perf_counter()
+            status = int(response.status)
+            if not 200 <= status < 300:
+                message = (await response.content.read(16_384)).decode(errors="replace")
+                raise RuntimeError(f"HTTP {status}: {message}")
+            buffer = b""
+            async for chunk in response.content.iter_chunked(65_536):
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    event = read_sse_event(line)
+                    if event is None:
+                        continue
+                    if isinstance(event.get("usage"), dict):
+                        usage = event["usage"]
+                    choices = event.get("choices") or []
+                    if choices and first_token is None:
+                        first_token = time.perf_counter()
+            completed = time.perf_counter()
+            if first_token is None:
+                raise RuntimeError("stream ended without an observable completion event")
     except Exception as exception:  # noqa: BLE001 - persisted per request.
-        request_start = locals().get("request_start", time.perf_counter())
         completed = time.perf_counter()
         error = f"{exception.__class__.__name__}: {exception}"
-    finally:
-        if response is not None:
-            response.release_conn()
     scheduled_absolute = benchmark_start + request.scheduled_offset_s
+    transport_dispatch = trace_timing.get("headers_sent")
     return {
         **asdict(request),
         "request_id": request.request_id,
-        "worker_start_offset_s": worker_start - benchmark_start,
+        "worker_start_offset_s": task_wakeup - benchmark_start,
         "request_start_offset_s": request_start - benchmark_start,
+        "transport_dispatch_offset_s": (None if transport_dispatch is None else transport_dispatch - benchmark_start),
+        "response_headers_offset_s": (None if response_headers is None else response_headers - benchmark_start),
         "first_token_offset_s": None if first_token is None else first_token - benchmark_start,
         "completion_offset_s": None if completed is None else completed - benchmark_start,
-        "client_dispatch_lag_s": request_start - scheduled_absolute,
-        "prompt_serialization_s": request_start - worker_start,
+        "client_submit_lag_s": request_start - scheduled_absolute,
+        "client_dispatch_lag_s": (None if transport_dispatch is None else transport_dispatch - scheduled_absolute),
+        "client_task_wakeup_lag_s": task_wakeup - scheduled_absolute,
+        "prompt_serialization_s": prepared.preparation_s,
         "ttft_s": None if first_token is None else first_token - request_start,
+        "scheduled_ttft_s": None if first_token is None else first_token - scheduled_absolute,
         "e2e_s": None if completed is None else completed - request_start,
         "http_status": status,
         "success": not error,
@@ -407,18 +461,50 @@ async def collect_metrics(
     return {"samples": samples, "errors": errors, "maxima": maxima}
 
 
-def warmup(pool: urllib3.PoolManager, url: str, model: str) -> None:
+async def warmup(session: Any, url: str, model: str) -> None:
     request = TraceRequest("warmup", 0, 0.0, 2_048, 0.0, 0.0)
-    result = send_request(
-        pool,
+    started = time.perf_counter()
+    result = await send_request(
+        session,
         url,
-        model,
-        request,
-        time.perf_counter(),
-        urllib3.Timeout(connect=30.0, read=900.0),
+        prepare_request(request, model),
+        started,
+        started,
     )
     if not result["success"]:
         raise RuntimeError(f"warmup failed: {result['error']}")
+
+
+async def collect_results_incrementally(
+    tasks: list[asyncio.Task[dict[str, Any]]],
+    partial_path: Path,
+) -> list[dict[str, Any]]:
+    results = []
+    with partial_path.open("w", encoding="utf-8") as handle:
+        for index, completed_task in enumerate(asyncio.as_completed(tasks), 1):
+            row = await completed_task
+            results.append(row)
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+            if index % RESULT_FLUSH_INTERVAL == 0:
+                handle.flush()
+        handle.flush()
+    return results
+
+
+def finalize_request_results(
+    output_dir: Path,
+    partial_path: Path,
+    results: list[dict[str, Any]],
+) -> Path:
+    results.sort(key=lambda row: int(row["source_index"]))
+    result_path = output_dir / "requests.jsonl"
+    temporary = result_path.with_name(f".{result_path.name}.tmp-{os.getpid()}")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for row in results:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    temporary.replace(result_path)
+    partial_path.unlink(missing_ok=True)
+    return result_path
 
 
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
@@ -447,66 +533,129 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         },
     )
 
-    request_pool = urllib3.PoolManager(
-        num_pools=args.max_connections,
-        maxsize=args.max_connections,
-        block=True,
-    )
+    try:
+        import aiohttp
+    except ImportError as error:
+        raise RuntimeError("aiohttp is required for unbounded asynchronous trace replay") from error
+
+    file_descriptor_limits = ensure_file_descriptor_capacity(len(requests))
+    preparation_started = time.perf_counter()
+    prepared_requests = [prepare_request(request, args.model) for request in requests]
+    preparation_wall_time_s = time.perf_counter() - preparation_started
+    prepared_body_bytes = sum(len(prepared.body) for prepared in prepared_requests)
+
     metrics_pool = urllib3.PoolManager(num_pools=1, maxsize=1, block=True)
     completion_url = urljoin(args.base_url.rstrip("/") + "/", "v1/completions")
     metrics_url = urljoin(args.base_url.rstrip("/") + "/", "metrics")
-    await asyncio.to_thread(warmup, request_pool, completion_url, args.model)
-
-    loop = asyncio.get_running_loop()
-    executor = ThreadPoolExecutor(max_workers=args.max_connections)
-    semaphore = asyncio.Semaphore(args.max_connections)
-    stop_metrics = asyncio.Event()
-    benchmark_start = time.perf_counter() + 1.0
-    metrics_task = asyncio.create_task(
-        collect_metrics(
-            metrics_pool,
-            metrics_url,
-            benchmark_start,
-            stop_metrics,
-            args.output_dir / "metrics.csv",
-        )
+    connector = aiohttp.TCPConnector(
+        limit=UNBOUNDED_CONNECTION_LIMIT,
+        limit_per_host=UNBOUNDED_CONNECTION_LIMIT,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        keepalive_timeout=60,
+        enable_cleanup_closed=True,
+        force_close=False,
     )
-    timeout = urllib3.Timeout(connect=30.0, read=args.request_timeout_s)
+    client_timeout = aiohttp.ClientTimeout(
+        total=None,
+        connect=None,
+        sock_connect=None,
+        sock_read=None,
+    )
+    trace_config = aiohttp.TraceConfig()
 
-    async def issue(request: TraceRequest) -> dict[str, Any]:
-        delay = benchmark_start + request.scheduled_offset_s - time.perf_counter()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        async with semaphore:
-            return await loop.run_in_executor(
-                executor,
-                send_request,
-                request_pool,
+    async def record_headers_sent(_: Any, context: Any, __: Any) -> None:
+        context.trace_request_ctx["headers_sent"] = time.perf_counter()
+
+    trace_config.on_request_headers_sent.append(record_headers_sent)
+    partial_path = args.output_dir / "requests.partial.jsonl"
+    async with aiohttp.ClientSession(
+        connector=connector,
+        trust_env=False,
+        timeout=client_timeout,
+        trace_configs=[trace_config],
+    ) as session:
+        try:
+            await asyncio.wait_for(
+                warmup(session, completion_url, args.model),
+                timeout=args.warmup_timeout_s,
+            )
+        except TimeoutError as error:
+            raise RuntimeError(f"warmup exceeded {args.warmup_timeout_s:g} seconds") from error
+
+        start_gate = asyncio.Event()
+        benchmark_start = 0.0
+
+        async def issue(prepared: PreparedTraceRequest) -> dict[str, Any]:
+            await start_gate.wait()
+            scheduled_absolute = benchmark_start + prepared.request.scheduled_offset_s
+            delay = scheduled_absolute - time.perf_counter()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            task_wakeup = time.perf_counter()
+            return await send_request(
+                session,
                 completion_url,
-                args.model,
-                request,
+                prepared,
                 benchmark_start,
-                timeout,
+                task_wakeup,
             )
 
-    try:
-        results = await asyncio.gather(*(issue(request) for request in requests))
-    finally:
-        stop_metrics.set()
-        metrics_summary = await metrics_task
-        executor.shutdown(wait=True, cancel_futures=False)
+        tasks = [
+            asyncio.create_task(issue(prepared), name=f"trace-{prepared.request.request_id}")
+            for prepared in prepared_requests
+        ]
+        # Let every request task reach the gate before starting the trace clock.
+        # This keeps task-creation time out of the first arrivals on large runs.
+        await asyncio.sleep(0)
+        benchmark_start = time.perf_counter() + 1.0
+        stop_metrics = asyncio.Event()
+        metrics_task = asyncio.create_task(
+            collect_metrics(
+                metrics_pool,
+                metrics_url,
+                benchmark_start,
+                stop_metrics,
+                args.output_dir / "metrics.csv",
+            )
+        )
+        start_gate.set()
+        try:
+            results = await asyncio.wait_for(
+                collect_results_incrementally(tasks, partial_path),
+                timeout=args.campaign_timeout_s,
+            )
+        except TimeoutError as error:
+            raise RuntimeError(
+                f"trace replay exceeded the {args.campaign_timeout_s:g}-second campaign watchdog; "
+                f"completed rows remain in {partial_path}"
+            ) from error
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            stop_metrics.set()
+            metrics_summary = await metrics_task
 
-    results.sort(key=lambda row: int(row["source_index"]))
-    result_path = args.output_dir / "requests.jsonl"
-    with result_path.open("w", encoding="utf-8") as handle:
-        for row in results:
-            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    finalize_request_results(args.output_dir, partial_path, results)
     successes = [row for row in results if row["success"]]
     completion_tokens = [
         int(row["usage_completion_tokens"]) for row in successes if row["usage_completion_tokens"] is not None
     ]
+    dispatch_lag_values = [
+        float(row["client_dispatch_lag_s"]) for row in results if row["client_dispatch_lag_s"] is not None
+    ]
+    dispatch_lag = distribution(dispatch_lag_values)
+    p99_dispatch_lag = dispatch_lag["p99"]
+    arrival_fidelity_passed = (
+        len(dispatch_lag_values) == len(results)
+        and isinstance(p99_dispatch_lag, (int, float))
+        and p99_dispatch_lag <= args.max_p99_dispatch_lag_s
+    )
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "client_protocol_version": CLIENT_PROTOCOL_VERSION,
         "trace": args.trace_name,
         "target_load": args.target_load,
         "output_tokens_requested": 1,
@@ -518,9 +667,31 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "wall_time_s": time.perf_counter() - benchmark_start,
         "workload": workload,
         "calibration": calibration,
+        "transport": {
+            "implementation": "aiohttp",
+            "aiohttp_version": aiohttp.__version__,
+            "connection_limit": UNBOUNDED_CONNECTION_LIMIT,
+            "read_timeout_s": None,
+            "campaign_timeout_s": args.campaign_timeout_s,
+            "warmup_timeout_s": args.warmup_timeout_s,
+            "request_bodies_prepared_before_replay": True,
+            "preparation_wall_time_s": preparation_wall_time_s,
+            "prepared_body_bytes": prepared_body_bytes,
+            "file_descriptor_limits": file_descriptor_limits,
+            "incremental_result_file": partial_path.name,
+        },
+        "arrival_fidelity": {
+            "metric": "p99 client dispatch lag",
+            "threshold_s": args.max_p99_dispatch_lag_s,
+            "observed_s": p99_dispatch_lag,
+            "passed": arrival_fidelity_passed,
+        },
         "ttft_s": distribution(row["ttft_s"] for row in successes),
+        "scheduled_ttft_s": distribution(row["scheduled_ttft_s"] for row in successes),
         "e2e_s": distribution(row["e2e_s"] for row in successes),
-        "client_dispatch_lag_s": distribution(row["client_dispatch_lag_s"] for row in results),
+        "client_dispatch_lag_s": dispatch_lag,
+        "client_submit_lag_s": distribution(row["client_submit_lag_s"] for row in results),
+        "client_task_wakeup_lag_s": distribution(row["client_task_wakeup_lag_s"] for row in results),
         "prompt_serialization_s": distribution(row["prompt_serialization_s"] for row in results),
         "metrics": metrics_summary,
     }
@@ -529,6 +700,11 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"{len(results) - len(successes)} requests failed")
     if completion_tokens and not summary["all_reported_completion_counts_are_one"]:
         raise RuntimeError("server reported a completion-token count other than one")
+    if not arrival_fidelity_passed:
+        raise RuntimeError(
+            f"arrival fidelity failed: p99 client dispatch lag {p99_dispatch_lag!r}s exceeds "
+            f"{args.max_p99_dispatch_lag_s:g}s"
+        )
     return summary
 
 
@@ -546,8 +722,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-requests", type=int, default=20_000)
     parser.add_argument("--max-model-len", type=int, default=262_144)
     parser.add_argument("--chunk-size", type=int, default=2_048)
-    parser.add_argument("--max-connections", type=int, default=128)
-    parser.add_argument("--request-timeout-s", type=float, default=1_800.0)
+    parser.add_argument(
+        "--campaign-timeout-s",
+        type=float,
+        default=DEFAULT_CAMPAIGN_TIMEOUT_S,
+        help="whole-replay watchdog; individual responses have no timeout",
+    )
+    parser.add_argument(
+        "--warmup-timeout-s",
+        type=float,
+        default=DEFAULT_WARMUP_TIMEOUT_S,
+    )
+    parser.add_argument(
+        "--max-p99-dispatch-lag-s",
+        type=float,
+        default=DEFAULT_MAX_P99_DISPATCH_LAG_S,
+        help="fail a run whose client-side p99 arrival lag exceeds this value",
+    )
     args = parser.parse_args()
     if not 0 < args.target_load < 1:
         parser.error("--target-load must be strictly between zero and one")
@@ -557,6 +748,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--chunk-size must be positive")
     if args.maximum_requests < args.minimum_requests:
         parser.error("--maximum-requests must be at least --minimum-requests")
+    if args.campaign_timeout_s <= 0 or args.warmup_timeout_s <= 0:
+        parser.error("campaign and warmup timeouts must be positive")
+    if args.max_p99_dispatch_lag_s < 0:
+        parser.error("--max-p99-dispatch-lag-s must be nonnegative")
     return args
 
 

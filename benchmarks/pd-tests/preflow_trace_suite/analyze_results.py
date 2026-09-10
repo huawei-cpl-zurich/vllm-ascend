@@ -98,6 +98,19 @@ def flatten_summary(policy: str, trace: str, summary: dict[str, Any]) -> dict[st
     }
 
 
+def resolve_result_path(status_path: Path, status: dict[str, Any]) -> Path | None:
+    """Resolve results after an output tree has been copied to another host."""
+    recorded = status.get("result_path")
+    if isinstance(recorded, str) and (candidate := Path(recorded)).is_dir():
+        return candidate
+    attempt = status.get("attempt")
+    if isinstance(attempt, str):
+        candidate = status_path.parent / Path(attempt).name / "result"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 def discover(output_root: Path) -> dict[tuple[str, str], Path]:
     results = {}
     policies_dir = output_root / "policies"
@@ -120,8 +133,12 @@ def discover(output_root: Path) -> dict[tuple[str, str], Path]:
         trace = status_path.parent.name
         if active_conditions is not None and (policy, trace) not in active_conditions:
             continue
-        result_path = Path(str(status["result_path"]))
-        if (result_path / "summary.json").is_file() and (result_path / "requests.jsonl").is_file():
+        result_path = resolve_result_path(status_path, status)
+        if (
+            result_path is not None
+            and (result_path / "summary.json").is_file()
+            and (result_path / "requests.jsonl").is_file()
+        ):
             results[(policy, trace)] = result_path
     return results
 

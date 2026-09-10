@@ -51,6 +51,7 @@ class Task:
     trace: str
     state: str
     status: dict[str, Any]
+    result: Path | None = None
     span: float = 0.0
     elapsed: float | None = None
     estimate: float = 0.0
@@ -70,14 +71,35 @@ def measured_duration(task: Task) -> float | None:
     return None if started is None or finished is None else max(0.0, (finished - started).total_seconds())
 
 
-def condition_state(status: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
+def resolve_result_path(condition_dir: Path, status: dict[str, Any]) -> Path | None:
+    recorded = status.get("result_path")
+    if isinstance(recorded, str) and (candidate := Path(recorded)).is_dir():
+        return candidate
+    attempt = status.get("attempt")
+    if isinstance(attempt, str) and (candidate := condition_dir / Path(attempt).name / "result").is_dir():
+        return candidate
+    return None
+
+
+def condition_state(
+    status: dict[str, Any] | None,
+    result: Path | None,
+) -> tuple[str, dict[str, Any]]:
     if status is None:
         return "pending", {}
     state = str(status.get("status", "pending"))
     if state == "completed":
-        result = status.get("result_path")
-        summary = read_json(Path(result) / "summary.json") if isinstance(result, str) else None
+        summary = read_json(result / "summary.json") if result is not None else None
         if summary is None or summary.get("requests") != summary.get("successful_requests"):
+            state = "invalid"
+        elif (
+            status.get("client_protocol_version") != suite.CLIENT_PROTOCOL_VERSION
+            or status.get("max_p99_dispatch_lag_s") != suite.MAX_P99_DISPATCH_LAG_S
+            or summary.get("client_protocol_version") != suite.CLIENT_PROTOCOL_VERSION
+            or summary.get("transport", {}).get("connection_limit") != 0
+        ):
+            state = "stale"
+        elif summary.get("arrival_fidelity", {}).get("passed") is not True:
             state = "invalid"
     return state, status
 
@@ -85,8 +107,7 @@ def condition_state(status: dict[str, Any] | None) -> tuple[str, dict[str, Any]]
 def trace_spans(tasks: list[Task]) -> dict[str, float]:
     spans: dict[str, float] = {}
     for task in tasks:
-        result = task.status.get("result_path")
-        workload = read_json(Path(result) / "workload.json") if isinstance(result, str) else None
+        workload = read_json(task.result / "workload.json") if task.result is not None else None
         value = None if workload is None else workload.get("scheduled_span_s")
         if isinstance(value, (int, float)) and value > 0:
             spans[task.trace] = float(value)
@@ -134,9 +155,11 @@ def main() -> int:
     by_policy: dict[str, list[Task]] = {}
     for policy in suite.POLICIES:
         for trace in policy.traces:
-            path = suite.condition_dir(output_root, policy, trace) / "status.json"
-            state, status = condition_state(read_json(path))
-            task = Task(policy.name, trace, state, status)
+            condition_dir = suite.condition_dir(output_root, policy, trace)
+            status = read_json(condition_dir / "status.json")
+            result = resolve_result_path(condition_dir, status or {})
+            state, status = condition_state(status, result)
+            task = Task(policy.name, trace, state, status, result)
             tasks.append(task)
             by_policy.setdefault(policy.name, []).append(task)
 
@@ -192,7 +215,8 @@ def main() -> int:
     print(f"Snapshot: {now:%Y-%m-%d %H:%M:%SZ}")
     print(
         f"Progress: {completed}/{len(tasks)} ({100 * completed / max(1, len(tasks)):.1f}%) complete; "
-        f"{counts.get('running', 0)} running, {counts.get('failed', 0)} failed"
+        f"{counts.get('running', 0)} running, {counts.get('failed', 0)} failed, "
+        f"{counts.get('stale', 0)} stale"
     )
     print(f"Estimated remaining: {show_duration(total_eta)}; finish: {finish:%Y-%m-%d %H:%MZ}")
     print(f"Estimate includes {show_duration(startup)} per future policy deployment on {len(slots)} TP4 slots.\n")
@@ -206,6 +230,8 @@ def main() -> int:
         )
     if counts.get("failed", 0):
         print("\nFailed conditions are counted as full retries; rerun run.py to execute them.")
+    if counts.get("stale", 0):
+        print("\nStale conditions used the old bounded HTTP client and will be rerun by run.py.")
     print(
         "ETA learns from same-trace completed runs, then falls back to the calibrated arrival span. Read-only snapshot."
     )

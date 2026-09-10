@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import re
+import resource
 import shlex
 import shutil
 import signal
@@ -52,6 +53,10 @@ GPU_MEMORY_UTILIZATION = 0.80
 SERVER_SEED = 1_024
 OUTPUT_TOKENS = 1
 ASYNC_SCHEDULING = True
+CLIENT_PROTOCOL_VERSION = 2
+CAMPAIGN_TIMEOUT_S = 6 * 60 * 60
+WARMUP_TIMEOUT_S = 15 * 60
+MAX_P99_DISPATCH_LAG_S = 1.0
 STARTUP_TIMEOUT_S = 1_200.0
 SHUTDOWN_TIMEOUT_S = 60.0
 BASE_PORT = 18_000
@@ -62,6 +67,21 @@ FATAL_SERVER_MARKERS = (
     "EngineDeadError: EngineCore encountered an issue.",
     "Engine core initialization failed",
 )
+
+
+def ensure_server_file_descriptor_capacity() -> None:
+    """Give each spawned server enough descriptors for open-loop requests."""
+    required = MAXIMUM_REQUESTS + 512
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft != resource.RLIM_INFINITY and soft < required:
+        target = required if hard == resource.RLIM_INFINITY else min(required, hard)
+        if target > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            soft = target
+    if soft != resource.RLIM_INFINITY and soft < required:
+        raise SuiteError(
+            f"open-file limit {soft} is too small for open-loop replay; raise 'ulimit -n' to at least {required}"
+        )
 
 
 class SuiteError(RuntimeError):
@@ -309,6 +329,11 @@ def condition_complete(path: Path, policy: PolicySpec, trace: str) -> bool:
         and status.get("service_budget_s") == SERVICE_BUDGET_S
         and status.get("minimum_requests") == MINIMUM_REQUESTS
         and status.get("maximum_requests") == MAXIMUM_REQUESTS
+        and status.get("client_protocol_version") == CLIENT_PROTOCOL_VERSION
+        and status.get("max_p99_dispatch_lag_s") == MAX_P99_DISPATCH_LAG_S
+        and summary.get("client_protocol_version") == CLIENT_PROTOCOL_VERSION
+        and summary.get("transport", {}).get("connection_limit") == 0
+        and summary.get("arrival_fidelity", {}).get("passed") is True
         and summary.get("requests") == summary.get("successful_requests")
         and summary.get("target_load") == TARGET_LOAD
     )
@@ -551,6 +576,14 @@ def client_command(server: ManagedServer, trace: str, result_dir: Path) -> list[
         str(MAXIMUM_REQUESTS),
         "--max-model-len",
         str(MAX_MODEL_LEN),
+        "--chunk-size",
+        str(MAX_NUM_BATCHED_TOKENS),
+        "--campaign-timeout-s",
+        str(CAMPAIGN_TIMEOUT_S),
+        "--warmup-timeout-s",
+        str(WARMUP_TIMEOUT_S),
+        "--max-p99-dispatch-lag-s",
+        str(MAX_P99_DISPATCH_LAG_S),
     ]
 
 
@@ -608,6 +641,12 @@ def execute_trace(output_root: Path, server: ManagedServer, trace: str) -> None:
         "service_budget_s": SERVICE_BUDGET_S,
         "minimum_requests": MINIMUM_REQUESTS,
         "maximum_requests": MAXIMUM_REQUESTS,
+        "client_protocol_version": CLIENT_PROTOCOL_VERSION,
+        "replay_script_sha256": sha256(REPLAY_SCRIPT),
+        "campaign_timeout_s": CAMPAIGN_TIMEOUT_S,
+        "warmup_timeout_s": WARMUP_TIMEOUT_S,
+        "max_p99_dispatch_lag_s": MAX_P99_DISPATCH_LAG_S,
+        "minimum_open_file_limit": MAXIMUM_REQUESTS + 512,
         "npu_ids": server.npu_ids,
         "attempt": str(attempt),
         "result_path": str(result_dir),
@@ -630,6 +669,10 @@ def execute_trace(output_root: Path, server: ManagedServer, trace: str) -> None:
         summary = load_json(result_dir / "summary.json")
         if summary.get("requests") != summary.get("successful_requests"):
             raise SuiteError("client summary contains failed requests")
+        if summary.get("client_protocol_version") != CLIENT_PROTOCOL_VERSION:
+            raise SuiteError("client summary has the wrong replay protocol version")
+        if summary.get("arrival_fidelity", {}).get("passed") is not True:
+            raise SuiteError("client summary failed its arrival-fidelity check")
         atomic_write_json(
             destination / "status.json",
             {
@@ -771,6 +814,11 @@ def suite_manifest() -> dict[str, Any]:
         "load_format": "dummy",
         "prefix_caching": False,
         "async_scheduling": ASYNC_SCHEDULING,
+        "client_protocol_version": CLIENT_PROTOCOL_VERSION,
+        "client_transport": "aiohttp-unbounded",
+        "campaign_timeout_s": CAMPAIGN_TIMEOUT_S,
+        "warmup_timeout_s": WARMUP_TIMEOUT_S,
+        "max_p99_dispatch_lag_s": MAX_P99_DISPATCH_LAG_S,
         "service_budget_s": SERVICE_BUDGET_S,
         "minimum_requests": MINIMUM_REQUESTS,
         "maximum_requests": MAXIMUM_REQUESTS,
@@ -804,7 +852,8 @@ def print_plan(output_root: Path) -> None:
     print(
         f"Common: target_load={TARGET_LOAD}, K={MAX_NUM_SEQS}, "
         f"chunk={MAX_NUM_BATCHED_TOKENS}, batch_width={MAX_NUM_BATCHED_SEQS}, "
-        f"output_tokens={OUTPUT_TOKENS}, async={ASYNC_SCHEDULING}"
+        f"output_tokens={OUTPUT_TOKENS}, async={ASYNC_SCHEDULING}, "
+        f"client=aiohttp-unbounded-v{CLIENT_PROTOCOL_VERSION}"
     )
     print(f"Total conditions: {sum(len(policy.traces) for policy in POLICIES)}")
     for policy in POLICIES:
@@ -884,6 +933,7 @@ def main() -> int:
         return 0
     validate_bundle()
     validate_environment()
+    ensure_server_file_descriptor_capacity()
     output_root.mkdir(parents=True, exist_ok=True)
     record_suite_configuration(output_root)
     refresh_index(output_root)
