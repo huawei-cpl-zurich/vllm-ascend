@@ -36,11 +36,12 @@ TRACE_DIR = HERE / "traces"
 REPLAY_SCRIPT = HERE / "replay_trace.py"
 ANALYZE_SCRIPT = HERE / "analyze_results.py"
 CALIBRATION = HERE / "calibration" / "parametric_chunk_cost_model.json"
+FCFS_SERVICE_CALIBRATION = HERE / "calibration" / "fcfs_trace_service_scales.json"
 SUITE_CONFIG = HERE / "suite_config.json"
 
 MODEL = "/data/weights/Qwen3-Coder-30B-A3B-Instruct/"
 SERVED_MODEL_NAME = "qwen"
-TARGET_LOAD = 0.95
+TARGET_LOAD = 0.80
 TENSOR_PARALLEL_SIZE = 4
 MAX_MODEL_LEN = 262_144
 MAX_NUM_SEQS = 16
@@ -180,6 +181,33 @@ def load_suite_definition() -> tuple[tuple[str, ...], tuple[str, ...], tuple[Pol
 ALL_TRACES, NPU_GROUPS, POLICIES = load_suite_definition()
 
 
+def load_fcfs_service_calibration() -> tuple[dict[str, float], dict[str, Any]]:
+    try:
+        payload = json.loads(FCFS_SERVICE_CALIBRATION.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SuiteError(
+            f"cannot read FCFS service calibration {FCFS_SERVICE_CALIBRATION}: {error}"
+        ) from error
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise SuiteError(f"{FCFS_SERVICE_CALIBRATION} schema_version must be 1")
+    raw_traces = payload.get("traces")
+    if not isinstance(raw_traces, dict):
+        raise SuiteError(f"{FCFS_SERVICE_CALIBRATION} 'traces' must be an object")
+    scales: dict[str, float] = {}
+    for trace in ALL_TRACES:
+        entry = raw_traces.get(trace)
+        if not isinstance(entry, dict):
+            raise SuiteError(f"missing FCFS service calibration for trace {trace!r}")
+        scale = entry.get("service_time_scale")
+        if not isinstance(scale, (int, float)) or not 0 < scale < float("inf"):
+            raise SuiteError(f"invalid FCFS service_time_scale for trace {trace!r}")
+        scales[trace] = float(scale)
+    return scales, payload
+
+
+FCFS_SERVICE_SCALES, FCFS_SERVICE_CALIBRATION_METADATA = load_fcfs_service_calibration()
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -310,16 +338,20 @@ def condition_complete(path: Path, policy: PolicySpec, trace: str) -> bool:
     try:
         current_trace_digest = sha256(TRACE_DIR / f"{trace}.jsonl")
         current_calibration_digest = sha256(CALIBRATION)
+        current_fcfs_calibration_digest = sha256(FCFS_SERVICE_CALIBRATION)
     except OSError:
         return False
     stored_trace_digest = status.get("trace_sha256")
     stored_calibration_digest = status.get("calibration_sha256")
+    stored_fcfs_calibration_digest = status.get("fcfs_service_calibration_sha256")
     return (
         status.get("status") == "completed"
         and stored_policy_runtime_config(status.get("policy")) == policy_runtime_config(policy)
         and status.get("trace") == trace
         and (stored_trace_digest is None or stored_trace_digest == current_trace_digest)
         and (stored_calibration_digest is None or stored_calibration_digest == current_calibration_digest)
+        and stored_fcfs_calibration_digest == current_fcfs_calibration_digest
+        and status.get("fcfs_service_time_scale") == FCFS_SERVICE_SCALES[trace]
         and status.get("output_tokens") == OUTPUT_TOKENS
         and status.get("max_num_seqs") == MAX_NUM_SEQS
         and status.get("max_num_batched_tokens") == MAX_NUM_BATCHED_TOKENS
@@ -568,6 +600,8 @@ def client_command(server: ManagedServer, trace: str, result_dir: Path) -> list[
         str(result_dir),
         "--target-load",
         str(TARGET_LOAD),
+        "--service-time-scale",
+        str(FCFS_SERVICE_SCALES[trace]),
         "--service-budget-s",
         str(SERVICE_BUDGET_S),
         "--minimum-requests",
@@ -631,6 +665,8 @@ def execute_trace(output_root: Path, server: ManagedServer, trace: str) -> None:
         "trace": trace,
         "trace_sha256": sha256(TRACE_DIR / f"{trace}.jsonl"),
         "calibration_sha256": sha256(CALIBRATION),
+        "fcfs_service_calibration_sha256": sha256(FCFS_SERVICE_CALIBRATION),
+        "fcfs_service_time_scale": FCFS_SERVICE_SCALES[trace],
         "target_load": TARGET_LOAD,
         "output_tokens": OUTPUT_TOKENS,
         "max_num_seqs": MAX_NUM_SEQS,
@@ -773,6 +809,7 @@ def validate_bundle() -> None:
         REPLAY_SCRIPT,
         ANALYZE_SCRIPT,
         CALIBRATION,
+        FCFS_SERVICE_CALIBRATION,
         TRACE_DIR / "manifest.json",
         *(TRACE_DIR / f"{trace}.jsonl" for trace in ALL_TRACES),
     ]
@@ -803,8 +840,14 @@ def suite_manifest() -> dict[str, Any]:
         "served_model_name": SERVED_MODEL_NAME,
         "target_load": TARGET_LOAD,
         "target_load_definition": (
-            "sum of calibrated fixed-chunk execution time divided by the stretched arrival span"
+            "sum of trace-corrected empirical FCFS service time divided by the stretched arrival span"
         ),
+        "fcfs_service_calibration": {
+            "path": str(FCFS_SERVICE_CALIBRATION.relative_to(HERE)),
+            "sha256": sha256(FCFS_SERVICE_CALIBRATION),
+            "method": FCFS_SERVICE_CALIBRATION_METADATA.get("method"),
+            "scales": FCFS_SERVICE_SCALES,
+        },
         "tensor_parallel_size": TENSOR_PARALLEL_SIZE,
         "max_model_len": MAX_MODEL_LEN,
         "max_num_seqs": MAX_NUM_SEQS,
@@ -835,6 +878,7 @@ def suite_manifest() -> dict[str, Any]:
                 REPLAY_SCRIPT,
                 ANALYZE_SCRIPT,
                 CALIBRATION,
+                FCFS_SERVICE_CALIBRATION,
                 TRACE_DIR / "manifest.json",
             )
         },
@@ -845,7 +889,7 @@ def suite_manifest() -> dict[str, Any]:
     }
 
 
-def print_plan(output_root: Path) -> None:
+def print_plan(output_root: Path, policies: tuple[PolicySpec, ...]) -> None:
     print(f"Model: {MODEL} (dummy weights)")
     print(f"Output: {output_root}")
     print(f"Hardware: {len(NPU_GROUPS)} concurrent TP4 servers on {', '.join(NPU_GROUPS)}")
@@ -855,8 +899,9 @@ def print_plan(output_root: Path) -> None:
         f"output_tokens={OUTPUT_TOKENS}, async={ASYNC_SCHEDULING}, "
         f"client=aiohttp-unbounded-v{CLIENT_PROTOCOL_VERSION}"
     )
-    print(f"Total conditions: {sum(len(policy.traces) for policy in POLICIES)}")
-    for policy in POLICIES:
+    print(f"Selected policies: {', '.join(policy.name for policy in policies)}")
+    print(f"Selected conditions: {sum(len(policy.traces) for policy in policies)}")
+    for policy in policies:
         missing = missing_traces(output_root, policy) if output_root.exists() else list(policy.traces)
         print(f"  {policy.name}: {len(policy.traces)} conditions, {len(missing)} pending")
 
@@ -922,14 +967,35 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-root", type=Path, default=HERE / "benchmark_output")
     parser.add_argument("--plan", action="store_true")
-    return parser.parse_args()
+    parser.add_argument(
+        "--policy",
+        action="append",
+        metavar="NAME",
+        help=(
+            "run only this policy; repeat the option to select multiple policies "
+            f"(available: {', '.join(policy.name for policy in POLICIES)})"
+        ),
+    )
+    args = parser.parse_args()
+    requested = set(args.policy or ())
+    unknown = requested.difference(policy.name for policy in POLICIES)
+    if unknown:
+        parser.error(
+            "unknown --policy value(s): "
+            + ", ".join(sorted(unknown))
+            + "; available policies: "
+            + ", ".join(policy.name for policy in POLICIES)
+        )
+    args.policies = tuple(policy for policy in POLICIES if not requested or policy.name in requested)
+    return args
 
 
 def main() -> int:
     args = parse_args()
+    selected_policies: tuple[PolicySpec, ...] = args.policies
     output_root = args.output_root.expanduser().resolve()
     if args.plan:
-        print_plan(output_root)
+        print_plan(output_root, selected_policies)
         return 0
     validate_bundle()
     validate_environment()
@@ -937,10 +1003,10 @@ def main() -> int:
     output_root.mkdir(parents=True, exist_ok=True)
     record_suite_configuration(output_root)
     refresh_index(output_root)
-    print_plan(output_root)
+    print_plan(output_root, selected_policies)
 
     queue: Queue[PolicySpec] = Queue()
-    for policy in POLICIES:
+    for policy in selected_policies:
         if missing_traces(output_root, policy):
             queue.put(policy)
     if queue.empty():
@@ -953,7 +1019,8 @@ def main() -> int:
         {
             "status": "running",
             "started_at": utc_now(),
-            "pending_conditions": sum(len(missing_traces(output_root, policy)) for policy in POLICIES),
+            "selected_policies": [policy.name for policy in selected_policies],
+            "pending_conditions": sum(len(missing_traces(output_root, policy)) for policy in selected_policies),
         },
     )
 
@@ -979,16 +1046,25 @@ def main() -> int:
     if errors:
         atomic_write_json(
             output_root / "suite_status.json",
-            {"status": "failed", "finished_at": utc_now(), "errors": errors},
+            {
+                "status": "failed",
+                "finished_at": utc_now(),
+                "selected_policies": [policy.name for policy in selected_policies],
+                "errors": errors,
+            },
         )
         print("Suite finished with failures; rerun run.py to retry incomplete conditions.", file=sys.stderr)
         return 1
     atomic_write_json(
         output_root / "suite_status.json",
-        {"status": "completed", "finished_at": utc_now()},
+        {
+            "status": "completed",
+            "finished_at": utc_now(),
+            "selected_policies": [policy.name for policy in selected_policies],
+        },
     )
     analyze_results(output_root)
-    print("Suite completed successfully.")
+    print("Selected benchmark policies completed successfully.")
     return 0
 
 

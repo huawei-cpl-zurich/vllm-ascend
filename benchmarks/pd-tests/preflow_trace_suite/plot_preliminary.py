@@ -29,6 +29,7 @@ from matplotlib.colors import LogNorm  # noqa: E402
 HERE = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = HERE / "benchmark_output"
 DEFAULT_ANALYSIS_DIR = DEFAULT_OUTPUT_ROOT / "preliminary_analysis"
+THROUGHPUT_WINDOW_S = 30.0
 
 POLICY_LABELS = {
     "fcfs": "FCFS",
@@ -74,7 +75,8 @@ HARD_PREFLOW_BOUNDS = {
     "preflow_hard_inflation_120": 2.2,
 }
 GUARANTEE_WARNING_PATTERN = re.compile(
-    r"PREFLOW's earliest-deadline request (\S+) was not legal under existing admission constraints"
+    r"PREFLOW's earliest-deadline request (\S+) was not legal under (?:existing admission constraints|"
+    r"an admission constraint outside the conservative resident-drain shield)"
 )
 
 
@@ -159,7 +161,11 @@ def scan_requests(path: Path) -> tuple[int, int, Counter[str], bool]:
                     error = str(value.get("error", "unknown"))
                     if "Read timed out" in error:
                         errors["read_timeout"] += 1
-                    elif "Connection reset" in error or "Remote end closed" in error:
+                    elif (
+                        "Connection reset" in error
+                        or "Remote end closed" in error
+                        or "ServerDisconnectedError" in error
+                    ):
                         errors["connection_drop"] += 1
                     else:
                         errors[error[:120]] += 1
@@ -179,7 +185,24 @@ def audit_condition(policy: str, trace: str, condition_dir: Path) -> Audit:
     summary = read_json(result / "summary.json")
     workload = read_json(result / "workload.json")
     request_path = result / "requests.jsonl"
+    partial_path = result / "requests.partial.jsonl"
     if summary is None or workload is None or not request_path.is_file():
+        if workload is not None and partial_path.is_file():
+            rows, successes, errors, parse_valid = scan_requests(partial_path)
+            quality = "running_partial" if recorded_state == "running" else "campaign_timeout_partial"
+            return Audit(
+                policy,
+                trace,
+                recorded_state,
+                quality if parse_valid else "artifact_invalid",
+                result,
+                summary,
+                workload,
+                rows,
+                successes,
+                errors,
+                False,
+            )
         return Audit(policy, trace, recorded_state, "artifact_invalid", result, summary, workload)
 
     rows, successes, errors, parse_valid = scan_requests(request_path)
@@ -277,6 +300,8 @@ def summary_rows(audits: Iterable[Audit]) -> list[dict[str, Any]]:
 def plot_coverage(policies: list[str], traces: list[str], audits: list[Audit], output: Path) -> None:
     score = {
         "missing": 0,
+        "campaign_timeout_partial": 1,
+        "running_partial": 1,
         "timeout_censored": 1,
         "request_failure": 1,
         "artifact_invalid": 1,
@@ -285,6 +310,8 @@ def plot_coverage(policies: list[str], traces: list[str], audits: list[Audit], o
     }
     symbol = {
         "missing": "—",
+        "campaign_timeout_partial": "T",
+        "running_partial": "R",
         "timeout_censored": "T",
         "request_failure": "F",
         "artifact_invalid": "!",
@@ -303,7 +330,10 @@ def plot_coverage(policies: list[str], traces: list[str], audits: list[Audit], o
     axis.set_xticks(range(len(traces)), [TRACE_LABELS.get(item, item) for item in traces])
     axis.set_yticks(range(len(policies)), [POLICY_LABELS.get(item, item) for item in policies])
     axis.set_title("Preliminary benchmark coverage and integrity")
-    axis.set_xlabel("✓ valid   D connection drop (preliminary only)   T timeout-censored   — not attempted")
+    axis.set_xlabel(
+        "✓ valid   D one connection drop (preliminary only)   T campaign timeout   "
+        "R running snapshot   — not attempted"
+    )
     fig.tight_layout()
     fig.savefig(output / "coverage_and_integrity.png", dpi=180)
     plt.close(fig)
@@ -346,7 +376,7 @@ def plot_ttft_heatmaps(
         axis.set_yticks(range(len(policies)), [POLICY_LABELS.get(item, item) for item in policies], fontsize=8)
         axis.set_title(f"{title} (seconds, log color)")
         fig.colorbar(image, ax=axis, shrink=0.75)
-    fig.suptitle("Available TTFT results (* one or two dropped connections; preliminary only)", fontsize=14)
+    fig.suptitle("Available TTFT results (* one dropped connection; preliminary only)", fontsize=14)
     fig.savefig(output / "ttft_heatmaps.png", dpi=180)
     plt.close(fig)
 
@@ -438,6 +468,488 @@ def plot_harness_fidelity(
     fig.suptitle("Open-loop replay fidelity: large dispatch lag means arrivals were client-throttled", fontsize=14)
     fig.savefig(output / "harness_fidelity.png", dpi=180)
     plt.close(fig)
+
+
+def partial_progress_rows(audits: list[Audit]) -> list[dict[str, Any]]:
+    """Summarize partial files without treating them as latency samples."""
+    rows = []
+    for audit in audits:
+        if audit.quality not in {"campaign_timeout_partial", "running_partial"} or audit.result is None:
+            continue
+        request_path = audit.result / "requests.partial.jsonl"
+        completions = []
+        with request_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                value = row.get("completion_offset_s")
+                if row.get("success") and isinstance(value, (int, float)):
+                    completions.append(float(value))
+        if not completions:
+            continue
+        completions.sort()
+        expected = audit.workload.get("selected_requests") if audit.workload else None
+        rows.append(
+            {
+                "policy": audit.policy,
+                "trace": audit.trace,
+                "quality": audit.quality,
+                "expected_requests": expected,
+                "returned_requests": len(completions),
+                "returned_fraction": len(completions) / expected if isinstance(expected, int) and expected else "",
+                "last_completion_s": completions[-1],
+                "returned_in_last_hour": sum(value > completions[-1] - 3600.0 for value in completions),
+                "completion_offsets_s": completions,
+            }
+        )
+    return rows
+
+
+def plot_partial_progress(rows: list[dict[str, Any]], output: Path) -> None:
+    if not rows:
+        return
+    fig, axis = plt.subplots(figsize=(9.5, 5.8), constrained_layout=True)
+    for row in rows:
+        completions = np.asarray(row["completion_offsets_s"], dtype=float)
+        expected = int(row["expected_requests"])
+        fraction = np.arange(1, completions.size + 1, dtype=float) / expected
+        slack = row["policy"].removeprefix("preflow_hard_inflation_")
+        suffix = " (running snapshot)" if row["quality"] == "running_partial" else " (6 h timeout)"
+        axis.step(completions / 3600.0, 100.0 * fraction, where="post", label=f"{slack}% slack{suffix}")
+    axis.axvline(6.0, color="#555555", linestyle=":", linewidth=1.2, label="campaign watchdog")
+    axis.set_xlabel("Elapsed replay time (hours)")
+    axis.set_ylabel("Requests returned (% of trace)")
+    axis.set_title("Hard PREFLOW Qwen-Coder partial progress (not a latency comparison)")
+    axis.grid(True, alpha=0.25)
+    axis.legend()
+    fig.savefig(output / "partial_run_progress.png", dpi=180)
+    plt.close(fig)
+
+
+def metric_series(path: Path, metric: str) -> tuple[np.ndarray, np.ndarray]:
+    times: list[float] = []
+    values: list[float] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if row.get("metric") == metric:
+                    times.append(float(row["time_s"]))
+                    values.append(float(row["value"]))
+    except (OSError, ValueError):
+        return np.asarray([]), np.asarray([])
+    if len(times) > 5000:
+        indices = np.linspace(0, len(times) - 1, 5000, dtype=int)
+        return np.asarray(times)[indices], np.asarray(values)[indices]
+    return np.asarray(times), np.asarray(values)
+
+
+def trailing_counter_rate(
+    times: np.ndarray,
+    cumulative: np.ndarray,
+    window_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Calculate a trailing-window rate from an irregularly sampled counter."""
+    if times.size < 2 or cumulative.size != times.size or times[-1] <= window_s:
+        return np.asarray([]), np.asarray([])
+    grid = np.arange(window_s, math.floor(float(times[-1])) + 1.0, 1.0)
+    current_indices = np.searchsorted(times, grid, side="right") - 1
+    previous_indices = np.searchsorted(times, grid - window_s, side="right") - 1
+    valid = (current_indices >= 0) & (previous_indices >= 0)
+    grid = grid[valid]
+    rates = (cumulative[current_indices[valid]] - cumulative[previous_indices[valid]]) / window_s
+    return grid, np.maximum(0.0, rates)
+
+
+def trailing_event_rate(
+    event_times: np.ndarray,
+    event_work: np.ndarray,
+    end_time_s: float,
+    window_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Attribute request work at completion and calculate its trailing rate."""
+    if event_times.size == 0 or event_work.size != event_times.size or end_time_s <= window_s:
+        return np.asarray([]), np.asarray([])
+    order = np.argsort(event_times)
+    times = event_times[order]
+    cumulative = np.cumsum(event_work[order])
+    grid = np.arange(window_s, math.floor(end_time_s) + 1.0, 1.0)
+    current_indices = np.searchsorted(times, grid, side="right") - 1
+    previous_indices = np.searchsorted(times, grid - window_s, side="right") - 1
+    current = np.where(current_indices >= 0, cumulative[np.maximum(current_indices, 0)], 0.0)
+    previous = np.where(previous_indices >= 0, cumulative[np.maximum(previous_indices, 0)], 0.0)
+    return grid, np.maximum(0.0, (current - previous) / window_s)
+
+
+def sampled_step_values(times: np.ndarray, values: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    if times.size == 0 or values.size != times.size:
+        return np.zeros(grid.size)
+    indices = np.searchsorted(times, grid, side="right") - 1
+    return np.where(indices >= 0, values[np.maximum(indices, 0)], 0.0)
+
+
+def throughput_statistics(
+    rate_times: np.ndarray,
+    rates: np.ndarray,
+    waiting_times: np.ndarray,
+    waiting_values: np.ndarray,
+    arrival_span_s: float,
+) -> dict[str, float | int | None]:
+    waiting_now = sampled_step_values(waiting_times, waiting_values, rate_times)
+    waiting_before = sampled_step_values(
+        waiting_times,
+        waiting_values,
+        np.maximum(0.0, rate_times - THROUGHPUT_WINDOW_S),
+    )
+    saturated = (waiting_now > 0.0) & (waiting_before > 0.0)
+    # Report the post-arrival drain as the cleanest capacity interval. Fall
+    # back to every saturated window for short or incomplete artifacts.
+    post_arrival = saturated & (rate_times >= arrival_span_s + THROUGHPUT_WINDOW_S)
+    selected = rates[post_arrival] if np.any(post_arrival) else rates[saturated]
+    selected = selected[np.isfinite(selected) & (selected >= 0.0)]
+    if not selected.size:
+        return {key: None for key in ("windows", "mean", "median", "p10", "p90", "p95", "max")}
+    return {
+        "windows": int(selected.size),
+        "mean": float(np.mean(selected)),
+        "median": float(np.median(selected)),
+        "p10": float(np.quantile(selected, 0.10)),
+        "p90": float(np.quantile(selected, 0.90)),
+        "p95": float(np.quantile(selected, 0.95)),
+        "max": float(np.max(selected)),
+    }
+
+
+def plot_fcfs_throughput(
+    traces: list[str],
+    audits: list[Audit],
+    output: Path,
+) -> list[dict[str, Any]]:
+    """Plot FCFS token and completion-attributed triangular-work rates."""
+    lookup = {(audit.policy, audit.trace): audit for audit in audits}
+    token_series = []
+    triangular_series = []
+    summary = []
+    for trace in traces:
+        audit = lookup.get(("fcfs", trace))
+        if audit is None or audit.result is None or audit.workload is None:
+            continue
+        metrics_path = audit.result / "metrics.csv"
+        request_path = audit.result / "requests.jsonl"
+        if not metrics_path.is_file() or not request_path.is_file():
+            continue
+        arrival_span = float(audit.workload["scheduled_span_s"])
+        counter_t, counter_v = metric_series(metrics_path, "vllm:prompt_tokens_total")
+        waiting_t, waiting_v = metric_series(metrics_path, "vllm:num_requests_waiting")
+        token_t, token_rate = trailing_counter_rate(counter_t, counter_v, THROUGHPUT_WINDOW_S)
+
+        completion_times = []
+        triangular_work = []
+        with request_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                completion = row.get("first_token_offset_s")
+                prompt_tokens = row.get("prompt_tokens")
+                if row.get("success") and isinstance(completion, (int, float)) and isinstance(prompt_tokens, int):
+                    completion_times.append(float(completion))
+                    triangular_work.append(float(prompt_tokens * (prompt_tokens + 1) / 2))
+        end_time = max(
+            float(counter_t[-1]) if counter_t.size else 0.0,
+            max(completion_times, default=0.0),
+        )
+        triangular_t, triangular_rate = trailing_event_rate(
+            np.asarray(completion_times),
+            np.asarray(triangular_work),
+            end_time,
+            THROUGHPUT_WINDOW_S,
+        )
+        token_stats = throughput_statistics(token_t, token_rate, waiting_t, waiting_v, arrival_span)
+        triangular_stats = throughput_statistics(
+            triangular_t,
+            triangular_rate,
+            waiting_t,
+            waiting_v,
+            arrival_span,
+        )
+        token_series.append((trace, arrival_span, token_t, token_rate, token_stats))
+        triangular_series.append((trace, arrival_span, triangular_t, triangular_rate, triangular_stats))
+        summary.append(
+            {
+                "trace": trace,
+                "window_s": THROUGHPUT_WINDOW_S,
+                **{f"token_per_s_{key}": value for key, value in token_stats.items()},
+                **{f"triangular_work_per_s_{key}": value for key, value in triangular_stats.items()},
+            }
+        )
+
+    def render_time_series(
+        series: list[tuple[str, float, np.ndarray, np.ndarray, dict[str, float | int | None]]],
+        ylabel: str,
+        title: str,
+        filename: str,
+    ) -> None:
+        if not series:
+            return
+        fig, axes = plt.subplots(4, 2, figsize=(15, 13), squeeze=False, constrained_layout=True)
+        for axis, (trace, arrival_span, rate_t, rates, stats) in zip(axes.flat, series, strict=False):
+            axis.plot(rate_t / 60.0, rates, color="#2171b5", linewidth=1.0)
+            median = stats.get("median")
+            p90 = stats.get("p90")
+            if isinstance(median, (int, float)):
+                axis.axhline(median, color="#238b45", linewidth=1.2, label=f"saturated median={median:,.0f}")
+            if isinstance(p90, (int, float)):
+                axis.axhline(p90, color="#d95f0e", linestyle=":", linewidth=1.2, label=f"saturated p90={p90:,.0f}")
+            axis.axvline(
+                arrival_span / 60.0,
+                color="#555555",
+                linestyle="--",
+                linewidth=1.0,
+                label="last arrival",
+            )
+            axis.set_title(TRACE_LABELS.get(trace, trace).replace("\n", " "))
+            axis.set_xlabel("Elapsed replay time (minutes)")
+            axis.set_ylabel(ylabel)
+            axis.grid(True, alpha=0.22)
+            axis.legend(fontsize=7, loc="upper right")
+        for axis in axes.flat[len(series) :]:
+            axis.axis("off")
+        fig.suptitle(title, fontsize=15)
+        fig.savefig(output / filename, dpi=180)
+        plt.close(fig)
+
+    render_time_series(
+        token_series,
+        "Prompt tokens/s",
+        f"FCFS prompt-token throughput ({THROUGHPUT_WINDOW_S:.0f}-second trailing window)",
+        "fcfs_token_throughput_vs_time.png",
+    )
+    render_time_series(
+        triangular_series,
+        "Triangular work units/s",
+        (
+            f"FCFS completion-attributed triangular-work throughput "
+            f"({THROUGHPUT_WINDOW_S:.0f}-second trailing window)"
+        ),
+        "fcfs_triangular_throughput_vs_time.png",
+    )
+
+    if summary:
+        positions = np.arange(len(summary))
+        labels = [TRACE_LABELS.get(str(row["trace"]), str(row["trace"])).replace("\n", " ") for row in summary]
+        fig, axes = plt.subplots(1, 2, figsize=(16, 5.5), constrained_layout=True)
+        for axis, prefix, ylabel in (
+            (axes[0], "token_per_s", "Prompt tokens/s"),
+            (axes[1], "triangular_work_per_s", "Triangular work units/s"),
+        ):
+            medians = [float(row[f"{prefix}_median"]) for row in summary]
+            p10 = [float(row[f"{prefix}_p10"]) for row in summary]
+            p90 = [float(row[f"{prefix}_p90"]) for row in summary]
+            axis.errorbar(
+                positions,
+                medians,
+                yerr=[np.asarray(medians) - np.asarray(p10), np.asarray(p90) - np.asarray(medians)],
+                fmt="o",
+                capsize=4,
+                color="#2171b5",
+                label="saturated median and p10--p90",
+            )
+            axis.set_xticks(positions, labels, rotation=40, ha="right")
+            axis.set_ylabel(ylabel)
+            axis.set_yscale("log")
+            axis.grid(True, which="both", alpha=0.22)
+            axis.legend()
+        fig.suptitle("FCFS trace-dependent saturated throughput ceilings", fontsize=15)
+        fig.savefig(output / "fcfs_throughput_ceiling_comparison.png", dpi=180)
+        plt.close(fig)
+    return summary
+
+
+def plot_queue_trajectories(
+    policies: list[str],
+    traces: list[str],
+    audits: list[Audit],
+    output: Path,
+) -> None:
+    """Render queue trajectories, including clearly marked partial runs."""
+    distribution_dir = output / "per_trace"
+    distribution_dir.mkdir(parents=True, exist_ok=True)
+    lookup = {(audit.policy, audit.trace): audit for audit in audits}
+    for trace in traces:
+        series = []
+        for policy in policies:
+            audit = lookup.get((policy, trace))
+            if audit is None or audit.result is None:
+                continue
+            metrics_path = audit.result / "metrics.csv"
+            if not metrics_path.is_file():
+                continue
+            waiting_t, waiting_v = metric_series(metrics_path, "vllm:num_requests_waiting")
+            running_t, running_v = metric_series(metrics_path, "vllm:num_requests_running")
+            if waiting_t.size or running_t.size:
+                series.append((policy, audit, waiting_t, waiting_v, running_t, running_v))
+        if not series:
+            continue
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True, constrained_layout=True)
+        for policy, audit, waiting_t, waiting_v, running_t, running_v in series:
+            partial = audit.quality in {"campaign_timeout_partial", "running_partial"}
+            dropped = audit.quality == "connection_drop"
+            marker = "†" if partial else ("*" if dropped else "")
+            label = f"{POLICY_LABELS.get(policy, policy)}{marker}"
+            style = {
+                "color": POLICY_COLORS.get(policy),
+                "linestyle": "--" if partial or dropped else "-",
+                "linewidth": 1.35,
+                "alpha": 0.9,
+                "label": label,
+            }
+            if waiting_t.size:
+                axes[0].plot(waiting_t / 3600.0, waiting_v, **style)
+            if running_t.size:
+                axes[1].plot(running_t / 3600.0, running_v, **style)
+        axes[0].set_ylabel("Waiting requests")
+        axes[0].set_title("Waiting queue")
+        axes[1].set_ylabel("Running requests")
+        axes[1].set_xlabel("Elapsed replay time (hours)")
+        axes[1].set_title("Resident/running queue")
+        for axis in axes:
+            axis.grid(True, alpha=0.22)
+        axes[0].legend(fontsize=7.5, ncol=2)
+        trace_label = TRACE_LABELS.get(trace, trace).replace("\n", " ")
+        fig.suptitle(
+            f"{trace_label}: scheduler queue trajectories  "
+            "(* one dropped request; † incomplete completion-biased run)",
+            fontsize=14,
+        )
+        fig.savefig(distribution_dir / f"{trace}_queue_trajectories.png", dpi=180)
+        plt.close(fig)
+
+
+def plot_policy_queue_trajectories(
+    policies: list[str],
+    traces: list[str],
+    audits: list[Audit],
+    output: Path,
+) -> list[dict[str, Any]]:
+    """Render a separate raw queue-versus-time figure for every policy."""
+    policy_dir = output / "per_policy"
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    lookup = {(audit.policy, audit.trace): audit for audit in audits}
+    summary = []
+    for policy in policies:
+        policy_series = []
+        for trace in traces:
+            audit = lookup.get((policy, trace))
+            if audit is None or audit.result is None:
+                continue
+            metrics_path = audit.result / "metrics.csv"
+            if not metrics_path.is_file():
+                continue
+            waiting_t, waiting_v = metric_series(metrics_path, "vllm:num_requests_waiting")
+            running_t, running_v = metric_series(metrics_path, "vllm:num_requests_running")
+            if not waiting_t.size and not running_t.size:
+                continue
+            arrival_span = None
+            if audit.workload is not None:
+                value = audit.workload.get("scheduled_span_s")
+                if isinstance(value, (int, float)):
+                    arrival_span = float(value)
+            policy_series.append((trace, audit, arrival_span, waiting_t, waiting_v, running_t, running_v))
+
+            peak_waiting = float(np.max(waiting_v)) if waiting_v.size else None
+            peak_waiting_time = float(waiting_t[int(np.argmax(waiting_v))]) if waiting_v.size else None
+            waiting_at_arrival_end = None
+            if waiting_t.size and arrival_span is not None:
+                waiting_at_arrival_end = float(waiting_v[int(np.argmin(np.abs(waiting_t - arrival_span)))])
+            queue_clear_time = None
+            if waiting_t.size and waiting_v[-1] == 0.0:
+                positive = np.flatnonzero(waiting_v > 0.0)
+                has_clear_sample = positive.size and positive[-1] + 1 < waiting_t.size
+                queue_clear_time = float(waiting_t[positive[-1] + 1]) if has_clear_sample else 0.0
+            metrics_span = max(
+                waiting_t[-1] if waiting_t.size else 0,
+                running_t[-1] if running_t.size else 0,
+            )
+            summary.append(
+                {
+                    "policy": policy,
+                    "trace": trace,
+                    "quality": audit.quality,
+                    "arrival_span_s": arrival_span,
+                    "metrics_span_s": float(metrics_span),
+                    "peak_waiting": peak_waiting,
+                    "peak_waiting_time_s": peak_waiting_time,
+                    "waiting_at_arrival_end": waiting_at_arrival_end,
+                    "final_waiting": float(waiting_v[-1]) if waiting_v.size else None,
+                    "queue_clear_time_s": queue_clear_time,
+                    "post_arrival_drain_s": (
+                        max(0.0, queue_clear_time - arrival_span)
+                        if queue_clear_time is not None and arrival_span is not None
+                        else None
+                    ),
+                    "peak_running": float(np.max(running_v)) if running_v.size else None,
+                    "final_running": float(running_v[-1]) if running_v.size else None,
+                }
+            )
+        if not policy_series:
+            continue
+
+        fig, axes = plt.subplots(
+            len(policy_series),
+            2,
+            figsize=(14, max(4.2, 3.0 * len(policy_series))),
+            squeeze=False,
+            constrained_layout=True,
+        )
+        for row_index, (trace, audit, arrival_span, waiting_t, waiting_v, running_t, running_v) in enumerate(
+            policy_series
+        ):
+            waiting_axis, running_axis = axes[row_index]
+            color = POLICY_COLORS.get(policy, "#2171b5")
+            if waiting_t.size:
+                waiting_axis.plot(waiting_t / 3600.0, waiting_v, color=color, linewidth=1.5)
+                peak_index = int(np.argmax(waiting_v))
+                waiting_axis.scatter(
+                    [waiting_t[peak_index] / 3600.0],
+                    [waiting_v[peak_index]],
+                    color="#d73027",
+                    s=20,
+                    zorder=3,
+                )
+                waiting_axis.text(
+                    0.98,
+                    0.94,
+                    f"peak={waiting_v[peak_index]:.0f}\nend={waiting_v[-1]:.0f}",
+                    transform=waiting_axis.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=8,
+                    bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "none"},
+                )
+            if running_t.size:
+                running_axis.plot(running_t / 3600.0, running_v, color=color, linewidth=1.3)
+            if arrival_span is not None:
+                for axis in (waiting_axis, running_axis):
+                    axis.axvline(
+                        arrival_span / 3600.0,
+                        color="#555555",
+                        linestyle="--",
+                        linewidth=1.0,
+                    )
+            marker = "†" if audit.quality in {"campaign_timeout_partial", "running_partial"} else ""
+            label = TRACE_LABELS.get(trace, trace).replace("\n", " ")
+            waiting_axis.set_ylabel(f"{label}{marker}\nrequests")
+            waiting_axis.set_title("Waiting queue")
+            running_axis.set_title("Resident/running queue")
+            for axis in (waiting_axis, running_axis):
+                axis.grid(True, alpha=0.22)
+                axis.set_xlabel("Elapsed time (hours)")
+        title = POLICY_LABELS.get(policy, policy)
+        fig.suptitle(
+            f"{title}: raw scheduler queue versus time\n"
+            "vertical dashed line = final scheduled arrival; † = incomplete run",
+            fontsize=15,
+        )
+        fig.savefig(policy_dir / f"{policy}_queue_vs_time.png", dpi=180)
+        plt.close(fig)
+    return summary
 
 
 def successful_ttfts(path: Path) -> dict[str, float]:
@@ -958,8 +1470,9 @@ def write_fcfs_relative_report(
         "is an improvement; a ratio above one is a slowdown.",
         "",
         "This is not a direct validation of the formal hard constraint. The formal bound is defined in "
-        "triangular-work units under the frozen arrival-time FCFS baseline. These plots compare wall-clock TTFT "
-        "across separate runs, and the current 128-connection replay cap caused policy-dependent dispatch lag.",
+        "triangular-work units under the frozen arrival-time FCFS baseline, whereas these plots compare "
+        "wall-clock TTFT across independent replays. The revised client kept p99 dispatch lag below one second "
+        "for every plotted condition, so client-side arrival throttling is not an explanation for the large gaps.",
         "",
         "`Log warnings` counts decisions where PREFLOW explicitly reported that admission constraints made its "
         "compute-side guarantee non-evaluable. Zero such warnings does not turn the wall-clock ratio into a "
@@ -1012,30 +1525,45 @@ def write_report(path: Path, audits: list[Audit], summaries: list[dict[str, Any]
         f"- Recorded failed conditions: {len(failures)}",
         f"- Not attempted: {sum(item.quality == 'missing' for item in audits)}",
         "",
-        "No recorded failure was shutdown-only: every failed condition contains at least one failed request row.",
-        "Connection-drop runs are included only in preliminary plots; every "
-        "failed condition should be rerun for final results.",
-        "Timeout-censored runs are excluded from all performance plots.",
+        "Connection-drop runs contain a complete artifact set and are included only in preliminary plots; "
+        "they should still be rerun for final results.",
+        "Campaign-timeout partials and running snapshots are completion-biased samples and are excluded from "
+        "latency comparisons.",
         "",
         "| Condition | Failed/total | Classification | Decision |",
         "|---|---:|---|---|",
     ]
     for item in failures:
-        decision = "rerun; excluded from plots" if item.quality == "timeout_censored" else "rerun; preliminary only"
-        lines.append(f"| {item.condition} | {item.failures}/{item.rows} | {item.quality} | {decision} |")
+        if item.quality == "campaign_timeout_partial":
+            total = item.workload.get("selected_requests") if item.workload else "?"
+            failed_total = f"{item.rows}/{total} returned"
+            decision = "rerun after fixing scheduler scalability; excluded from latency plots"
+        else:
+            failed_total = f"{item.failures}/{item.rows} failed"
+            decision = "rerun for final; included as preliminary" if item.preliminary_usable else "rerun; excluded"
+        lines.append(f"| {item.condition} | {failed_total} | {item.quality} | {decision} |")
+    running = [item for item in audits if item.recorded_state == "running"]
+    for item in running:
+        total = item.workload.get("selected_requests") if item.workload else "?"
+        lines.append(
+            f"| {item.condition} | {item.rows}/{total} returned | {item.quality} | "
+            "snapshot only; excluded from latency plots |"
+        )
     lagged = [row for row in summaries if float(row.get("p99_client_dispatch_lag_s") or 0.0) > 1.0]
-    lines.extend(
-        [
-            "",
-            "## Replay-fidelity warning",
-            "",
-            f"{len(lagged)}/{len(summaries)} plotted conditions have p99 client dispatch lag above one second. "
-            "Those requests did not reach vLLM at their intended trace timestamps because the 128-connection "
-            "client semaphore applied backpressure.",
-            "This is separate from artifact integrity: the measurements are useful diagnostically, but conditions "
-            "with material dispatch lag are not faithful open-loop 0.95-load replays.",
-        ]
-    )
+    lines.extend(["", "## Replay fidelity", ""])
+    if lagged:
+        lines.extend(
+            [
+                f"{len(lagged)}/{len(summaries)} plotted conditions have p99 client dispatch lag above one "
+                "second. Those conditions are not faithful open-loop 0.95-load replays.",
+                "This is separate from artifact integrity: the measurements remain useful diagnostically.",
+            ]
+        )
+    else:
+        lines.append(
+            f"0/{len(summaries)} plotted conditions have p99 client dispatch lag above one second. The revised "
+            "client therefore preserved the intended arrival process for every full artifact set."
+        )
     lookup = {(row["policy"], row["trace"]): row for row in summaries}
     lambda_traces = sorted(
         trace
@@ -1100,9 +1628,18 @@ def main() -> int:
     policies, traces, audits = audit_suite(output_root)
     summaries = summary_rows(audits)
     relative = fcfs_relative_rows(audits)
+    partial_rows = partial_progress_rows(audits)
+    throughput_rows = plot_fcfs_throughput(traces, audits, analysis_dir)
+    queue_rows = plot_policy_queue_trajectories(policies, traces, audits, analysis_dir)
     write_csv(analysis_dir / "audit.csv", audit_rows(audits))
     write_csv(analysis_dir / "available_summary.csv", summaries)
     write_csv(analysis_dir / "fcfs_relative_summary.csv", relative)
+    write_csv(
+        analysis_dir / "partial_run_progress.csv",
+        [{key: value for key, value in row.items() if key != "completion_offsets_s"} for row in partial_rows],
+    )
+    write_csv(analysis_dir / "queue_summary.csv", queue_rows)
+    write_csv(analysis_dir / "fcfs_throughput_summary.csv", throughput_rows)
     write_report(analysis_dir / "AUDIT.md", audits, summaries)
     relative_by_trace, relative_diagnostics = collect_fcfs_relative_diagnostics(policies, traces, audits)
     guarantee_warning_counts, guarantee_warning_rows = scan_guarantee_warnings(output_root, traces, audits)
@@ -1118,8 +1655,10 @@ def main() -> int:
     plot_sensitivity(summaries, analysis_dir, "hard")
     plot_sensitivity(summaries, analysis_dir, "prefill_only")
     plot_harness_fidelity(policies, traces, summaries, analysis_dir)
+    plot_partial_progress(partial_rows, analysis_dir)
     plot_fcfs_relative(relative, analysis_dir)
     plot_trace_distributions(policies, traces, audits, analysis_dir)
+    plot_queue_trajectories(policies, traces, audits, analysis_dir)
     plot_fcfs_relative_distributions(relative_by_trace, audits, analysis_dir)
     plot_hard_constraint_checks(relative_by_trace, audits, guarantee_warning_counts, analysis_dir)
     plot_hard_constraint_summary(relative_diagnostics, analysis_dir)

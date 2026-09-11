@@ -95,7 +95,13 @@ def condition_state(
         elif (
             status.get("client_protocol_version") != suite.CLIENT_PROTOCOL_VERSION
             or status.get("max_p99_dispatch_lag_s") != suite.MAX_P99_DISPATCH_LAG_S
+            or status.get("target_load") != suite.TARGET_LOAD
+            or status.get("fcfs_service_calibration_sha256")
+            != suite.sha256(suite.FCFS_SERVICE_CALIBRATION)
+            or status.get("fcfs_service_time_scale")
+            != suite.FCFS_SERVICE_SCALES.get(str(status.get("trace")))
             or summary.get("client_protocol_version") != suite.CLIENT_PROTOCOL_VERSION
+            or summary.get("target_load") != suite.TARGET_LOAD
             or summary.get("transport", {}).get("connection_limit") != 0
         ):
             state = "stale"
@@ -105,17 +111,10 @@ def condition_state(
 
 
 def trace_spans(tasks: list[Task]) -> dict[str, float]:
+    del tasks  # Spans are cheap to reconstruct and must use the current calibration.
     spans: dict[str, float] = {}
-    for task in tasks:
-        workload = read_json(task.result / "workload.json") if task.result is not None else None
-        value = None if workload is None else workload.get("scheduled_span_s")
-        if isinstance(value, (int, float)) and value > 0:
-            spans[task.trace] = float(value)
-
     cost_model, _ = replay.load_calibrated_chunk_cost(suite.CALIBRATION)
     for trace in suite.ALL_TRACES:
-        if trace in spans:
-            continue
         _, workload = replay.load_workload(
             suite.TRACE_DIR / f"{trace}.jsonl",
             trace,
@@ -126,6 +125,7 @@ def trace_spans(tasks: list[Task]) -> dict[str, float]:
             suite.MAX_MODEL_LEN,
             suite.MAX_NUM_BATCHED_TOKENS,
             cost_model,
+            suite.FCFS_SERVICE_SCALES[trace],
         )
         spans[trace] = float(workload["scheduled_span_s"])
     return spans
@@ -231,7 +231,7 @@ def main() -> int:
     if counts.get("failed", 0):
         print("\nFailed conditions are counted as full retries; rerun run.py to execute them.")
     if counts.get("stale", 0):
-        print("\nStale conditions used the old bounded HTTP client and will be rerun by run.py.")
+        print("\nStale conditions do not match the current harness configuration and will be rerun by run.py.")
     print(
         "ETA learns from same-trace completed runs, then falls back to the calibrated arrival span. Read-only snapshot."
     )

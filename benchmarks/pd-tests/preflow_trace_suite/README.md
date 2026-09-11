@@ -11,7 +11,7 @@ output token, and does not launch a decode server or vLLM Router.
 - Load format: `dummy`
 - Three NPU groups: `0,1,2,3`, `4,5,6,7`, `8,9,10,11`
 - Tensor parallelism: 4
-- Target calibrated fixed-chunk execution load: 0.95
+- Target empirical FCFS-normalized load: 0.80
 - Maximum resident requests (`max_num_seqs`): 16
 - Maximum chunk: 2,048 tokens
 - Scheduled prefill batch width: exactly one request
@@ -49,6 +49,16 @@ python run.py
 
 Use `python run.py --plan` to print the 88-condition plan without needing
 vLLM, the model, or NPUs. `VLLM_BIN` may point to a non-default vLLM executable.
+
+To run or resume only selected policies, repeat `--policy` as needed:
+
+```bash
+python run.py --policy fcfs
+python run.py --policy sjf --policy srpt
+```
+
+Policy names are the `name` values in `suite_config.json`. Selection does not
+change result paths or resumability, and unselected policies are left alone.
 
 Run `python status.py` at any time for a read-only progress and ETA snapshot.
 It takes one filesystem snapshot from the suite inputs and existing result
@@ -112,8 +122,10 @@ Then append `azure_chat` to `suite_config.json` and rerun `python run.py`.
 Multiple `--trace NAME=PATH` arguments may be supplied. Relative paths are
 resolved under `--source-root`. Use `--force` only when intentionally replacing
 an existing derived trace; a changed trace digest invalidates just that trace's
-conditions. A changed calibration artifact invalidates all conditions because
-it changes load normalization.
+conditions. Add an empirical FCFS scale for the new trace to
+`calibration/fcfs_trace_service_scales.json` before running the matrix. A
+changed cost-model or FCFS-scale artifact invalidates all conditions because it
+changes load normalization.
 
 Each suite configuration is archived by digest under
 `benchmark_output/provenance/suite_configs/`, while `suite_manifest.json` is
@@ -165,15 +177,23 @@ wall-clock time.
 
 ## Load normalization
 
-`calibration/parametric_chunk_cost_model.json` is the bundled dummy-weight TP4
-fixed-chunk calibration for the exact model path used by the suite. It is the
-same execution model used by the PREFLOW simulator: each request's isolated
-service is the sum of its calibrated 2,048-token chunks, including modeled
-linear work and launch overhead. For a selected window with total calibrated
-service `S`, the client stretches the original timestamp span to `S / 0.95`.
-Relative timing, ordering, and bursts within the contiguous trace window are
-preserved. PREFLOW's scheduling decisions themselves continue to use only the
-triangular work model.
+`calibration/parametric_chunk_cost_model.json` provides request-level relative
+costs: each request's isolated service is the sum of its modeled 2,048-token
+chunks, including linear work and launch overhead. The original calibration
+substantially underpredicted saturated execution time, especially for the
+short-request Qwen traces. `calibration/fcfs_trace_service_scales.json`
+therefore records a policy-independent correction measured as saturated FCFS
+makespan divided by summed model service for the same trace prefix and exact
+suite configuration.
+
+The client multiplies every modeled request cost by that trace's FCFS scale
+before both selecting the contiguous service-budget prefix and stretching its
+timestamps. For corrected service `S`, the scheduled span is `S / 0.80`. Thus
+all policies receive the same request IDs and arrivals at an intended 80% of
+empirically observed FCFS capacity. This leaves headroom for workload variance
+and scheduler overhead; that overhead is not calibrated away per policy.
+Relative timing, ordering, and bursts are preserved. PREFLOW scheduling itself
+continues to use only the triangular work model.
 
 This is intentionally a prefill-node experiment. One output token makes TTFT
 the request completion metric while avoiding a router, KV transfer, and a

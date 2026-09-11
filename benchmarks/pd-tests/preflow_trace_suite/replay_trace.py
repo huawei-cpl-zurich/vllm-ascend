@@ -171,9 +171,13 @@ def load_workload(
     max_model_len: int,
     chunk_size: int,
     cost_model: CalibratedChunkCost,
+    service_time_scale: float = 1.0,
 ) -> tuple[list[TraceRequest], dict[str, Any]]:
+    if not math.isfinite(service_time_scale) or service_time_scale <= 0:
+        raise ValueError("service_time_scale must be finite and positive")
     selected: list[tuple[int, float, int, float]] = []
     total_service = 0.0
+    total_uncorrected_service = 0.0
     last_timestamp: float | None = None
     with trace_path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
@@ -191,9 +195,11 @@ def load_workload(
                 )
             if last_timestamp is not None and timestamp < last_timestamp:
                 raise ValueError(f"{trace_path}:{line_number}: timestamps are not nondecreasing")
-            service = cost_model.request_duration_s(prompt_tokens, chunk_size)
+            uncorrected_service = cost_model.request_duration_s(prompt_tokens, chunk_size)
+            service = uncorrected_service * service_time_scale
             selected.append((source_index, timestamp, prompt_tokens, service))
             total_service += service
+            total_uncorrected_service += uncorrected_service
             last_timestamp = timestamp
             if len(selected) >= minimum_requests and total_service >= service_budget_s:
                 break
@@ -233,6 +239,8 @@ def load_workload(
         "arrival_time_scale": time_scale,
         "scheduled_span_s": target_span,
         "predicted_service_s": total_service,
+        "uncorrected_predicted_service_s": total_uncorrected_service,
+        "fcfs_service_time_scale": service_time_scale,
         "target_load": target_load,
         "realized_offered_load_by_construction": total_service / target_span,
         "requests_exceeding_calibrated_history_domain": sum(
@@ -521,6 +529,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         max_model_len=args.max_model_len,
         chunk_size=args.chunk_size,
         cost_model=cost_model,
+        service_time_scale=args.service_time_scale,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(
@@ -723,6 +732,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=262_144)
     parser.add_argument("--chunk-size", type=int, default=2_048)
     parser.add_argument(
+        "--service-time-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "policy-independent multiplier applied to modeled request service "
+            "for workload selection and arrival-rate normalization"
+        ),
+    )
+    parser.add_argument(
         "--campaign-timeout-s",
         type=float,
         default=DEFAULT_CAMPAIGN_TIMEOUT_S,
@@ -746,6 +764,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("service budget and minimum requests must be positive")
     if args.chunk_size <= 0:
         parser.error("--chunk-size must be positive")
+    if not math.isfinite(args.service_time_scale) or args.service_time_scale <= 0:
+        parser.error("--service-time-scale must be finite and positive")
     if args.maximum_requests < args.minimum_requests:
         parser.error("--maximum-requests must be at least --minimum-requests")
     if args.campaign_timeout_s <= 0 or args.warmup_timeout_s <= 0:

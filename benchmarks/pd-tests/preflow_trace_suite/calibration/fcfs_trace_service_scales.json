@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "method": "Measured saturated FCFS request makespan divided by the parametric model's summed service for the same trace prefix. The scale is policy-independent and is applied before prefix selection and arrival stretching.",
+  "environment": {
+    "model": "/data/weights/Qwen3-Coder-30B-A3B-Instruct/",
+    "load_format": "dummy",
+    "tensor_parallel_size": 4,
+    "max_num_batched_tokens": 2048,
+    "max_num_batched_seqs": 1,
+    "async_scheduling": true,
+    "output_tokens": 1,
+    "prefix_caching": false
+  },
+  "traces": {
+    "mooncake_conversation": {
+      "measured_fcfs_makespan_s": 1005.348201,
+      "modeled_service_s": 604.886831,
+      "service_time_scale": 1.662043
+    },
+    "mooncake_arxiv": {
+      "measured_fcfs_makespan_s": 1155.421892,
+      "modeled_service_s": 600.550804,
+      "service_time_scale": 1.923937
+    },
+    "mooncake_synthetic": {
+      "measured_fcfs_makespan_s": 1036.361530,
+      "modeled_service_s": 600.596948,
+      "service_time_scale": 1.725552
+    },
+    "mooncake_toolagent": {
+      "measured_fcfs_makespan_s": 1150.176033,
+      "modeled_service_s": 600.163879,
+      "service_time_scale": 1.916437
+    },
+    "qwen_coder": {
+      "measured_fcfs_makespan_s": 1587.535902,
+      "modeled_service_s": 600.130173,
+      "service_time_scale": 2.645319
+    },
+    "qwen_thinking": {
+      "measured_fcfs_makespan_s": 1613.124126,
+      "modeled_service_s": 600.045437,
+      "service_time_scale": 2.688337
+    },
+    "qwen_trace_a": {
+      "measured_fcfs_makespan_s": 2499.146741,
+      "modeled_service_s": 600.017800,
+      "service_time_scale": 4.165121
+    },
+    "qwen_trace_b": {
+      "measured_fcfs_makespan_s": 6064.426584,
+      "modeled_service_s": 600.022826,
+      "service_time_scale": 10.106993
+    }
+  }
+}
