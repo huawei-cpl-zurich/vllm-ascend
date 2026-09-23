@@ -5,6 +5,7 @@
 # Adapted from vllm-project/vllm/vllm/v1/core/sched/scheduler.py
 # at vLLM v0.25.1.
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -35,6 +36,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -67,15 +69,27 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm_ascend.core.preflow_cost_model import (
+    PREFLOW_CALIBRATION_REQUEST_ATTR,
+    PREFLOW_CALIBRATION_REQUEST_PREFIX,
+    PREFLOW_PROFILE_ELAPSED_MS_ATTR,
+    PREFLOW_PROFILE_METADATA_ATTR,
+    PreflowProfileSample,
+    ProfiledPrefillCostModel,
+    TriangularPrefillCostModel,
+    fit_profiled_prefill_cost_model,
+)
 from vllm_ascend.queue_stats import QueueStatsTracer, create_queue_stats_tracer
 
 _PREFLOW_MIN_WORK = 1e-12
 _PREFLOW_BATCH_ID_ATTR = "_vllm_ascend_preflow_batch_id"
+_PREFLOW_PROFILE_REPETITIONS = 3
+_PREFLOW_PROFILE_MAX_STEPS_AFTER_PROMPT = 4
 
 
 @dataclass
 class _PREFLOWBatchWork:
-    """Triangular prefill work dispatched but not yet completed."""
+    """Modeled prefill work dispatched but not yet completed."""
 
     total_work: float
     work_by_req_id: dict[str, float]
@@ -136,7 +150,7 @@ class _PREFLOWWaitingBatchState:
     scheduled_running_reqs: list[Request]
     req_to_new_blocks: dict[str, KVCacheBlocks]
     num_scheduled_tokens: dict[str, int]
-    preflow_scheduled_chunks: list[tuple[str, int, int]]
+    preflow_scheduled_chunks: list[tuple[str, int, int, bool]]
     scheduled_spec_decode_tokens: dict[str, list[int]]
     scheduled_encoder_inputs: dict[str, list[int]]
     scheduled_loras: set[int]
@@ -414,6 +428,11 @@ class PREFLOWScheduler(SchedulerInterface):
         self.preflow_rho = 1.0 + self.preflow_max_fcfs_inflation
         self.preflow_micro_prefill_isl_threshold = preflow_config.micro_prefill_isl_threshold
         self.preflow_max_num_batched_seqs = preflow_config.max_num_batched_seqs
+        self.preflow_work_model_name = preflow_config.work_model
+        self._preflow_cost_model: TriangularPrefillCostModel | ProfiledPrefillCostModel = TriangularPrefillCostModel()
+        self._preflow_calibration_active = False
+        self._preflow_calibration_samples: list[PreflowProfileSample] = []
+        self._preflow_calibration_discard_request_ids: set[str] = set()
         self._preflow_validate_config()
 
         # PREFLOW per-request state. Initial history, FCFS baseline, and
@@ -436,6 +455,10 @@ class PREFLOWScheduler(SchedulerInterface):
         )
 
     def _preflow_validate_config(self) -> None:
+        if self.parallel_config.pipeline_parallel_size != 1:
+            raise ValueError(
+                "PREFLOW supports tensor parallelism but not pipeline parallelism; set pipeline_parallel_size=1."
+            )
         if self.preflow_max_fcfs_inflation < 0:
             raise ValueError(f"PREFLOW requires max_fcfs_inflation >= 0, got {self.preflow_max_fcfs_inflation}.")
         if self.preflow_micro_prefill_isl_threshold < 0:
@@ -448,10 +471,323 @@ class PREFLOWScheduler(SchedulerInterface):
                 f"[1, max_num_seqs={self.max_num_running_reqs}], got "
                 f"{self.preflow_max_num_batched_seqs}."
             )
+        if self.preflow_work_model_name not in {"triangular", "profiled"}:
+            raise ValueError(
+                f"PREFLOW work_model must be 'triangular' or 'profiled', got {self.preflow_work_model_name!r}."
+            )
+        if self.preflow_work_model_name == "profiled" and self.preflow_max_num_batched_seqs != 1:
+            raise ValueError(
+                "PREFLOW's profiled work model requires max_num_batched_seqs=1 so measured chunk costs remain additive."
+            )
+
+    @property
+    def preflow_requires_startup_profile(self) -> bool:
+        return self.preflow_work_model_name == "profiled"
+
+    def _preflow_profile_chunk_size(self) -> int:
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if threshold > 0:
+            return min(threshold, self.max_num_scheduled_tokens)
+        return self.max_num_scheduled_tokens
+
+    def _preflow_profile_history_limit(self, chunk_size: int) -> int:
+        maximum_prompt = self.max_model_len - self.num_sampled_tokens_per_step
+        kv_capacity = getattr(self.cache_config, "kv_cache_size_tokens", None)
+        if kv_capacity is not None:
+            maximum_prompt = min(maximum_prompt, int(kv_capacity) - self.num_sampled_tokens_per_step)
+        history_limit = maximum_prompt // chunk_size * chunk_size
+        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        while history_limit > 0:
+            required_blocks = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+                request_id=f"{PREFLOW_CALIBRATION_REQUEST_PREFIX}capacity_probe",
+                num_tokens=history_limit,
+                new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=0,
+                num_local_computed_tokens=0,
+                num_tokens_main_model=history_limit,
+                apply_admission_cap=True,
+            )
+            if required_blocks <= free_blocks:
+                break
+            history_limit = (history_limit * free_blocks // max(1, required_blocks)) // chunk_size * chunk_size
+        if history_limit < 4 * chunk_size:
+            raise RuntimeError(
+                "PREFLOW profiling requires room for at least four full "
+                f"chunks, but only {history_limit} tokens fit with chunk "
+                f"size {chunk_size}."
+            )
+        return history_limit
+
+    @staticmethod
+    def _preflow_profile_short_sizes(chunk_size: int) -> list[int]:
+        sizes = {
+            1,
+            16,
+            64,
+            chunk_size // 16,
+            chunk_size // 8,
+            chunk_size // 4,
+            chunk_size // 2,
+            3 * chunk_size // 4,
+            chunk_size,
+        }
+        return sorted(size for size in sizes if 0 < size <= chunk_size)
+
+    def _preflow_make_calibration_request(
+        self,
+        engine_core: Any,
+        prompt_tokens: int,
+        request_index: int,
+        *,
+        discard: bool,
+    ) -> Request:
+        request_id = f"{PREFLOW_CALIBRATION_REQUEST_PREFIX}{request_index}"
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            ignore_eos=True,
+            max_tokens=1,
+            min_tokens=1,
+        )
+        request = Request(
+            request_id=request_id,
+            prompt_token_ids=[1] * prompt_tokens,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            cache_salt=request_id,
+            block_hasher=getattr(engine_core, "request_block_hasher", None),
+        )
+        setattr(request, PREFLOW_CALIBRATION_REQUEST_ATTR, True)
+        if discard:
+            self._preflow_calibration_discard_request_ids.add(request_id)
+        return request
+
+    def _preflow_run_calibration_request(
+        self,
+        engine_core: Any,
+        prompt_tokens: int,
+        request_index: int,
+        *,
+        discard: bool,
+        chunk_size: int,
+    ) -> None:
+        request = self._preflow_make_calibration_request(
+            engine_core,
+            prompt_tokens,
+            request_index,
+            discard=discard,
+        )
+        engine_core.add_request(request)
+        max_steps = (prompt_tokens + chunk_size - 1) // chunk_size + _PREFLOW_PROFILE_MAX_STEPS_AFTER_PROMPT
+        for _ in range(max_steps):
+            _, model_executed = engine_core.step()
+            engine_core.post_step(model_executed)
+            request_present = request.request_id in self.requests
+            if not request_present and not self.has_finished_requests():
+                if not self.reset_prefix_cache():
+                    raise RuntimeError(
+                        f"PREFLOW could not release calibration KV blocks after request {request.request_id}."
+                    )
+                return
+            if request_present and not model_executed:
+                raise RuntimeError(
+                    "PREFLOW calibration request could not be admitted with "
+                    f"prompt length {prompt_tokens}; full-sequence KV "
+                    "reservation did not fit."
+                )
+        raise RuntimeError(
+            f"PREFLOW calibration request did not finish within the expected {max_steps} scheduler steps."
+        )
+
+    def _preflow_abort_calibration_requests(self) -> None:
+        calibration_ids = [
+            request_id
+            for request_id, request in self.requests.items()
+            if getattr(request, PREFLOW_CALIBRATION_REQUEST_ATTR, False)
+        ]
+        if calibration_ids:
+            self.finish_requests(calibration_ids, RequestStatus.FINISHED_ABORTED)
+
+    def _preflow_reset_after_calibration(self) -> None:
+        if self.running or self.waiting or self.skipped_waiting or self.requests:
+            raise RuntimeError("PREFLOW calibration cleanup left requests in scheduler queues.")
+        if self.has_finished_requests():
+            raise RuntimeError("PREFLOW calibration cleanup left worker request cleanup pending.")
+        if self._inflight_prefills:
+            raise RuntimeError("PREFLOW calibration cleanup left in-flight prefills.")
+        if self._preflow_pending_batch_work:
+            raise RuntimeError("PREFLOW calibration cleanup left pending batch work.")
+        if self.deferred_frees:
+            raise RuntimeError("PREFLOW calibration cleanup left deferred KV frees.")
+        self._preflow_initial_history.clear()
+        self._preflow_initial_history_authoritative.clear()
+        self._preflow_fcfs_baseline.clear()
+        self._preflow_deadline.clear()
+        self._preflow_arrival_order.clear()
+        self._preflow_next_arrival_order = 0
+        self._preflow_service_clock = 0.0
+        self._preflow_next_batch_id = 0
+        self._preflow_planning_active = False
+        self._preflow_planning_snapshot = None
+        self.current_step = 0
+        self.sched_step_seq = 0
+        self.processed_step_seq = 0
+        self.prefill_capacity_bound = False
+
+    def run_preflow_startup_profile(self, engine_core: Any) -> None:
+        """Calibrate T(c, h) before EngineCore begins accepting requests."""
+        if not self.preflow_requires_startup_profile:
+            return
+        if self.has_requests() or self.requests:
+            raise RuntimeError("PREFLOW startup profiling requires an empty scheduler.")
+
+        chunk_size = self._preflow_profile_chunk_size()
+        history_limit = self._preflow_profile_history_limit(chunk_size)
+        free_blocks_before = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        original_connector = self.connector
+        original_ec_connector = self.ec_connector
+        request_index = 0
+        started_at = time.perf_counter()
+        self._preflow_calibration_active = True
+        self._preflow_calibration_samples.clear()
+        self._preflow_calibration_discard_request_ids.clear()
+        self.connector = None
+        self.ec_connector = None
+
+        logger.info(
+            "PREFLOW startup profiling begins: chunk_size=%d, history_limit=%d, repetitions=%d",
+            chunk_size,
+            history_limit,
+            _PREFLOW_PROFILE_REPETITIONS,
+        )
+        profile_failed = False
+        try:
+            self._preflow_run_calibration_request(
+                engine_core,
+                history_limit,
+                request_index,
+                discard=True,
+                chunk_size=chunk_size,
+            )
+            request_index += 1
+            for _ in range(_PREFLOW_PROFILE_REPETITIONS):
+                self._preflow_run_calibration_request(
+                    engine_core,
+                    history_limit,
+                    request_index,
+                    discard=False,
+                    chunk_size=chunk_size,
+                )
+                request_index += 1
+
+            for short_size in self._preflow_profile_short_sizes(chunk_size):
+                self._preflow_run_calibration_request(
+                    engine_core,
+                    short_size,
+                    request_index,
+                    discard=True,
+                    chunk_size=chunk_size,
+                )
+                request_index += 1
+                for _ in range(_PREFLOW_PROFILE_REPETITIONS):
+                    self._preflow_run_calibration_request(
+                        engine_core,
+                        short_size,
+                        request_index,
+                        discard=False,
+                        chunk_size=chunk_size,
+                    )
+                    request_index += 1
+
+            fitted_model = fit_profiled_prefill_cost_model(
+                self._preflow_calibration_samples,
+                chunk_size=chunk_size,
+                calibration_history=history_limit,
+                maximum_history=self.max_model_len - self.num_sampled_tokens_per_step,
+            )
+            self._preflow_cost_model = fitted_model
+            measured_samples = [sample for sample in self._preflow_calibration_samples if not sample.discard]
+            absolute_errors = [
+                abs(
+                    fitted_model.chunk_cost(
+                        sample.history,
+                        sample.chunk_size,
+                        is_final=sample.is_final,
+                    )
+                    - sample.elapsed_ms
+                )
+                for sample in measured_samples
+            ]
+            rmse_ms = (sum(error * error for error in absolute_errors) / len(absolute_errors)) ** 0.5
+            max_relative_error = max(
+                error / sample.elapsed_ms
+                for error, sample in zip(
+                    absolute_errors,
+                    measured_samples,
+                )
+            )
+            logger.info(
+                "PREFLOW startup profile fitted: theta=(%.6g, %.6g, %.6g), "
+                "final_overhead=%.6g ms, samples=%d, rmse=%.4f ms, "
+                "max_relative_error=%.2f%%",
+                fitted_model.theta_0,
+                fitted_model.theta_1,
+                fitted_model.theta_2,
+                fitted_model.final_overhead,
+                len(self._preflow_calibration_samples),
+                rmse_ms,
+                max_relative_error * 100.0,
+            )
+        except BaseException:
+            profile_failed = True
+            raise
+        finally:
+            try:
+                try:
+                    self._preflow_abort_calibration_requests()
+                    if not self.reset_prefix_cache():
+                        raise RuntimeError("PREFLOW calibration could not reset the KV prefix cache.")
+                    self._preflow_reset_after_calibration()
+                    free_blocks_after = self.kv_cache_manager.block_pool.get_num_free_blocks()
+                    if free_blocks_after != free_blocks_before:
+                        raise RuntimeError(
+                            "PREFLOW calibration leaked KV blocks: "
+                            f"free before={free_blocks_before}, free after={free_blocks_after}."
+                        )
+                except Exception:
+                    if not profile_failed:
+                        raise
+                    logger.exception(
+                        "PREFLOW cleanup also failed after the startup profile failed; "
+                        "the original profiling error is preserved."
+                    )
+            finally:
+                self.connector = original_connector
+                self.ec_connector = original_ec_connector
+                self._preflow_calibration_active = False
+                self._preflow_calibration_discard_request_ids.clear()
+
+        logger.info(
+            "PREFLOW startup profiling completed in %.2f s; all calibration KV blocks were released.",
+            time.perf_counter() - started_at,
+        )
 
     def _preflow_work(self, num_tokens: int) -> float:
         tokens = float(max(0, int(num_tokens)))
         return tokens * (tokens + 1.0) / 2.0
+
+    def _preflow_interval_work(
+        self,
+        start_history: int,
+        end_history: int,
+        *,
+        include_final: bool = True,
+    ) -> float:
+        return self._preflow_cost_model.interval_cost(
+            start_history,
+            end_history,
+            include_final=include_final,
+        )
 
     def _preflow_prompt_history(
         self,
@@ -520,9 +856,10 @@ class PREFLOWScheduler(SchedulerInterface):
     ) -> float:
         prompt_tokens = request.num_prompt_tokens
         initial_history = self._preflow_get_initial_history(request)
-        return max(
-            0.0,
-            self._preflow_work(prompt_tokens) - self._preflow_work(initial_history),
+        return self._preflow_interval_work(
+            initial_history,
+            prompt_tokens,
+            include_final=True,
         )
 
     def _preflow_remaining_work(self, request: Request) -> float:
@@ -534,8 +871,11 @@ class PREFLOWScheduler(SchedulerInterface):
         if history == 0 and getattr(request, "num_preemptions", 0) == 0:
             # Before first admission, use the cache estimate frozen at enqueue.
             history = self._preflow_initial_history.get(request.request_id, 0)
-        remaining_work = self._preflow_work(prompt_tokens) - self._preflow_work(history)
-        return max(0.0, remaining_work)
+        return self._preflow_interval_work(
+            history,
+            prompt_tokens,
+            include_final=True,
+        )
 
     def _preflow_has_unfinished_prefill(self, request: Request) -> bool:
         return self._preflow_prompt_history(request) < request.num_prompt_tokens
@@ -669,11 +1009,7 @@ class PREFLOWScheduler(SchedulerInterface):
         # A request whose whole remainder is already dispatched completes
         # before the next action and cannot be delayed by that action.
         edf_requests = sorted(
-            (
-                request
-                for request in deadline_requests
-                if remaining_work[request.request_id] > _PREFLOW_MIN_WORK
-            ),
+            (request for request in deadline_requests if remaining_work[request.request_id] > _PREFLOW_MIN_WORK),
             key=self._preflow_edf_key,
         )
 
@@ -744,9 +1080,7 @@ class PREFLOWScheduler(SchedulerInterface):
                 continue
             resident_ids.add(request_id)
             resident_drain_work += (
-                remaining_work[request_id]
-                if request_id in remaining_work
-                else self._preflow_remaining_work(resident)
+                remaining_work[request_id] if request_id in remaining_work else self._preflow_remaining_work(resident)
             )
 
         return _PREFLOWPlanningSnapshot(
@@ -802,8 +1136,18 @@ class PREFLOWScheduler(SchedulerInterface):
                 request.request_id,
             )
 
-    def _preflow_chunk_work(self, history: int, chunk_size: int) -> float:
-        return self._preflow_work(history + chunk_size) - self._preflow_work(history)
+    def _preflow_chunk_work(
+        self,
+        history: int,
+        chunk_size: int,
+        *,
+        is_final: bool = False,
+    ) -> float:
+        return self._preflow_cost_model.chunk_cost(
+            history,
+            chunk_size,
+            is_final=is_final,
+        )
 
     def _preflow_chunk_is_safe(
         self,
@@ -905,7 +1249,11 @@ class PREFLOWScheduler(SchedulerInterface):
             self.max_model_len - request.num_computed_tokens - self.num_sampled_tokens_per_step,
         )
         prefill_chunk = min(max(0, num_new_tokens), request.num_prompt_tokens - history)
-        return self._preflow_chunk_work(history, prefill_chunk)
+        return self._preflow_chunk_work(
+            history,
+            prefill_chunk,
+            is_final=history + prefill_chunk >= request.num_prompt_tokens,
+        )
 
     def _preflow_preferred_request(self, token_budget: int) -> Request | None:
         actions: list[tuple[Request, float]] = []
@@ -972,7 +1320,7 @@ class PREFLOWScheduler(SchedulerInterface):
 
     def _preflow_add_scheduled_chunk(
         self,
-        scheduled_chunks: list[tuple[str, int, int]],
+        scheduled_chunks: list[tuple[str, int, int, bool]],
         request: Request,
         history: int,
         num_new_tokens: int,
@@ -982,18 +1330,29 @@ class PREFLOWScheduler(SchedulerInterface):
         prefill_chunk = min(num_new_tokens, prompt_tokens - prompt_history)
         if prefill_chunk <= 0:
             return
-        scheduled_chunks.append((request.request_id, prompt_history, prefill_chunk))
+        scheduled_chunks.append(
+            (
+                request.request_id,
+                prompt_history,
+                prefill_chunk,
+                prompt_history + prefill_chunk >= prompt_tokens,
+            )
+        )
 
     def _preflow_remember_batch_work(
         self,
         scheduler_output: SchedulerOutput,
-        scheduled_chunks: list[tuple[str, int, int]],
+        scheduled_chunks: list[tuple[str, int, int, bool]],
     ) -> None:
         if not scheduled_chunks:
             return
         work_by_req_id: dict[str, float] = defaultdict(float)
-        for request_id, history, chunk_size in scheduled_chunks:
-            work_by_req_id[request_id] += self._preflow_chunk_work(history, chunk_size)
+        for request_id, history, chunk_size, is_final in scheduled_chunks:
+            work_by_req_id[request_id] += self._preflow_chunk_work(
+                history,
+                chunk_size,
+                is_final=is_final,
+            )
         total_work = sum(work_by_req_id.values())
         if total_work <= _PREFLOW_MIN_WORK:
             return
@@ -1003,6 +1362,64 @@ class PREFLOWScheduler(SchedulerInterface):
         self._preflow_pending_batch_work[batch_id] = _PREFLOWBatchWork(
             total_work=total_work,
             work_by_req_id=dict(work_by_req_id),
+        )
+
+    def _preflow_attach_profile_metadata(
+        self,
+        scheduler_output: SchedulerOutput,
+        scheduled_chunks: list[tuple[str, int, int, bool]],
+    ) -> None:
+        if not self._preflow_calibration_active or not scheduled_chunks:
+            return
+        calibration_chunks = [
+            chunk
+            for chunk in scheduled_chunks
+            if (
+                (request := self.requests.get(chunk[0])) is not None
+                and getattr(request, PREFLOW_CALIBRATION_REQUEST_ATTR, False)
+            )
+        ]
+        if not calibration_chunks:
+            return
+        if len(calibration_chunks) != 1 or len(scheduler_output.num_scheduled_tokens) != 1:
+            raise RuntimeError("PREFLOW startup profiling requires exactly one scheduled calibration chunk.")
+        request_id, history, chunk_size, is_final = calibration_chunks[0]
+        setattr(
+            scheduler_output,
+            PREFLOW_PROFILE_METADATA_ATTR,
+            {
+                "request_id": request_id,
+                "history": history,
+                "chunk_size": chunk_size,
+                "is_final": is_final,
+                "discard": request_id in self._preflow_calibration_discard_request_ids,
+            },
+        )
+
+    def _preflow_record_profile_sample(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        metadata = getattr(scheduler_output, PREFLOW_PROFILE_METADATA_ATTR, None)
+        if metadata is None:
+            return
+        elapsed_ms = getattr(model_runner_output, PREFLOW_PROFILE_ELAPSED_MS_ATTR, None)
+        if (
+            elapsed_ms is None
+            or not isinstance(elapsed_ms, (int, float))
+            or not math.isfinite(elapsed_ms)
+            or elapsed_ms <= 0
+        ):
+            raise RuntimeError("PREFLOW calibration model output did not contain a valid execution time.")
+        self._preflow_calibration_samples.append(
+            PreflowProfileSample(
+                history=int(metadata["history"]),
+                chunk_size=int(metadata["chunk_size"]),
+                elapsed_ms=float(elapsed_ms),
+                is_final=bool(metadata["is_final"]),
+                discard=bool(metadata["discard"]),
+            )
         )
 
     def _preflow_apply_completed_batch_work(self, scheduler_output: SchedulerOutput) -> None:
@@ -1387,8 +1804,16 @@ class PREFLOWScheduler(SchedulerInterface):
 
         prefill_chunk = min(remaining_prefill_tokens, num_new_tokens)
         if prefill_chunk > 0:
-            chunk_work = self._preflow_chunk_work(num_computed_tokens, prefill_chunk)
-            remaining_work = self._preflow_work(request.num_prompt_tokens) - self._preflow_work(num_computed_tokens)
+            chunk_work = self._preflow_chunk_work(
+                num_computed_tokens,
+                prefill_chunk,
+                is_final=(num_computed_tokens + prefill_chunk >= request.num_prompt_tokens),
+            )
+            remaining_work = self._preflow_interval_work(
+                num_computed_tokens,
+                request.num_prompt_tokens,
+                include_final=True,
+            )
             if not self._preflow_chunk_is_safe(
                 request,
                 chunk_work,
@@ -1608,7 +2033,7 @@ class PREFLOWScheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        preflow_scheduled_chunks: list[tuple[str, int, int]] = []
+        preflow_scheduled_chunks: list[tuple[str, int, int, bool]] = []
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -1744,7 +2169,11 @@ class PREFLOWScheduler(SchedulerInterface):
 
             prefill_chunk = min(remaining_prefill_tokens, num_new_tokens)
             if prefill_chunk > 0:
-                chunk_work = self._preflow_chunk_work(request.num_computed_tokens, prefill_chunk)
+                chunk_work = self._preflow_chunk_work(
+                    request.num_computed_tokens,
+                    prefill_chunk,
+                    is_final=(request.num_computed_tokens + prefill_chunk >= request.num_prompt_tokens),
+                )
                 if not self._preflow_chunk_is_safe(
                     request,
                     chunk_work,
@@ -2039,9 +2468,13 @@ class PREFLOWScheduler(SchedulerInterface):
             scheduler_output,
             preflow_scheduled_chunks,
         )
+        self._preflow_attach_profile_metadata(
+            scheduler_output,
+            preflow_scheduled_chunks,
+        )
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
-        if self._queue_stats_tracer is not None:
+        if self._queue_stats_tracer is not None and not self._preflow_calibration_active:
             self._queue_stats_tracer.record(self)
         self._preflow_planning_active = False
         self._preflow_planning_snapshot = None
@@ -2395,6 +2828,10 @@ class PREFLOWScheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._preflow_record_profile_sample(
+            scheduler_output,
+            model_runner_output,
+        )
         self._preflow_apply_completed_batch_work(scheduler_output)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs

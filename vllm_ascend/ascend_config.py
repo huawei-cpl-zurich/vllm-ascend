@@ -59,6 +59,10 @@ class AscendConfig:
             additional_config,
             balance_env_value=ascend_envs.VLLM_ASCEND_BALANCE_SCHEDULING,
         )
+        if self.scheduler_config.preflow_config.enabled and vllm_config.parallel_config.pipeline_parallel_size != 1:
+            raise ValueError(
+                "PREFLOW supports tensor parallelism but not pipeline parallelism; set pipeline_parallel_size=1."
+            )
         if self.scheduler_config.profiling_chunk_config.enabled:
             max_batched = vllm_config.scheduler_config.max_num_batched_tokens
             if max_batched < self.scheduler_config.profiling_chunk_config.min_chunk:
@@ -787,10 +791,12 @@ class PREFLOWConfig:
     (``kv_role="kv_producer"``). Decode and other node roles retain their
     normal scheduler when this configuration is enabled.
 
-    PREFLOW uses the fixed triangular attention-work proxy
-    ``W(n) = n * (n + 1) / 2``. ``max_fcfs_inflation`` is the maximum
-    completion-time inflation relative to the request's frozen FCFS baseline;
-    for example, ``0.5`` permits completion at most 50% later.
+    ``work_model="triangular"`` uses the original attention-work proxy
+    ``W(n) = n * (n + 1) / 2``. ``work_model="profiled"`` calibrates a
+    deterministic fixed-chunk runtime model during engine startup.
+    ``max_fcfs_inflation`` is the maximum completion-time inflation relative
+    to the request's frozen FCFS baseline; for example, ``0.5`` permits
+    completion at most 50% later in the selected model's units.
 
     ``work_exponent``, ``admission_bypass_budget``, ``age_priority_double``,
     and ``waiting_policy`` are deprecated compatibility fields. They are
@@ -825,6 +831,7 @@ class PREFLOWConfig:
     _defaults = {
         "enabled": False,
         "max_fcfs_inflation": 0.5,
+        "work_model": "triangular",
         # Deprecated and unused policy fields retained for compatibility.
         "work_exponent": 1.5,
         "admission_bypass_budget": 0.2,
@@ -859,6 +866,7 @@ class PREFLOWConfig:
                 self._defaults["max_fcfs_inflation"],
             )
         )
+        self.work_model = str(user_config.get("work_model", self._defaults["work_model"]))
         self.work_exponent = float(user_config.get("work_exponent", self._defaults["work_exponent"]))
         self.admission_bypass_budget = float(
             user_config.get(
@@ -900,6 +908,8 @@ class PREFLOWConfig:
             )
         if self.max_num_batched_seqs <= 0:
             raise ValueError(f"preflow_config.max_num_batched_seqs must be positive, got {self.max_num_batched_seqs}")
+        if self.work_model not in {"triangular", "profiled"}:
+            raise ValueError(f"preflow_config.work_model must be 'triangular' or 'profiled', got {self.work_model!r}")
 
 
 class PrefillOnlyConfig:

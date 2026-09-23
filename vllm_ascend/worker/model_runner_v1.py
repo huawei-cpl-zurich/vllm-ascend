@@ -132,6 +132,10 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.core.preflow_cost_model import (
+    PREFLOW_PROFILE_ELAPSED_MS_ATTR,
+    PREFLOW_PROFILE_METADATA_ATTR,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
 )
@@ -1780,6 +1784,14 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        preflow_profile_batch = getattr(
+            scheduler_output,
+            PREFLOW_PROFILE_METADATA_ATTR,
+            None,
+        ) is not None
+        if preflow_profile_batch:
+            self._sync_device()
+            self._preflow_profile_start_time = time.perf_counter()
         if vllm_version_is("0.27.1"):
             if self.vllm_config.model_config.enable_return_routed_experts and self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -2365,6 +2377,19 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats=cudagraph_stats,
             routed_experts=None,
         )
+        preflow_profile_start = getattr(
+            self,
+            "_preflow_profile_start_time",
+            None,
+        )
+        if preflow_profile_start is not None:
+            self._sync_device()
+            setattr(
+                model_runner_output,
+                PREFLOW_PROFILE_ELAPSED_MS_ATTR,
+                (time.perf_counter() - preflow_profile_start) * 1000.0,
+            )
+            del self._preflow_profile_start_time
         if self.ascend_config.scheduler_config.profiling_chunk_config.need_timing and hasattr(
             self, "_execution_start_time"
         ):
