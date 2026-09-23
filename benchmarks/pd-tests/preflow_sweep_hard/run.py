@@ -446,6 +446,14 @@ def parse_args() -> argparse.Namespace:
         help="resume an existing sweep root, skipping completed conditions",
     )
     parser.add_argument(
+        "--retry-failed-only",
+        action="store_true",
+        help=(
+            "with --resume, rerun only conditions whose saved status is failed; "
+            "completed and not-yet-started conditions are left untouched"
+        ),
+    )
+    parser.add_argument(
         "--plan-only",
         action="store_true",
         help="print the deployment/run plan without launching anything",
@@ -453,6 +461,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.resume is not None and args.output_root is not None:
         parser.error("--resume and --output-root are mutually exclusive")
+    if args.retry_failed_only and args.resume is None:
+        parser.error("--retry-failed-only requires --resume")
     return args
 
 
@@ -685,6 +695,17 @@ def run_is_complete(condition_dir: Path) -> bool:
         return False
     result_path = Path(result_value)
     return status.get("status") == "completed" and (result_path / "summary.json").is_file()
+
+
+def run_has_failed(condition_dir: Path) -> bool:
+    status_path = condition_dir / "status.json"
+    if not status_path.is_file():
+        return False
+    try:
+        status = load_json(status_path)
+    except (OSError, ValueError, SweepError):
+        return False
+    return status.get("status") == "failed"
 
 
 def execute_run(
@@ -976,20 +997,51 @@ def config_from_manifest(manifest: dict[str, Any]) -> SweepConfig:
     return SweepConfig(**values)
 
 
-def print_plan(config: SweepConfig) -> None:
+def selected_runs(
+    config: SweepConfig,
+    root: Path,
+    deployment: DeploymentSpec,
+    retry_failed_only: bool,
+) -> list[RunSpec]:
+    runs = run_specs(config, deployment)
+    if not retry_failed_only:
+        return runs
+    deployment_dir = root / "deployments" / f"{deployment.ordinal:02d}-{deployment.name}"
+    return [
+        run
+        for run in runs
+        if run_has_failed(deployment_dir / "runs" / run.name)
+    ]
+
+
+def print_plan(
+    config: SweepConfig,
+    root: Path | None = None,
+    retry_failed_only: bool = False,
+) -> None:
     deployments = deployment_specs(config)
+    if retry_failed_only:
+        assert root is not None
+        planned = [
+            (deployment, selected_runs(config, root, deployment, True))
+            for deployment in deployments
+        ]
+        planned = [(deployment, runs) for deployment, runs in planned if runs]
+    else:
+        planned = [(deployment, run_specs(config, deployment)) for deployment in deployments]
     print(f"Model: {config.model}")
     print(f"NPUs: {config.npu_ids} (one TP=2 prefill and one TP=2 decode worker)")
-    print(f"Model loads: {len(deployments)}")
-    print(f"Measured runs: {sum(len(run_specs(config, spec)) for spec in deployments)}")
-    for deployment in deployments:
+    print(f"Selection: {'failed conditions only' if retry_failed_only else 'full sweep'}")
+    print(f"Model loads: {len(planned)}")
+    print(f"Measured runs: {sum(len(runs) for _, runs in planned)}")
+    for deployment, runs in planned:
         print(
             f"  {deployment.ordinal + 1}. {deployment.name}: "
             f"scheduler={deployment.scheduler_label}, "
             f"max_fcfs_inflation={number_text(deployment.max_fcfs_inflation)}, "
             f"work_model={deployment.work_model}"
         )
-        for run in run_specs(config, deployment):
+        for run in runs:
             print(
                 f"       arrival_rate={number_text(run.arrival_rate)}, "
                 f"decode_tokens={run.decode_length}, requests={config.request_count}"
@@ -1004,10 +1056,23 @@ def install_signal_handlers() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
 
 
-def execute_sweep(config: SweepConfig, root: Path, events: EventLog) -> None:
+def execute_sweep(
+    config: SweepConfig,
+    root: Path,
+    events: EventLog,
+    retry_failed_only: bool = False,
+) -> None:
     refresh_run_index(root, config)
     for deployment_spec in deployment_specs(config):
-        if deployment_is_complete(root, config, deployment_spec):
+        runs = selected_runs(config, root, deployment_spec, retry_failed_only)
+        if retry_failed_only and not runs:
+            LOGGER.info("Skipping deployment %s: no failed runs", deployment_spec.name)
+            events.write(
+                "deployment_skipped_no_failed_runs",
+                deployment=deployment_spec.name,
+            )
+            continue
+        if not retry_failed_only and deployment_is_complete(root, config, deployment_spec):
             LOGGER.info("Skipping completed deployment %s", deployment_spec.name)
             events.write(
                 "deployment_skipped_completed",
@@ -1025,7 +1090,7 @@ def execute_sweep(config: SweepConfig, root: Path, events: EventLog) -> None:
         try:
             manager.start()
             assert manager.process is not None
-            for run in run_specs(config, deployment_spec):
+            for run in runs:
                 execute_run(
                     config,
                     run,
@@ -1096,7 +1161,7 @@ def main() -> int:
         atomic_write_json(root / "sweep_manifest.json", manifest)
 
     if args.plan_only:
-        print_plan(config)
+        print_plan(config, root, args.retry_failed_only)
         return 0
 
     configure_logging(root)
@@ -1110,17 +1175,26 @@ def main() -> int:
     LOGGER.info("Sweep output root: %s", root)
     deployments = deployment_specs(config)
     LOGGER.info(
-        "Execution uses %d deployments and %d measured runs",
-        len(deployments),
-        sum(len(run_specs(config, spec)) for spec in deployments),
+        "Execution selection=%s uses %d deployments and %d measured runs",
+        "failed-only" if args.retry_failed_only else "all-incomplete",
+        sum(bool(selected_runs(config, root, spec, args.retry_failed_only)) for spec in deployments),
+        sum(
+            len(selected_runs(config, root, spec, args.retry_failed_only))
+            for spec in deployments
+        ),
     )
-    events.write("sweep_started", output_root=str(root), config=asdict(config))
+    events.write(
+        "sweep_started",
+        output_root=str(root),
+        config=asdict(config),
+        retry_failed_only=args.retry_failed_only,
+    )
     try:
         validate_bundle()
         if is_new_sweep:
             capture_provenance(root)
         validate_environment(root, config)
-        execute_sweep(config, root, events)
+        execute_sweep(config, root, events, args.retry_failed_only)
     except TerminationRequested as exc:
         status = {
             "status": "interrupted",
@@ -1150,14 +1224,22 @@ def main() -> int:
         refresh_run_index(root, config)
         events.close()
 
+    all_complete = all(deployment_is_complete(root, config, spec) for spec in deployments)
     status = {
-        "status": "completed",
+        "status": "completed" if all_complete else "partial",
         "finished_at": utc_now(),
         "duration_s": time.monotonic() - started,
         "output_root": str(root),
+        "retry_failed_only": args.retry_failed_only,
     }
     atomic_write_json(root / "sweep_status.json", status)
-    LOGGER.info("Sweep completed successfully: %s", root)
+    if all_complete:
+        LOGGER.info("Sweep completed successfully: %s", root)
+    else:
+        LOGGER.info(
+            "Selected retries completed successfully; non-selected conditions remain pending in %s",
+            root,
+        )
     return 0
 
 

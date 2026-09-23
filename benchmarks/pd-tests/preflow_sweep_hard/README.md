@@ -78,6 +78,18 @@ python run.py --resume /absolute/path/to/the/sweep-root
 Completed conditions are skipped. Only deployments with unfinished conditions
 are loaded again.
 
+To retry only conditions that are explicitly marked `failed`, without running
+conditions that have never started, use:
+
+```bash
+python run.py \
+  --resume /absolute/path/to/the/sweep-root \
+  --retry-failed-only
+```
+
+This preserves the failed attempt, writes the retry under a new `attempt-NNN`
+directory, and leaves completed and pending conditions untouched.
+
 The FCFS/soft-aging `analyze_results.py` from `preflow_sweep` is intentionally
 not bundled: it requires paired FCFS and aging results, while this sweep emits
 hard-policy-only results. The raw output layout remains the same for subsequent
