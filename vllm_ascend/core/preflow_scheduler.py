@@ -644,15 +644,16 @@ class PREFLOWScheduler(SchedulerInterface):
         chunk_size = self._preflow_profile_chunk_size()
         history_limit = self._preflow_profile_history_limit(chunk_size)
         free_blocks_before = self.kv_cache_manager.block_pool.get_num_free_blocks()
-        original_connector = self.connector
-        original_ec_connector = self.ec_connector
         request_index = 0
         started_at = time.perf_counter()
         self._preflow_calibration_active = True
         self._preflow_calibration_samples.clear()
         self._preflow_calibration_discard_request_ids.clear()
-        self.connector = None
-        self.ec_connector = None
+
+        # Keep configured connectors attached. Their worker-side counterparts
+        # require connector metadata on every batch, even when no transfer is
+        # requested. Calibration requests have no transfer parameters, so the
+        # generated metadata is an empty/no-transfer operation.
 
         logger.info(
             "PREFLOW startup profiling begins: chunk_size=%d, history_limit=%d, repetitions=%d",
@@ -762,8 +763,6 @@ class PREFLOWScheduler(SchedulerInterface):
                         "the original profiling error is preserved."
                     )
             finally:
-                self.connector = original_connector
-                self.ec_connector = original_ec_connector
                 self._preflow_calibration_active = False
                 self._preflow_calibration_discard_request_ids.clear()
 
