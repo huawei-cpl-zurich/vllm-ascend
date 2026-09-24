@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "policies": [
+    {
+      "name": "fcfs",
+      "scheduler_cls": "vllm_ascend.core.prefill_policy_schedulers.AsyncFCFSPrefillScheduler"
+    },
+    {
+      "name": "sjf",
+      "scheduler_cls": "vllm_ascend.core.prefill_policy_schedulers.AsyncSJFPrefillScheduler"
+    },
+    {
+      "name": "srpt",
+      "scheduler_cls": "vllm_ascend.core.prefill_policy_schedulers.AsyncSRPTPrefillScheduler"
+    },
+    {
+      "name": "prefill_only_lambda_200",
+      "scheduler_cls": "vllm_ascend.core.prefill_only_scheduler.AsyncPrefillOnlyScheduler",
+      "scheduler_config": {
+        "prefill_only_config": {
+          "aging_rate": 200.0
+        }
+      }
+    },
+    {
+      "name": "prefill_only_lambda_500",
+      "scheduler_cls": "vllm_ascend.core.prefill_only_scheduler.AsyncPrefillOnlyScheduler",
+      "scheduler_config": {
+        "prefill_only_config": {
+          "aging_rate": 500.0
+        }
+      }
+    },
+    {
+      "name": "prefill_only_lambda_2000",
+      "scheduler_cls": "vllm_ascend.core.prefill_only_scheduler.AsyncPrefillOnlyScheduler",
+      "scheduler_config": {
+        "prefill_only_config": {
+          "aging_rate": 2000.0
+        }
+      }
+    },
+    {
+      "name": "edf_inflation_120",
+      "scheduler_cls": "vllm_ascend.core.prefill_policy_schedulers.AsyncEDFPrefillScheduler",
+      "scheduler_config": {
+        "preflow_config": {
+          "max_fcfs_inflation": 1.2
+        }
+      }
+    },
+    {
+      "name": "preflow_hard_inflation_30",
+      "scheduler_cls": "vllm_ascend.core.preflow_scheduler.AsyncPREFLOWScheduler",
+      "scheduler_config": {
+        "preflow_config": {
+          "max_fcfs_inflation": 0.3,
+          "work_model": "profiled"
+        }
+      }
+    },
+    {
+      "name": "preflow_hard_inflation_50",
+      "scheduler_cls": "vllm_ascend.core.preflow_scheduler.AsyncPREFLOWScheduler",
+      "scheduler_config": {
+        "preflow_config": {
+          "max_fcfs_inflation": 0.5,
+          "work_model": "profiled"
+        }
+      }
+    },
+    {
+      "name": "preflow_hard_inflation_80",
+      "scheduler_cls": "vllm_ascend.core.preflow_scheduler.AsyncPREFLOWScheduler",
+      "scheduler_config": {
+        "preflow_config": {
+          "max_fcfs_inflation": 0.8,
+          "work_model": "profiled"
+        }
+      }
+    },
+    {
+      "name": "preflow_hard_inflation_120",
+      "scheduler_cls": "vllm_ascend.core.preflow_scheduler.AsyncPREFLOWScheduler",
+      "scheduler_config": {
+        "preflow_config": {
+          "max_fcfs_inflation": 1.2,
+          "work_model": "profiled"
+        }
+      }
+    }
+  ]
+}

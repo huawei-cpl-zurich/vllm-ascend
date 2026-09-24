@@ -1,0 +1,9 @@
+# The target environment must separately provide vLLM, vLLM Ascend, and
+# vllm-router. These are the direct Python dependencies of the bundled client.
+hydra-core
+omegaconf
+PyYAML
+urllib3
+
+# Optional: enables Parquet output in addition to the always-written CSV files.
+# pyarrow
