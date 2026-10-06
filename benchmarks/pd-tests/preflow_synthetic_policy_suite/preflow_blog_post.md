@@ -103,6 +103,10 @@ PREFLOW makes one scheduling decision at each chunk boundary.
 3. Rank requests by the work-aware objective and execute the highest-ranked
    chunk that preserves every fixed deadline.
 
+This is the central difference from aging. PREFLOW defines which schedules are
+legal, then optimizes aggressively inside that feasible region. Aging changes
+the priority score without imposing the same completion constraint.
+
 The implementation ranks safe requests by
 
 $$
@@ -145,12 +149,13 @@ The measured operating points are:
 | PREFLOW 80% | 76.1% | 1.92× |
 | PREFLOW 120% | 78.2% | 2.37× |
 
-The central comparison is PREFLOW against PrefillOnly. PREFLOW 120% achieves
-2.2 percentage points less mean improvement than PrefillOnly
-$\lambda=200$, while reducing the worst observed slowdown from 5.62× to
-2.37×. PREFLOW 30% is better on both measured axes than the most protective
-tested PrefillOnly setting: 68.2% versus 24.4% mean improvement and 1.37×
-versus 3.63× worst slowdown.
+On this workload, PREFLOW reaches nearly the same mean-latency regime as
+aggressive aging while moving the worst-request slowdown into a very different
+range. PrefillOnly $\lambda=200$ improves mean TTFT by 80.4% with a 5.62×
+worst slowdown; PREFLOW 120% improves it by 78.2%, 2.2 percentage points lower,
+with a 2.37× worst slowdown. PREFLOW 30% is better on both measured axes than
+the most protective tested PrefillOnly setting: 68.2% versus 24.4% mean
+improvement and 1.37× versus 3.63× worst slowdown.
 
 SRPT minimizes mean flow time in the classical known-size preemptive
 single-server model and gives the highest measured mean-TTFT improvement among
@@ -198,9 +203,11 @@ action. The endpoints from 3.63× to 7.52× are finite observations from this
 trace, not policy limits.
 
 PREFLOW has a different shape. Each curve keeps a broad region of useful
-reordering and then ends near its configured FCFS-relative boundary. Once an
-earlier deadline has no prefix slack left, another bypass is illegal. Changing
-$\rho$ moves that boundary; it does not change the rule that enforces it.
+reordering and then ends near its configured FCFS-relative boundary. The
+important distinction is not simply that PREFLOW produced a shorter tail in
+this run. Once the modeled overtaking budget is exhausted, further bypasses
+become illegal. Changing $\rho$ moves that boundary; it does not change the rule
+that enforces it.
 
 ## Queue behavior during bursts
 
@@ -258,39 +265,97 @@ Accepted chunks preserve prefix feasibility, and later arrivals cannot change
 older deadlines. Under conservative cost and admission assumptions, request
 $i$ therefore completes by $D_i=a_i+\rho B_i$.
 
-## Implementation details and limits
+## From scheduling theory to device time
 
-Token-count and triangular attention proxies can be useful for ranking requests.
-They are insufficient for enforcing a meaningful completion-inflation contract:
-the feasibility test spends predicted action cost as time, so the charged units
-must track actual service time.
+PREFLOW's feasibility test needs the service time consumed by a candidate
+chunk. A model that only ranks requests relative to one another cannot determine
+whether an overtake fits within the remaining deadline margin.
 
-The reported PREFLOW results therefore use the startup-profiled device-time
-model. An empty prefill worker profiles the real model path and fits a monotone,
-history-dependent predictor in milliseconds using the features $1,h,h^2$.
-Sparse measurements cover chunks smaller than the configured size. Summing
-these predictions gives isolated work, remaining work, and next-action cost.
+The vLLM-Ascend implementation profiles the real prefill execution path at
+startup. Calibration requests run through the deployed model and hardware, and
+the scheduler measures each chunk directly. For a configured full chunk of
+size $C$, it fits a history-dependent cost in milliseconds:
 
-Calibration requests and their KV state are removed before serving begins. The
-scheduling principle does not depend on this particular predictor; another
-additive device-time model could replace it without changing the deadline or
-prefix-slack rules.
+$$
+T_C(h)=\theta_0+\theta_1 z+\theta_2 z^2,\qquad z=h/H.
+$$
 
-KV admission adds another blocking point. PREFLOW reserves a conservative
-allowance for the resident set to drain; once a waiting request becomes
-admission-critical, younger work cannot enlarge its blocking set. The normal KV
-allocator and waiting/running lifecycle remain unchanged.
+Here $h$ is the existing token history and $H$ is the history normalization
+scale used during calibration. The fitted full-chunk curve is constrained to
+remain non-decreasing across the supported history range.
 
-The theorem is exact in the scheduler's charged model units. The current
-profiler fits median point estimates rather than conservative upper bounds, so
-it does not establish the same bound in wall-clock time. Charging an empirical
-upper quantile or measured error envelope would tighten that translation
-without redesigning the scheduler.
+Short prompts and final partial chunks require separate measurements. Fixed
+invocation overhead makes their cost non-linear in token count, so PREFLOW
+profiles a set of sub-chunk sizes instead of scaling a full chunk directly. The
+profile also measures the additional overhead paid when prefill finalizes.
 
-This evaluation also has a narrow scope: one synthetic trace and seed, dummy
-weights, one hardware topology, and no prefix caching. Real traces, prefix
-reuse, and other platforms remain to be evaluated. The guarantee applies to
-prefill service under the stated model and admission assumptions.
+The scheduler sums these predicted costs to obtain:
+
+- the request's isolated work;
+- its remaining work;
+- the predicted cost of its exact next-chunk action; and
+- its arrival-state FCFS baseline.
+
+PREFLOW's logical service clock and its feasibility test therefore use the same
+device-time units. The profile is local to the deployed model, hardware,
+parallelism, attention implementation, and chunk size. Once calibration
+finishes, vLLM-Ascend removes the calibration requests and releases their KV
+state before serving traffic.
+
+The profiled model is what makes the FCFS-relative completion contract
+operational on real hardware. The scheduling rule remains separate from the
+predictor: another additive device-time model can replace this fit without
+changing the deadline construction or prefix-slack test.
+
+The current implementation fits point estimates from median observations, so
+the theorem is enforced exactly in charged model units. A deterministic
+wall-clock interpretation would require conservative charging, such as an upper
+quantile or a prediction-error envelope.
+
+## Making PREFLOW work with a finite KV cache
+
+A request can be urgent according to the compute scheduler and still be unable
+to run because the resident set occupies the KV cache. Compute-side protection
+alone is therefore insufficient. If the engine repeatedly admits younger
+requests, it can consume the protected request's deadline margin before that
+request ever enters the executable set.
+
+PREFLOW uses full-sequence KV reservation to protect admission. Every pending
+request must retain enough modeled time for two obligations:
+
+1. the resident prefill work blocking its admission must drain; and
+2. its own remaining prefill must complete before its fixed deadline.
+
+At logical service time $t$, let $\mathcal{R}(t)$ be the resident prefill set
+and order pending requests by deadline. With the conservative full-drain
+envelope used by the implementation,
+
+$$
+G(t)=\sum_{j\in\mathcal{R}(t)}r_j(t),\qquad
+t+G(t)+\sum_{j=1}^{k}r_{(j)}(t)\le D_{(k)}\quad\text{for every pending prefix }k.
+$$
+
+Here $G(t)$ upper-bounds the modeled time required for the current resident set
+to drain and release admission capacity. The prefix inequality requires enough
+time to remain after that drain for every protected pending prefix to finish by
+its deadline. A request may be admitted earlier if its reservation fits, but
+the scheduler does not rely on that outcome for safety.
+
+The scheduler evaluates this envelope as resident work advances and before each
+admission decision. Younger work cannot consume resident capacity when doing so
+would make an older fixed deadline infeasible.
+
+This mechanism works with vLLM's existing waiting/running lifecycle and KV
+allocator. PREFLOW does not replace the allocator with a separate memory
+management subsystem. Instead, the safety mechanism covers both decisions that
+control progress: which resident request receives compute, and which waiting
+request may become resident.
+
+Without admission-aware protection, a scheduler can satisfy every compute-side
+priority rule and still violate the intended completion bound because the
+protected request remained outside the executable set for too long. The
+admission shield carries the same completion contract from the idealized
+compute scheduler into a memory-constrained serving engine.
 
 ## The prefill advantage remains visible end to end
 
