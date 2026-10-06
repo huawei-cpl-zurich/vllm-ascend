@@ -1,0 +1,707 @@
+\documentclass{article}
+
+\usepackage{iclr2027_conference,times}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{url}
+
+\newtheorem{definition}{Definition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+
+\newcommand{\preflow}{\textnormal{\textsc{PREFLOW}}}
+\newcommand{\fcfs}{\textsc{FCFS}}
+\newcommand{\edf}{\textsc{EDF}}
+\newcommand{\slo}{\textsc{SLO}}
+\newcommand{\isl}{\textsc{ISL}}
+\newcommand{\ttft}{\textsc{TTFT}}
+\newcommand{\R}{\mathbb{R}}
+
+\title{\preflow: Safe Prefill Preemption\\
+with FCFS-Relative Completion Guarantees}
+
+% Authors are hidden while \iclrfinalcopy remains commented out.
+\author{AUTHORS}
+
+% Uncomment only for the camera-ready version.
+\iclrfinalcopy
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Production LLM traffic is both bursty and heterogeneous: prompts with orders of
+magnitude different prefill costs can accumulate in the same queue.  Chunking
+makes long prefills preemptible, but leaves a central policy question open:
+\emph{when is it safe to let short work overtake them?}  FCFS avoids starvation
+but causes head-of-line blocking; shortest-job policies improve mean latency but
+provide no bound on the delay imposed on an individual request.  We present
+\preflow, a scheduler that makes preemption safe and interpretable.  At arrival,
+request $i$ receives an endogenous deadline
+$D_i=a_i+\rho B_i$, where $B_i$ is its predicted completion latency under a
+legal FCFS continuation from the observed state and $\rho\geq1$ is the maximum
+allowed completion inflation.  A triangular attention-work model represents
+both chunk progress and reusable cached prefixes.  At each chunk boundary,
+\preflow{} serves the
+highest-value request whose execution preserves joint feasibility of all fixed
+deadlines.  On a preemptive single-resource model, this decision reduces to an
+incremental EDF prefix-slack test that states exactly how much overtaking is
+safe.  Under conservative work estimates, we prove
+$(C_i-a_i)/B_i\leq\rho$ for every request, independent of future arrivals.  We
+also extend the obligation across the KV-memory admission boundary using a
+conservative drain envelope.  \preflow{} thus exploits preemption aggressively
+without heuristic starvation controls or synthetic per-length SLOs, while
+bounding only the delay introduced by scheduling rather than congestion already
+present at arrival.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+Production traces make queue order consequential.  BurstGPT documents rapidly
+varying request concurrency in Azure OpenAI services, while Mooncake reports a
+timestamped Kimi workload with a broad input-length distribution and substantial
+prefix reuse~\citep{wang2024burstgpt,qin2024mooncake}.  The same prefill queue can
+therefore mix short chat turns with long RAG, document, and agent contexts whose
+attention costs differ by orders of magnitude.  In a prefill--decode
+disaggregated deployment, a single long prompt can block an arriving burst at a
+dedicated prefill worker.
+
+Chunked prefill exposes preemption points and removes the need to execute a
+prompt atomically~\citep{agrawal2024sarathi,agrawal2024medha,
+hsieh2026flowprefill}.  Yet preemptibility alone is not a scheduling policy.
+FCFS preserves arrival order but suffers head-of-line blocking.  Least-
+remaining-work policies remove convoys, but a stream of short arrivals can
+repeatedly preempt a long request.  Fixed bypass limits, aging multipliers, and
+priority boosts can mitigate starvation, but their parameters do not express a
+completion guarantee and interact unpredictably with load and request-size
+mix.  The open problem is therefore not merely how to preempt, but how to
+identify \emph{exactly when preemption remains safe}.
+
+Existing SLO-aware schedulers answer a related but different question.  If a
+request carries a meaningful external deadline---from a contract, an
+interactive threshold, or a larger workflow---then the scheduler should use
+it.  When no such deadline exists, however, synthesizing one from an offline
+length profile creates a calibration problem.  The same 64K prompt may arrive
+to an idle worker or behind seconds of queued work.  A length-bucket deadline
+that is tight in the first state can be infeasible in the second; one loose
+enough for the burst provides little protection when the system is idle.
+Conditioning the table on load, mix, burstiness, hardware, and queue state
+progressively learns an offline approximation to the state-dependent quantity
+that is available directly at arrival.
+
+\preflow{} derives this quantity from a concrete counterfactual.  Request $i$
+receives the immutable deadline
+\begin{equation}
+    D_i = a_i + \rho B_i,
+    \label{eq:deadline-intro}
+\end{equation}
+where $a_i$ is its arrival, $B_i$ is its predicted FCFS response from the
+arrival state, and $\rho\geq1$ is the allowed inflation.  Thus $\rho=1.75$
+permits at most $75\%$ more modeled response time than the arrival-time FCFS
+baseline.  The deadline contracts when the worker is idle and expands when a
+burst has already made low absolute latency impossible.  Unlike an arbitrary
+SLO set, the constraints come with a feasible witness; unlike an urgency score,
+they bound the additional harm caused by every future scheduling decision.
+
+At each chunk boundary, \preflow{} ranks requests by a soft efficiency score,
+then executes the first candidate that preserves all fixed deadlines.  This
+separates \emph{what is profitable} from \emph{what is safe}: the score can be
+changed without changing the protection contract.  In the single-resource
+model, safety reduces to an EDF prefix-slack test.  It measures the exact amount
+of service that a later-deadline request may consume before some protected
+prefix becomes infeasible; when no such slack remains, the corresponding EDF
+work must run.
+
+This missing contract aligns with the interface exposed by current serving
+stacks.  As Section~\ref{sec:related} documents, prominent routers choose a
+prefill endpoint from cache affinity and load, then spill to another worker once
+the preferred endpoint is saturated; SLO-aware modes, when present, commonly
+translate fleet-level TTFT and TPOT targets into capacity.  The local prefill
+queue therefore has request work, cache, and backlog state, but not necessarily
+a meaningful deadline for every request.  \preflow{} turns exactly that state
+into a contract: one global $\rho$ self-calibrates to each arrival, while the
+feasibility shield provides an explicit bound without a workload-specific SLO
+table.
+
+This paper makes four contributions:
+\begin{itemize}
+    \item We introduce an endogenous, arrival-state completion contract that
+    separates inherited congestion from scheduler-induced delay.
+    \item We derive a preemptive scheduler that greedily optimizes a soft
+    efficiency objective subject to exact EDF prefix feasibility, and show how
+    much overtaking each decision can safely consume.
+    \item We prove the per-request bound
+    $(C_i-a_i)/B_i\leq\rho$, independent of future arrivals, under conservative
+    work estimates.
+    \item We extend the obligation across memory-constrained admission with a
+    conservative KV-capacity drain envelope.
+\end{itemize}
+
+\section{Model and objective}
+\label{sec:model}
+
+\subsection{Cache-aware triangular work}
+
+Request $i$ arrives at time $a_i$ with a prompt of $n_i$ tokens.  Let
+$0\leq c_i<n_i$ be the reusable cached prefix observed at arrival and let
+$h_i(t)$ be the longest prefix already available at time $t$, so
+$h_i(a_i)=c_i$.  The prefill completes at $C_i$ when $h_i(C_i)=n_i$.
+
+At an attention layer, each new token attends over its preceding history.
+Ignoring a common constant, the cumulative work of a prefix is the triangular
+number $W(n)$.  The cache-aware isolated and remaining work are therefore
+\begin{equation}
+    W(n)=\frac{n(n+1)}{2},\qquad p_i=W(n_i)-W(c_i),\qquad r_i(t)=W(n_i)-W(h_i(t)).
+    \label{eq:work-model}
+\end{equation}
+An $x$-token chunk starting after history $h$ consumes
+\begin{equation}
+    \Delta W(h,x)=W(h+x)-W(h)=hx+\frac{x(x+1)}{2}.
+    \label{eq:chunk-work}
+\end{equation}
+Thus the same simple model covers full prefills, partial progress, and prefix
+reuse: a cache hit removes the triangular work already performed for the shared
+prefix while retaining the attention from each new suffix token to that prefix.
+Execution is non-preemptive within a chunk and preemptive at chunk boundaries.
+
+Prefix caching is a target use case, not an exclusion.  If blocks credited at
+arrival are evicted while $i$ waits, its work estimate increases.  A practical
+implementation can recompute the affected queued work and correct its deadline
+before the next decision, just as cache-aware JCT schedulers recalibrate waiting
+requests~\citep{du2025prefillonly}.  The formal bound assumes that credited
+blocks remain available or that their possible recomputation is charged
+conservatively.  We treat dynamic deadline correction as a systems extension
+and evaluate how often it is required.
+
+\subsection{Compute and admission state}
+
+An LLM serving engine cannot necessarily begin every arrived prefill.  We
+partition the state into pending requests $P(t)$ and in-flight requests $I(t)$
+whose execution state is resident.  An admission is legal only if its KV-cache
+allocation respects memory capacity $M$.  vLLM exposes waiting and running
+collections and admits against available KV blocks~\citep{kwon2023vllm,
+vllmSchedulerDocs}; SGLang and TensorRT-LLM implement different forms of
+running-batch and capacity management~\citep{zheng2024sglang,
+tensorrtExecutorDocs}.  The names and reclamation mechanisms differ, but a
+pending/in-flight boundary is common.
+
+We first derive the scheduler on a unit-speed, preemptive work resource where
+all admitted work is immediately executable.  Section~\ref{sec:admission}
+extends the model to memory-constrained admission.
+
+\subsection{Choosing among safe requests}
+
+The hard constraint developed below tells us which chunks are safe, but often
+leaves several choices.  We use intrinsic stretch to choose among them.  The
+flow time of request $i$ is its arrival-to-completion latency
+$F_i=C_i-a_i$; dividing by its cache-aware isolated work $p_i$ makes that
+latency comparable across prompt sizes:
+\begin{equation}
+    S_i=\frac{F_i}{p_i}=\frac{C_i-a_i}{p_i}.
+\end{equation}
+Minimizing total stretch is weighted flow minimization with weight $1/p_i$.
+With known remaining work, this motivates the weighted-shortest-remaining-job
+priority
+\begin{equation}
+    \pi_i(t)=\frac{1}{p_i r_i(t)}.
+    \label{eq:soft-score}
+\end{equation}
+The factor $1/p_i$ favors requests that are intrinsically small after cache
+reuse, while $1/r_i(t)$ also recognizes a long request that is close to
+completion.  This score expresses only a preference: another latency, utility,
+or tenant objective can replace it without changing the safety test.  The hard
+boundary uses $B_i$, not $p_i$, because protection must also reflect the backlog
+that request $i$ inherited at arrival.
+
+\section{FCFS-relative completion constraints}
+\label{sec:constraints}
+
+\subsection{Arrival-time baseline}
+
+Freeze the system state at arrival $a_i$ and assume no future requests arrive.
+Let $B_i$ be an upper bound on the time until $i$ completes under a legal,
+work-conserving FCFS continuation from that state.
+
+In the single-resource model,
+\begin{equation}
+    B_i=Q_i(a_i)+p_i,
+    \label{eq:baseline-simple}
+\end{equation}
+where $Q_i(a_i)$ is all remaining work already present ahead of $i$.  In the
+general model, $B_i$ is obtained from an FCFS reference simulation that also
+accounts for memory release and admission.  This witness-based definition is
+more robust than assuming that GPU batch times are perfectly additive.
+
+We distinguish two dimensionless quantities:
+\begin{equation}
+    S_i=\frac{C_i-a_i}{p_i}
+    \quad\text{and}\quad
+    I_i=\frac{C_i-a_i}{B_i}.
+    \label{eq:two-normalizers}
+\end{equation}
+$S_i$ is intrinsic stretch and defines the efficiency objective.  $I_i$ is
+FCFS-relative completion inflation and defines protection.  The baseline $B_i$
+is fixed at arrival; future requests cannot retroactively enlarge it.
+
+\subsection{Constrained optimization}
+
+For inflation limit $\rho\geq1$, assign $D_i$ by
+Equation~\eqref{eq:deadline-intro}.  The conceptual offline problem is
+\begin{align}
+    \min_{\text{legal schedule}}\quad
+        &\sum_i \frac{C_i-a_i}{p_i}
+        \label{eq:optimization}\\
+    \text{s.t.}\quad
+        &C_i\leq D_i=a_i+\rho B_i && \forall i,\nonumber\\
+        &\text{chunk, compute, and memory constraints.}&&\nonumber
+\end{align}
+\preflow{} is an online greedy solution: Equation~\eqref{eq:soft-score}
+approximates the objective, while a feasibility invariant enforces the hard
+constraints.
+
+\subsection{Why the baseline is not an SLO table}
+
+$B_i$ is conditioned on the resource state seen by request $i$, not only on its
+length.  Thus two equal-length requests in the same trace may receive different
+deadlines: one arrives to an idle worker, while the other inherits a burst.  A
+per-length p99 table instead averages over the queue states, mix, hardware, and
+execution policy used to construct it.  It can be a useful tuned baseline, but
+does not retain the same meaning under workload or system shifts.
+
+External SLOs remain appropriate when they encode application value.  They can
+drive admission, provisioning, or SLO-goodput scheduling; if infeasible, the
+system should reject work or record a violation.  For accepted requests without
+such a deadline, \preflow{} provides the complementary scheduler-level
+contract: it bounds added interference after accounting for inherited
+congestion.
+
+\section{PREFLOW scheduling}
+\label{sec:scheduler}
+
+\subsection{EDF prefix feasibility}
+
+At a decision time $t$, order all unfinished, released requests by fixed
+deadline:
+\begin{equation}
+    D_{(1)}\leq D_{(2)}\leq\cdots\leq D_{(m)},
+\end{equation}
+breaking ties by arrival order.  Define the residual slack of prefix $k$ as
+\begin{equation}
+    \sigma_k(t)=D_{(k)}-t-\sum_{j=1}^{k}r_{(j)}(t).
+    \label{eq:prefix-slack}
+\end{equation}
+For released jobs on a preemptive unit-speed server, the state is feasible if
+and only if $\sigma_k(t)\geq0$ for every $k$.  Necessity follows from the
+capacity available before $D_{(k)}$; sufficiency follows from EDF.  We include
+the standard argument in Appendix~\ref{app:prefix-proof}.
+
+\begin{proposition}[Safe-chunk criterion]
+\label{prop:safe-chunk}
+Suppose request $i$ has EDF rank $m_i$.  Executing $q\leq r_i(t)$ units of $i$
+preserves residual feasibility if and only if
+\begin{equation}
+    q\leq \min_{k<m_i}\sigma_k(t),
+    \label{eq:safe-chunk}
+\end{equation}
+where the minimum of the empty set is $+\infty$.
+\end{proposition}
+
+\begin{proof}
+For $k<m_i$, request $i$ is absent from prefix $k$: time advances by $q$ while
+its remaining work does not decrease, hence $\sigma'_k=\sigma_k-q$.  For
+$k\geq m_i$, the same prefix contains $i$: both available time and remaining
+work decrease by $q$, hence $\sigma'_k=\sigma_k$.  Therefore exactly the
+earlier prefixes can become infeasible, yielding
+Equation~\eqref{eq:safe-chunk}.
+\end{proof}
+
+The proposition makes the scheduler incremental.  A preferred request spends
+only the slack of requests with earlier deadlines.  The earliest-deadline
+request is always safe in a feasible state.  If a proposed chunk is too large,
+the engine can reduce its size to the available slack or defer it.
+
+\subsection{Greedy feasible selection}
+
+At every chunk boundary, \preflow{} applies the following rule:
+\begin{enumerate}
+    \item Rank legal request actions by decreasing soft score $\pi_i(t)$, with
+    deterministic FCFS tie-breaking.
+    \item For each candidate in that order, predict the work $q$ of its next
+    chunk and test the successor state's deadline feasibility.
+    \item Execute the first safe candidate.  If no preferred candidate is safe,
+    execute an earliest-deadline action.
+    \item Recompute scores, remaining work, and feasibility at the next chunk
+    boundary.
+\end{enumerate}
+
+This policy preempts when doing so improves the soft objective and remains
+feasible; otherwise it serves the tightest EDF \emph{prefix}, not a permanently
+locked job.  Proposition~\ref{prop:safe-chunk} turns the protection rule into an
+interpretable preemption budget: a later-deadline action may consume at most the
+minimum slack of every prefix it bypasses.  A deadline-ordered tree can maintain
+prefix sums and minima in logarithmic time; a linear scan suffices for modest
+queues.
+
+\section{Memory-constrained admission}
+\label{sec:admission}
+
+\subsection{The admission gap}
+
+The compute-only result assumes that the selected request can run.  In an LLM
+engine, a request can reach the head of $P(t)$ while insufficient KV capacity
+prevents admission.  A guarantee that it merely reaches the first pending
+position is therefore not a completion guarantee.
+
+The exact generalization is state based.  A state contains remaining work,
+$P(t)$, $I(t)$, resident allocations, capacity $M$, and all fixed deadlines.  It
+is feasible if some legal sequence of admissions, chunks, and releases meets
+every deadline.  \preflow{} may execute the highest-scoring action whose
+successor remains feasible.  This definition yields a clean theorem but may be
+expensive to evaluate, motivating a conservative sufficient test.
+
+\subsection{Drain envelopes}
+
+For pending request $i$, let $G_i(t)$ upper-bound the time needed to free enough
+resident memory to admit $i$ once the scheduler commits to protecting it.  A
+concrete drain policy may (i) stop admitting younger requests that increase the
+blocking set, (ii) prioritize resident blockers whose completion releases the
+required memory, and (iii) admit $i$ as soon as its reservation fits.  If
+$r_i(t)$ upper-bounds its post-admission work, define the latest protection time
+\begin{equation}
+    L_i(t)=D_i-G_i(t)-r_i(t).
+    \label{eq:latest-protection}
+\end{equation}
+By $L_i(t)$, the scheduler must make $i$ admission-critical and begin the drain
+plan.  This formalizes the required headroom: $i$ must reach the protected
+pending position early enough for the current in-flight set to drain and for
+$i$ itself to execute.
+
+The arrival baseline can equivalently be decomposed as
+\begin{equation}
+    B_i=Q_i^{\mathrm{pending}}(a_i)+G_i(a_i)+p_i.
+    \label{eq:admission-baseline}
+\end{equation}
+Including $G_i(a_i)$ in $B_i$ is necessary, but the scheduler must also prevent
+later admissions from enlarging $G_i$ after the deadline is fixed.
+
+A conservative admission shield maintains four invariants: (1) once $i$ is
+critical, do not admit younger work that increases $G_i$; (2) execute its
+blocker-drain plan within the charged envelope; (3) admit $i$ as soon as its
+reservation fits; and (4) after admission, preserve compute-prefix feasibility.
+If several requests are critical, they are protected by deadline order.  Full
+input-length reservation gives a simple, conservative realization; paging,
+swapping, or destructive preemption can instead be represented as explicit
+release actions with charged costs.
+
+\section{Completion guarantee}
+\label{sec:guarantee}
+
+We state the result for a generic feasibility oracle.  The compute-only prefix
+test is exact; the memory-aware shield is a sufficient implementation when its
+drain estimates are conservative.
+
+\paragraph{Assumptions.}
+(A1) Every realized chunk duration is at most its charged work, and any cached
+prefix credited at deadline assignment remains available or its possible
+recomputation is included in that charge.
+(A2) The scheduler reconsiders decisions at chunk boundaries and charges a full
+non-preemptive chunk before dispatch.
+(A3) At arrival, $B_i$ upper-bounds completion of $i$ in a legal FCFS witness
+that does not violate older deadlines.
+(A4) Every $G_i$ upper-bounds the protected drain policy, and later actions
+cannot enlarge a protected blocking set.
+(A5) \preflow{} executes only successor states accepted by the exact oracle or
+a sound sufficient test.
+(A6) The scheduler makes progress whenever unfinished work exists.
+
+\begin{lemma}[Arrival feasibility]
+\label{lem:arrival}
+If the state immediately before $a_i$ is feasible, adding request $i$ with
+$D_i=a_i+\rho B_i$ for $\rho\geq1$ preserves feasibility.
+\end{lemma}
+
+\begin{proof}
+By A3, a legal continuation meets every old deadline and completes $i$ by
+$a_i+B_i$.  Since $a_i+B_i\leq a_i+\rho B_i=D_i$, that continuation is a
+feasible witness for the enlarged state.
+\end{proof}
+
+\begin{lemma}[Action invariance]
+\label{lem:action}
+If the current state is feasible and \preflow{} executes a safe action, the
+successor state is feasible.
+\end{lemma}
+
+\begin{proof}
+This follows from the definition of a safe action.  In the single-resource
+model, Proposition~\ref{prop:safe-chunk} is an exact constructive test.  Under
+memory constraints, A4--A5 make the conservative admission shield sound.
+\end{proof}
+
+\begin{theorem}[FCFS-relative completion bound]
+\label{thm:bound}
+Under A1--A6, every accepted request $i$ completes by its fixed deadline:
+\begin{equation}
+    C_i\leq D_i=a_i+\rho B_i,
+    \qquad
+    \frac{C_i-a_i}{B_i}\leq\rho.
+    \label{eq:main-bound}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+The empty system is feasible.  Lemma~\ref{lem:arrival} preserves feasibility at
+each arrival, and Lemma~\ref{lem:action} preserves it after each action.  A1 and
+A4 ensure that realized compute and admission consume no more time than the
+feasibility model reserves; A2 prevents an uncharged chunk overrun; and A6
+excludes indefinite idling.  Thus the maintained feasible continuation can be
+realized and no fixed deadline is missed.
+\end{proof}
+
+\begin{corollary}[Independence from future arrivals]
+Once request $i$ is accepted, later arrivals cannot weaken
+Equation~\eqref{eq:main-bound}.
+\end{corollary}
+
+The deadline and baseline are immutable.  Each later arrival must itself
+preserve feasibility, and all subsequent actions remain subject to the existing
+deadlines.  Future load may force \preflow{} to follow EDF more often, reducing
+its freedom to optimize mean stretch, but it cannot legally consume $i$'s
+reserved capacity.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Interpretation under bursts.}
+The guarantee is intentionally relative.  A request arriving into a severe
+burst may have a large $B_i$, because no scheduler can erase work that is
+already present.  Nevertheless, the factor $\rho$ bounds the additional harm
+caused by future overtaking.  This separates inherited congestion from
+scheduler-induced slowdown.
+
+\paragraph{Choosing $\rho$.}
+A smaller $\rho$ approaches FCFS and leaves little room for short work to pass;
+a larger $\rho$ improves stretch efficiency but permits more tail inflation.
+The parameter has a direct operational meaning: $\rho=1.75$ permits at most
+$75\%$ modeled completion inflation over the request's arrival-time FCFS
+baseline.  A single global value yields the cleanest admission rule.
+Class-specific values are possible if each arrival is rejected or relaxed
+whenever its proposed deadline cannot be appended feasibly.
+
+\paragraph{External SLOs.}
+\preflow{} is not an argument against real application deadlines.  A
+contractual tier or workflow deadline specifies value outside the scheduler and
+should be honored whenever admission and provisioning make it feasible.  The
+FCFS-relative deadline answers a different question for requests without such
+deadlines: after accounting for inherited state, how much additional harm may
+the scheduler create?  Benchmark-derived per-length p99 targets are useful
+tuned baselines, but should not be conflated with external requirements.
+
+\paragraph{Prediction error.}
+Theorem~\ref{thm:bound} is exact in modeled work units.  A deterministic
+wall-clock claim requires upper-confidence costs or a known multiplicative
+error envelope.  If actual action time is at most $(1+\eta)$ times the point
+estimate, charging $(1+\eta)$ times estimated work recovers the modeled bound.
+Online correction can debit measured overruns from slack, but cannot repair one
+unmodeled overrun larger than the remaining reserve.
+
+\paragraph{Dynamic prefix-cache state.}
+Prefix reuse changes work rather than the scheduling argument.  Stable or
+pinned hits fall directly under Theorem~\ref{thm:bound}.  If an unexpected
+eviction increases a queued request's work, the implementation can rebuild the
+affected work and deadline before the next chunk boundary; the resulting
+contract is relative to the corrected baseline.  Preserving the original
+arrival-time contract instead requires pinning the credited blocks or reserving
+their possible recomputation.  We expect the distinction to matter only for
+requests whose observed hits are evicted while they wait, and report that
+frequency separately.
+
+\paragraph{Batching and non-additivity.}
+GPU batch time is not perfectly additive.  The exact abstraction treats a
+batch as a state transition with a predicted duration and a vector of request
+progress.  A simpler conservative implementation can serialize accounting
+while physically batching compatible work.  This may reject some safe
+schedules, but does not invalidate the guarantee.
+
+\paragraph{Scope.}
+The theorem does not promise low absolute latency, competitiveness with an
+offline optimum, or service for a request that cannot fit in an empty system.
+It bounds prefill completion rather than full decode completion, and excludes
+unbounded cost error, hardware failure, and permanent capacity loss.
+
+\section{Related work}
+\label{sec:related}
+
+\paragraph{From preemption mechanisms to an ordering contract.}
+Paged KV management and chunked prefill make it possible to reconsider a request
+before its prompt completes~\citep{kwon2023vllm,agrawal2024sarathi,
+zheng2024sglang}.  LoongServe adds elastic sequence parallelism, while Medha
+pushes preemptive execution to million-token contexts through adaptive chunking,
+Sequence Pipeline Parallelism, KV-Cache Parallelism, and multi-prefill
+batching~\citep{wu2024loongserve,agrawal2024medha}.  These systems establish
+\emph{how} long prefills can be split and executed efficiently.  \preflow{}
+starts from that scheduling freedom and asks a separate question: which
+reorderings may the worker perform without imposing unbounded harm?
+
+\paragraph{Work-aware and SLO-aware scheduling.}
+Known prefill work naturally motivates job-completion-time policies.
+PrefillOnly serves single-token-output workloads with SRJF, continuously
+recomputing each waiting request's JCT from its current prefix-cache hit and
+subtracting a waiting-time offset for fairness~\citep{du2025prefillonly}.  It is
+important precedent for treating prefix reuse as dynamic work, but its fairness
+control remains a soft priority adjustment rather than a completion bound.
+
+Medha is the closest comparison because its LARS scheduler explicitly combines
+long-context preemption, heterogeneity, and deadlines~\citep{agrawal2024medha}.
+LARS assumes that request $i$ arrives with a relative deadline $d_i$ and ranks
+the normalized slack
+$(a_i+d_i-t-w_i(t))/w_i^{\mathrm{total}}$.  This is a sensible policy when
+$d_i$ encodes a valid per-request SLO.  It does not, however, derive that target
+from the backlog encountered at arrival or test whether the selected chunk
+preserves joint feasibility of the residual deadline set.  FlowPrefill likewise
+uses finer preemption to maximize externally defined TTFT-SLO
+goodput~\citep{hsieh2026flowprefill}; when targets conflict, goodput optimization
+decides which requests miss them.  \preflow{} addresses the complementary case
+in which no meaningful individual deadline is supplied: it constructs a
+feasible target from the observed state and bounds the interference created by
+all later reorderings.
+
+\paragraph{Classical foundation.}
+SRPT minimizes mean flow time when job sizes are known, but its treatment of
+large jobs motivates the literature on slowdown and stretch
+\citep{bender1998flow,muthukrishnan1999online,bansal2001srpt}.  EDF feasibility
+for released preemptive jobs is also classical.  The novelty of \preflow{} is
+the bridge between them: an online FCFS counterfactual creates each deadline,
+and EDF prefix feasibility turns that deadline set into an exact safety
+certificate for a modular efficiency policy.
+
+\paragraph{Fleet routing and within-worker control.}
+PD systems such as Splitwise, DistServe, and Mooncake use TTFT and TPOT
+objectives to provision pools and assign work across prefill and decode
+resources~\citep{patel2024splitwise,zhong2024distserve,qin2024mooncake}.  At
+runtime, prominent open-source routers expose a cache/load interface rather than
+requiring a deadline on every request.  vLLM Router provides sticky hashing and
+power-of-two load balancing; llm-d prefers cache-resident endpoints, bypasses a
+preferred endpoint after a calibrated prefill-throughput threshold marks it
+saturated, and then selects by token load; Dynamo exposes active-prefill-token
+busy thresholds.\footnote{Official descriptions:
+\href{https://vllm.ai/blog/2025-12-13-vllm-router-release}{vLLM Router},
+\href{https://github.com/llm-d/llm-d/blob/main/guides/precise-prefix-cache-routing/README.md}{llm-d precise prefix routing}, and
+\href{https://docs.nvidia.com/dynamo/v-0-9-1/components/router/router-guide}{Dynamo Router}.}
+Dynamo's optional SLA planner similarly translates TTFT/ITL targets into fleet
+capacity, while its default throughput mode scales on queue depth and KV
+utilization.\footnote{\href{https://docs.nvidia.com/dynamo/dev/knowledge-base/modular-components/planner/overview}{NVIDIA Dynamo Planner}.}
+The common operational pattern is therefore cache-affine saturation followed by
+spillover; per-request deadlines can be added, but are not a universal input to
+the local prefill scheduler.  This is precisely where \preflow{} is attractive:
+it needs only state already visible at the worker and one interpretable
+inflation factor, yet gives every accepted request an explicit guarantee.
+
+To our knowledge, prior LLM serving work has not used an online FCFS
+counterfactual to construct per-request completion bounds and enforce them as a
+joint feasibility invariant at every preemption point.  This is the core
+novelty of \preflow{}; the work score, EDF condition, and chunking mechanism are
+established components placed in service of that contract.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Bursts and service-time heterogeneity make preemption valuable; repeated
+overtaking makes it dangerous.  \preflow{} resolves this tension by deriving a
+fixed completion entitlement from the state each request encounters and using
+joint feasibility to decide exactly when a preemption is safe.  It can optimize
+any suitable soft priority while guaranteeing, under conservative compute and
+admission models, that every request completes within $\rho$ times its
+arrival-state FCFS baseline regardless of future arrivals.  This provides a
+direct, load-adaptive alternative to heuristic starvation controls and
+synthetic SLO calibration, at the within-prefill-worker scheduling layer
+already exposed by modern PD serving stacks.
+
+\bibliography{iclr2027_conference}
+\bibliographystyle{iclr2027_conference}
+
+\clearpage
+\appendix
+
+\section{Detailed prefix-feasibility proof}
+\label{app:prefix-proof}
+
+For released preemptive jobs on a unit-speed server, let $J_k$ be the first $k$
+jobs in deadline order and
+\begin{equation}
+    R_k(t)=\sum_{j\in J_k}r_j(t).
+\end{equation}
+Any feasible schedule must process $R_k(t)$ units during $[t,D_{(k)}]$, whose
+capacity is $D_{(k)}-t$.  Thus $R_k(t)\leq D_{(k)}-t$, equivalent to
+$\sigma_k(t)\geq0$.
+
+Conversely, run EDF.  If EDF first misses $D_{(k)}$, then over the relevant busy
+interval it processed only jobs with deadlines no later than $D_{(k)}$;
+otherwise this could not be the first missed deadline in a released,
+work-conserving instance.  The required work of that prefix must exceed the
+available interval, contradicting its nonnegative slack.  Hence the prefix
+conditions are sufficient.
+
+Now execute $q$ units of rank-$m$ request $i$.  For $k<m$, $i\notin J_k$, so
+$R'_k=R_k$ while the interval loses $q$ units: $\sigma'_k=\sigma_k-q$.  For
+$k\geq m$, $i\in J_k$, so both $R_k$ and the interval decrease by $q$:
+$\sigma'_k=\sigma_k$.  This proves Proposition~\ref{prop:safe-chunk}.
+
+\section{Examples}
+\label{app:examples}
+
+\paragraph{Long request followed by short work.}
+At $t=0$, request $A$ arrives with $p_A=B_A=100$.  For $\rho=1.75$, its
+deadline is $D_A=175$.  Suppose that at $t=1$, after one unit of progress,
+$r_A=99$ and short jobs with higher soft scores begin arriving.  The singleton
+prefix slack is
+\begin{equation}
+    \sigma_A(t)=175-t-99=76-t.
+\end{equation}
+Short work may consume at most 75 additional units after $t=1$.  Once the slack
+is zero, every later-deadline action is unsafe and $A$ must run.  An unbounded
+number of subsequent arrivals cannot change $D_A$.
+
+\paragraph{Jointly tight prefix.}
+At $t=5$, suppose $(D_A,r_A)=(20,8)$ and $(D_B,r_B)=(25,10)$.  Then
+\begin{equation}
+    \sigma_1=20-5-8=7,
+    \qquad
+    \sigma_2=25-5-(8+10)=2.
+\end{equation}
+A later-deadline request may consume only two work units because the joint
+prefix $\{A,B\}$ is tighter than $A$ alone.  Pairwise bypass counters or
+individual urgency scores do not directly expose this interaction.
+
+\paragraph{Memory-blocked request.}
+A pending request has $D_A=200$ and $r_A=40$.  Releasing enough resident KV
+capacity takes at most $G_A=30$ under the protected drain plan.  Its latest
+protection time is $L_A=200-30-40=130$.  Before 130, the scheduler may exploit
+slack.  At 130, it must freeze harmful younger admissions, drain blockers,
+admit $A$ by 160, and reserve its 40 units of service.  Moving $A$ to the
+waiting-queue head at 175 would not suffice.
+
+\section{Implementation-oriented feasibility interface}
+\label{app:interface}
+
+A serving engine can expose the theoretical shield through three operations:
+\begin{enumerate}
+    \item \textsc{PredictAction}$(s,u)$ returns a conservative duration and
+    successor resource state for chunk or admission action $u$.
+    \item \textsc{IsSafe}$(s')$ checks compute-prefix slack and all active drain
+    obligations in successor state $s'$.
+    \item \textsc{Fallback}$(s)$ returns an earliest-deadline compute action or
+    the blocker-release action required by the earliest admission obligation.
+\end{enumerate}
+The priority layer is then engine agnostic: it sorts candidates by
+Equation~\eqref{eq:soft-score} and selects the first action accepted by
+\textsc{IsSafe}.  Engine-specific logic is confined to state prediction,
+memory release, and legal chunk construction.
+
+\end{document}
