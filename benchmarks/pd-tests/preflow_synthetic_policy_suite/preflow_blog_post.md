@@ -15,11 +15,11 @@ slowdown is 1.37×.
 Can we keep most of the benefit of preemption without arbitrarily sacrificing
 long requests?
 
-PREFLOW separates that question into two decisions. A shortest-work objective
-decides which request should run next. A separate feasibility test decides
-whether allowing that action is still safe for every request already in the
-system. High-value work can overtake, but only while the queue has enough slack
-to absorb the delay.
+PREFLOW separates that question into two decisions. A stretch-oriented,
+work-aware efficiency objective decides which request should run next. A
+separate feasibility test decides whether allowing that action is still safe
+for every request already in the system. High-value work can overtake, but only
+while the queue has enough slack to absorb the delay.
 
 ## The synthetic stress test
 
@@ -46,8 +46,11 @@ to hide much of the underlying cost difference.
 
 PREFLOW-50 lets short requests pass while earlier deadlines still have enough
 slack. Mean TTFT falls to 5.0 seconds for 4K prompts and then grows with prompt
-size, reaching 186.9 seconds at 100K. The grouped bars use the observed
-wall-clock TTFTs from the same matched benchmark requests.
+size, reaching 186.9 seconds at 100K. PREFLOW does not remove congestion; it
+redistributes waiting time. Short prompts benefit dramatically, while the
+largest prompts absorb more delay. This is the benefit/harm tradeoff examined
+later in the post. The grouped bars use observed wall-clock TTFT from the same
+matched benchmark requests.
 
 ![FCFS and PREFLOW-50 mean wall-clock TTFT by prompt length](benchmark_output/final-synthetic-policy-suite/analysis/06_mean_ttft_by_prompt_length.png)
 
@@ -59,9 +62,9 @@ to expose the scheduling tradeoff cleanly.
 ## Why aging is not a contract
 
 Aging is a common way to soften starvation in work-aware scheduling.
-PrefillOnly is the representative aging baseline in this experiment: predicted
-work favors short requests, while a linear waiting-time term gradually raises
-the priority of requests left behind.
+[PrefillOnly](https://arxiv.org/abs/2505.07203) is the representative aging
+baseline in this experiment: predicted work favors short requests, while a
+linear waiting-time term gradually raises the priority of requests left behind.
 
 The coefficient $\lambda$ controls how quickly waiting overcomes the work
 ranking. A small value stays close to shortest-work scheduling. A large value
