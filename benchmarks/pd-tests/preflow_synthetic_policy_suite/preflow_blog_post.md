@@ -39,12 +39,17 @@ bursts and later drain.
 - The model is Qwen3-30B-A3B-Instruct-2507 with dummy weight loading. Prefix
   caching is disabled.
 
-Under FCFS, a 100K-token prompt can hold many short prompts behind it. Waiting
-then dominates TTFT during the busiest phases. The rolling median below rises
-with the bursts under FCFS and drops again as offered load falls. Work-aware
-policies reduce that convoy by changing which requests finish first.
+The six prompt classes span 25× in token count, but FCFS compresses their mean
+TTFT into a narrow 116.6–123.8 second range. This does not mean their execution
+costs are equal. During bursts, queueing dominates total TTFT strongly enough
+to hide much of the underlying cost difference.
 
-![TTFT through the burst phases](benchmark_output/final-synthetic-policy-suite/analysis/13_temporal_ttft_under_bursts.png)
+PREFLOW-50 lets short requests pass while earlier deadlines still have enough
+slack. Mean TTFT falls to 5.0 seconds for 4K prompts and then grows with prompt
+size, reaching 186.9 seconds at 100K. The grouped bars use the observed
+wall-clock TTFTs from the same matched benchmark requests.
+
+![FCFS and PREFLOW-50 mean wall-clock TTFT by prompt length](benchmark_output/final-synthetic-policy-suite/analysis/06_mean_ttft_by_prompt_length.png)
 
 All 11 policy configurations completed the same 1,000 requests with identical
 request IDs, prompt lengths, and scheduled arrival times. This is a controlled
@@ -107,11 +112,11 @@ stretch. Stretch is useful when request sizes differ by orders of magnitude: an
 extra second is an 11× completion time for a request that needs 0.1 seconds in
 isolation, but only 1.1× for one that needs 10 seconds.
 
-The ranking is locally optimal for the released weighted-completion problem.
-PREFLOW applies that ranking only inside the feasible action set. If the
-highest-ranked chunk is unsafe, it tries the next candidate. An
-earliest-deadline action is the rescue choice when the queue has no slack for a
-preferred overtake.
+The score $1/(p_i r_i)$ is the weighted-shortest-remaining-work priority
+induced by the stretch objective. PREFLOW applies that priority only inside the
+feasible action set. If the highest-ranked chunk is unsafe, it tries the next
+candidate. An earliest-deadline action is the rescue choice when the queue has
+no slack for a preferred overtake.
 
 ## Hard protection changes the benefit–harm tradeoff
 
@@ -144,22 +149,23 @@ $\lambda=200$, while reducing the worst observed slowdown from 5.62× to
 tested PrefillOnly setting: 68.2% versus 24.4% mean improvement and 1.37×
 versus 3.63× worst slowdown.
 
-SRPT is the aggressive efficiency reference. In the known-size preemptive
-single-server model it minimizes mean flow time, so its mean benefit is an upper
-bound for that idealized objective. PREFLOW 120% retains about 92% of SRPT's
-measured mean-TTFT improvement while cutting worst observed slowdown by more
-than threefold.
+SRPT minimizes mean flow time in the classical known-size preemptive
+single-server model and gives the highest measured mean-TTFT improvement among
+the policies in this experiment. We therefore use it as the aggressive
+efficiency reference, not as a formal bound for the real PD implementation.
+PREFLOW 120% retains about 92% of SRPT's measured mean-TTFT improvement while
+cutting worst observed slowdown by more than threefold.
 
 EDF is the ablation for the other half of the design. It uses the same frozen
 deadlines but always follows deadline order, removing PREFLOW's greedy choice
 among safe actions. Its 5.8% mean improvement shows that deadlines provide
-protection, while the locally best safe choice produces most of the latency
-benefit.
+protection, while the work-aware choice among safe actions produces most of
+the latency benefit.
 
 These points describe the tradeoff measured on this workload and seed. They do
 not establish a complete Pareto frontier.
 
-## A hard ceiling produces a different tail
+## A hard modeled constraint produces a different tail
 
 The slowdown tail answers the practical version of "why not tune aging?" A
 softer priority can make large slowdowns rarer. It cannot make the next unsafe
@@ -227,67 +233,59 @@ $$
 \sigma_k(t)=D_{(k)}-t-\sum_{j=1}^{k}r_{(j)}(t).
 $$
 
-The first two terms are the service time available before the prefix deadline;
-the sum is the work that prefix still needs. A nonnegative $\sigma_k$ means
-the prefix remains feasible.
+The deadline minus the current clock is the available service; the sum is the
+work the prefix still needs. A nonnegative $\sigma_k$ means the prefix remains
+feasible.
 
-Suppose a candidate request has EDF position $m$, and its exact next chunk
-costs $q$. Running that later-deadline chunk delays every earlier prefix by
-$q$. Prefixes containing the candidate lose $q$ units of time and $q$
-units of remaining work, so their slack is unchanged. The chunk is safe exactly
-when
+For a candidate at EDF position $m$ with next-chunk cost $q$, every earlier
+prefix loses $q$ units of slack. Prefixes containing the candidate lose the
+same amount of time and remaining work, so their slack is unchanged. The chunk
+is safe exactly when
 
 $$
 q\le\min_{k<m}\sigma_k(t).
 $$
 
-This minimum is the remaining overtaking budget. The earliest-deadline request
-has no earlier prefix, so its next chunk is always safe while the modeled state
-is feasible. That gives the scheduler a rescue action without permanently
-locking a request.
+Prefix slack is the remaining overtaking budget. The earliest-deadline request
+has no earlier prefix, so it provides a rescue action whenever a preferred
+overtake is unsafe.
 
-At arrival, the FCFS continuation used to construct $B_i$ is a feasible
-witness. Each accepted chunk preserves EDF-prefix feasibility, and later
-arrivals receive new deadlines without changing old ones. Under conservative
-cost and admission assumptions, this maintains
-
-$$
-C_i\le D_i=a_i+\rho B_i.
-$$
-
-The full feasibility and induction proofs are in the
+The arrival-state FCFS continuation supplies the initial feasible schedule.
+Accepted chunks preserve prefix feasibility, and later arrivals cannot change
+older deadlines. Under conservative cost and admission assumptions, request
+$i$ therefore completes by $D_i=a_i+\rho B_i$. The full proofs are in the
 [preprint source](preflow_preprint.tex). The corresponding implementation
 remains the existing
 [PREFLOWScheduler](../../../vllm_ascend/core/preflow_scheduler.py).
 
 ## Implementation details and limits
 
-The implementation needs chunk costs in a unit that tracks device time. At
-startup, an empty prefill worker profiles chunk execution through the real model
-path. It fits a history-dependent predictor in milliseconds using the features
-$1,h,h^2$, projected so predicted full-chunk cost cannot decrease with
-history. Sparse short-chunk measurements cover prompts and final chunks smaller
-than the configured chunk size. The scheduler sums predicted chunk costs to
-obtain isolated work, remaining work, and the cost of the next action.
+Token-count and triangular attention proxies can be useful for ranking requests.
+They are insufficient for enforcing a meaningful completion-inflation contract:
+the feasibility test spends predicted action cost as time, so the charged units
+must track actual service time.
+
+The reported PREFLOW results therefore use the startup-profiled device-time
+model. An empty prefill worker profiles the real model path and fits a monotone,
+history-dependent predictor in milliseconds using the features $1,h,h^2$.
+Sparse measurements cover chunks smaller than the configured size. Summing
+these predictions gives isolated work, remaining work, and next-action cost.
 
 Calibration requests and their KV state are removed before serving begins. The
-predictor is deliberately separate from the scheduling rule. A different
-additive, conservative predictor can replace it without changing the deadline
-construction or prefix-slack test.
+scheduling principle does not depend on this particular predictor; another
+additive device-time model could replace it without changing the deadline or
+prefix-slack rules.
 
-KV admission adds another source of blocking. A waiting request needs both a
-resident slot and enough memory for its full KV reservation. PREFLOW includes a
-conservative allowance for the resident set to drain. Once a waiting request
-becomes admission-critical, younger work cannot enlarge its blocking set; the
-existing engine drains resident work and admits the protected request as soon
-as its reservation fits. This leaves the normal KV allocator and
-waiting/running lifecycle in place.
+KV admission adds another blocking point. PREFLOW reserves a conservative
+allowance for the resident set to drain; once a waiting request becomes
+admission-critical, younger work cannot enlarge its blocking set. The normal KV
+allocator and waiting/running lifecycle remain unchanged.
 
-The current profiler fits median point estimates, not conservative upper bounds.
-That choice explains part of the gap between configured modeled bounds and the
-wall-clock ratios above. Charging an empirical upper quantile or a measured
-error envelope would tighten the runtime interpretation without redesigning the
-scheduler.
+The theorem is exact in the scheduler's charged model units. The current
+profiler fits median point estimates rather than conservative upper bounds, so
+it does not establish the same bound in wall-clock time. Charging an empirical
+upper quantile or measured error envelope would tighten that translation
+without redesigning the scheduler.
 
 This evaluation also has a narrow scope: one synthetic trace and seed, dummy
 weights, one hardware topology, and no prefix caching. Real traces, prefix
@@ -317,5 +315,5 @@ requests left behind.
 
 Aging modifies the priority and relies on tuning to shape the resulting tail.
 PREFLOW constrains the legal schedule. The work-aware objective still chooses
-the best next action, but only inside a safety envelope that preserves every
-fixed FCFS-relative entitlement already in the system.
+the highest-priority next action, but only inside a safety envelope that
+preserves every fixed FCFS-relative entitlement already in the system.
