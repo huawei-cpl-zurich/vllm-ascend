@@ -1,4 +1,4 @@
-# PREFLOW: Safe preemption for LLM prefill
+# PREFLOW: Safe Preemptive Scheduling for LLM prefill
 
 Preemption fixes head-of-line blocking. It also decides who pays for the
 queue. Every time a scheduler moves a short prompt forward, some other prompt
@@ -256,10 +256,7 @@ overtake is unsafe.
 The arrival-state FCFS continuation supplies the initial feasible schedule.
 Accepted chunks preserve prefix feasibility, and later arrivals cannot change
 older deadlines. Under conservative cost and admission assumptions, request
-$i$ therefore completes by $D_i=a_i+\rho B_i$. The full proofs are in the
-[preprint source](preflow_preprint.tex). The corresponding implementation
-remains the existing
-[PREFLOWScheduler](../../../vllm_ascend/core/preflow_scheduler.py).
+$i$ therefore completes by $D_i=a_i+\rho B_i$.
 
 ## Implementation details and limits
 

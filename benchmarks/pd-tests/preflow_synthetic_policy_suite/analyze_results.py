@@ -559,66 +559,6 @@ def plot_e2e_relative_distributions(runs: dict[str, RunData], output: Path) -> N
     )
 
 
-def _bounded_hill(
-    parameter: np.ndarray,
-    midpoint: float,
-    exponent: float,
-    lower: float,
-    upper: float,
-    *,
-    increasing: bool,
-) -> np.ndarray:
-    """Evaluate a numerically stable Hill response between fixed limits."""
-    log_ratio = np.log(np.maximum(parameter, 1e-12) / midpoint)
-    signed_logit = exponent * log_ratio * (1.0 if increasing else -1.0)
-    response = 1.0 / (1.0 + np.exp(-np.clip(signed_logit, -60.0, 60.0)))
-    return lower + (upper - lower) * response
-
-
-def _fit_bounded_hill(
-    parameter: np.ndarray,
-    observed: np.ndarray,
-    lower: float,
-    upper: float,
-    *,
-    increasing: bool,
-) -> tuple[float, float]:
-    """Fit a two-parameter bounded Hill curve without a scipy dependency."""
-    parameter = np.asarray(parameter, dtype=float)
-    observed = np.asarray(observed, dtype=float)
-    log_midpoint_low = np.log(float(parameter.min())) - 5.0
-    log_midpoint_high = np.log(float(parameter.max())) + 7.0
-    exponent_low, exponent_high = 0.05, 8.0
-    best_log_midpoint = (log_midpoint_low + log_midpoint_high) / 2.0
-    best_exponent = 1.0
-
-    # A small deterministic grid search is sufficient for the three/four
-    # measured settings and avoids making the analysis depend on scipy.
-    for _ in range(4):
-        log_midpoints = np.linspace(log_midpoint_low, log_midpoint_high, 240)
-        exponents = np.linspace(exponent_low, exponent_high, 240)
-        midpoint_grid = np.exp(log_midpoints)[None, :, None]
-        exponent_grid = exponents[:, None, None]
-        parameter_grid = parameter[None, None, :]
-        log_ratio = np.log(parameter_grid / midpoint_grid)
-        signed_logit = exponent_grid * log_ratio * (1.0 if increasing else -1.0)
-        response = 1.0 / (1.0 + np.exp(-np.clip(signed_logit, -60.0, 60.0)))
-        prediction = lower + (upper - lower) * response
-        errors = np.mean(np.square(prediction - observed[None, None, :]), axis=2)
-        exponent_index, midpoint_index = np.unravel_index(np.argmin(errors), errors.shape)
-        best_log_midpoint = float(log_midpoints[midpoint_index])
-        best_exponent = float(exponents[exponent_index])
-
-        midpoint_step = float(log_midpoints[1] - log_midpoints[0])
-        exponent_step = float(exponents[1] - exponents[0])
-        log_midpoint_low = best_log_midpoint - 3.0 * midpoint_step
-        log_midpoint_high = best_log_midpoint + 3.0 * midpoint_step
-        exponent_low = max(0.01, best_exponent - 3.0 * exponent_step)
-        exponent_high = best_exponent + 3.0 * exponent_step
-
-    return float(np.exp(best_log_midpoint)), best_exponent
-
-
 def plot_tradeoff(
     summary: pd.DataFrame,
     output: Path,
@@ -626,15 +566,15 @@ def plot_tradeoff(
     benefit_field: str = "mean_ttft_improvement_pct",
     harm_field: str = "max_fcfs_ratio",
     filename: str = "05_benefit_fairness_tradeoff",
-    fit_filename: str = "tradeoff_curve_fits.csv",
-    title: str = "Mean-latency benefit versus worst-request harm",
+    points_filename: str = "tradeoff_measured_points.csv",
+    title: str = "Benefit-harm tradeoff: measured operating points",
     x_label: str = "Mean TTFT improvement over FCFS (%) →",
     y_label: str = "Worst per-request TTFT / matched FCFS TTFT (lower is safer)",
-    srpt_is_theoretical_bound: bool = True,
+    is_e2e_metric: bool = False,
 ) -> None:
-    # This figure is about the hard per-request protection claim. EDF is
+    # This figure is about the per-request protection claim. EDF is
     # intentionally omitted: its low-benefit point expands the x-axis without
-    # helping distinguish the efficiency/fairness frontier.
+    # helping distinguish the measured benefit-harm tradeoff.
     candidates = summary[~summary["policy"].isin(["fcfs", "edf_inflation_120"])]
     indexed = candidates.set_index("policy")
     srpt = indexed.loc["srpt"]
@@ -655,110 +595,32 @@ def plot_tradeoff(
     srpt_benefit = float(srpt["mean_ttft_improvement_pct"])
     if benefit_field != "mean_ttft_improvement_pct":
         srpt_benefit = float(srpt[benefit_field])
-    srpt_harm = float(srpt[field])
-
     hard = indexed.loc[hard_policies]
     hard_benefit = hard[benefit_field].to_numpy(dtype=float)
     hard_harm = hard[field].to_numpy(dtype=float)
-    hard_benefit_fit = _fit_bounded_hill(
-        hard_slack,
-        hard_benefit,
-        0.0,
-        srpt_benefit,
-        increasing=True,
-    )
-    hard_harm_fit = _fit_bounded_hill(
-        hard_slack,
-        hard_harm,
-        1.0,
-        srpt_harm,
-        increasing=True,
-    )
-
     prefill_only = indexed.loc[prefill_only_policies]
     prefill_only_benefit = prefill_only[benefit_field].to_numpy(dtype=float)
     prefill_only_harm = prefill_only[field].to_numpy(dtype=float)
-    prefill_only_benefit_fit = _fit_bounded_hill(
-        prefill_only_lambda,
-        prefill_only_benefit,
-        0.0,
-        srpt_benefit,
-        increasing=False,
-    )
-    prefill_only_harm_fit = _fit_bounded_hill(
-        prefill_only_lambda,
-        prefill_only_harm,
-        1.0,
-        srpt_harm,
-        increasing=False,
-    )
 
     fig, axis = plt.subplots(figsize=(11.5, 6.7))
-    family_paths = (
-        (
-            np.geomspace(hard_slack.min(), hard_slack.max(), 240),
-            hard_benefit_fit,
-            hard_harm_fit,
-            True,
-            "#006d2c",
-            "-",
-            "PREFLOW fitted path",
-        ),
-        (
-            np.geomspace(hard_slack.max(), 1e7, 320),
-            hard_benefit_fit,
-            hard_harm_fit,
-            True,
-            "#006d2c",
-            "--",
-            (
-                "PREFLOW ceiling-bounded extrapolation"
-                if srpt_is_theoretical_bound
-                else "PREFLOW SRPT-referenced extrapolation"
-            ),
-        ),
-        (
-            np.geomspace(prefill_only_lambda.max(), prefill_only_lambda.min(), 240),
-            prefill_only_benefit_fit,
-            prefill_only_harm_fit,
-            False,
-            "#e6550d",
-            "-",
-            "PrefillOnly fitted path",
-        ),
-        (
-            np.geomspace(prefill_only_lambda.min(), 1e-5, 240),
-            prefill_only_benefit_fit,
-            prefill_only_harm_fit,
-            False,
-            "#e6550d",
-            "--",
-            "PrefillOnly → SRPT as λ → 0",
-        ),
+    axis.plot(
+        hard_benefit,
+        hard_harm,
+        color="#006d2c",
+        linewidth=2.6,
+        alpha=0.9,
+        label="PREFLOW measured settings",
+        zorder=1,
     )
-    for parameter_values, benefit_fit, harm_fit, increasing, color, linestyle, label in family_paths:
-        axis.plot(
-            _bounded_hill(
-                parameter_values,
-                *benefit_fit,
-                0.0,
-                srpt_benefit,
-                increasing=increasing,
-            ),
-            _bounded_hill(
-                parameter_values,
-                *harm_fit,
-                1.0,
-                srpt_harm,
-                increasing=increasing,
-            ),
-            color=color,
-            linestyle=linestyle,
-            linewidth=2.8 if linestyle == "-" else 2.0,
-            alpha=0.9 if linestyle == "-" else 0.65,
-            label=label,
-            zorder=1,
-        )
+    axis.plot(
+        prefill_only_benefit,
+        prefill_only_harm,
+        color="#e6550d",
+        linewidth=2.6,
+        alpha=0.9,
+        label="PrefillOnly measured settings",
+        zorder=1,
+    )
 
     point_labels = {
         "sjf": "SJF",
@@ -825,31 +687,8 @@ def plot_tradeoff(
         color=POLICY_COLORS["srpt"],
         linestyle=":",
         linewidth=1.8,
-        label=(
-            "SRPT theoretical mean-latency upper bound"
-            if srpt_is_theoretical_bound
-            else "Measured SRPT E2E reference"
-        ),
+        label="Measured SRPT E2E reference" if is_e2e_metric else "Measured SRPT TTFT reference",
     )
-    if srpt_is_theoretical_bound:
-        axis.axvspan(
-            srpt_benefit,
-            srpt_benefit + 4.0,
-            color=POLICY_COLORS["srpt"],
-            alpha=0.07,
-            zorder=0,
-        )
-        axis.text(
-            srpt_benefit + 2.0,
-            0.48,
-            "Infeasible: benefit exceeds SRPT optimum",
-            transform=axis.get_xaxis_transform(),
-            rotation=90,
-            va="center",
-            ha="center",
-            fontsize=8,
-            color=POLICY_COLORS["srpt"],
-        )
     axis.axhline(1.0, color="#555555", linestyle="--", linewidth=1)
     axis.set_xlim(left=20.0, right=srpt_benefit + 4.0)
     axis.set_xlabel(x_label)
@@ -857,12 +696,11 @@ def plot_tradeoff(
     axis.legend(loc="upper left", fontsize=8.5)
     fig.suptitle(title)
     figure_note = (
-        "SRPT minimizes mean latency in the known-size preemptive model, so no policy can lie to its right. "
-        "Solid curves cover measured settings; dashed curves are bounded extrapolations."
-        if srpt_is_theoretical_bound
-        else "SRPT is a measured limiting-policy reference, not a theoretical E2E upper bound "
-        "in the two-stage PD system. "
-        "Solid curves cover measured settings; dashed curves are SRPT-referenced extrapolations."
+        "Lines connect measured settings only. SRPT is the highest measured mean-TTFT improvement "
+        "and the classical known-size preemptive reference."
+        if not is_e2e_metric
+        else "Lines connect measured settings only. SRPT is a measured reference, not a theoretical "
+        "E2E upper bound in the two-stage PD system."
     )
     fig.text(
         0.5,
@@ -874,22 +712,24 @@ def plot_tradeoff(
     )
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     save_figure(fig, output, filename)
-    pd.DataFrame(
-        [
-            {
-                "panel_metric": field,
-                "family": family,
-                "benefit_midpoint": benefit_fit[0],
-                "benefit_exponent": benefit_fit[1],
-                "harm_midpoint": harm_fit[0],
-                "harm_exponent": harm_fit[1],
-            }
-            for family, benefit_fit, harm_fit in (
-                ("hard_preflow", hard_benefit_fit, hard_harm_fit),
-                ("prefill_only", prefill_only_benefit_fit, prefill_only_harm_fit),
+    measured_points = []
+    for family, policies, parameters in (
+        ("preflow", hard_policies, hard_slack),
+        ("prefill_only", prefill_only_policies, prefill_only_lambda),
+    ):
+        for policy, parameter in zip(policies, parameters, strict=True):
+            row = indexed.loc[policy]
+            measured_points.append(
+                {
+                    "panel_metric": field,
+                    "family": family,
+                    "policy": policy,
+                    "parameter": parameter,
+                    "benefit": row[benefit_field],
+                    "harm": row[field],
+                }
             )
-        ]
-    ).to_csv(output / fit_filename, index=False)
+    pd.DataFrame(measured_points).to_csv(output / points_filename, index=False)
 
 
 def plot_e2e_tradeoff(summary: pd.DataFrame, output: Path) -> None:
@@ -899,11 +739,11 @@ def plot_e2e_tradeoff(summary: pd.DataFrame, output: Path) -> None:
         benefit_field="mean_e2e_improvement_pct",
         harm_field="max_e2e_fcfs_ratio",
         filename="05c_e2e_benefit_fairness_tradeoff",
-        fit_filename="e2e_tradeoff_curve_fits.csv",
-        title="Mean E2E-latency benefit versus worst-request harm",
+        points_filename="e2e_tradeoff_measured_points.csv",
+        title="E2E benefit-harm tradeoff: measured operating points",
         x_label="Mean E2E latency improvement over FCFS (%) →",
         y_label="Worst per-request E2E latency / matched FCFS E2E latency (lower is safer)",
-        srpt_is_theoretical_bound=False,
+        is_e2e_metric=True,
     )
 
 
@@ -1030,29 +870,36 @@ def plot_slowdown_tails(runs: dict[str, RunData], output: Path) -> None:
 
 
 def plot_prompt_length(summary: pd.DataFrame, output: Path) -> None:
-    fig, axis = plt.subplots(figsize=(10.5, 6.1))
-    for policy in POLICY_ORDER:
-        rows = summary[summary["policy"] == policy].sort_values("prompt_tokens")
-        linewidth = 2.4 if policy.startswith("preflow_hard") or policy == "fcfs" else 1.35
-        axis.plot(
-            rows["prompt_tokens"],
+    policies = ["fcfs", "preflow_hard_inflation_50"]
+    labels = ["FCFS", r"PREFLOW (50% slack, $\rho=1.5$)"]
+    colors = ["#4c78a8", "#e45756"]
+    lengths = sorted(summary["prompt_tokens"].unique())
+    positions = np.arange(len(lengths), dtype=float)
+    width = 0.36
+
+    fig, axis = plt.subplots(figsize=(10.2, 5.8))
+    for index, (policy, label, color) in enumerate(zip(policies, labels, colors, strict=True)):
+        rows = summary[summary["policy"] == policy].set_index("prompt_tokens").loc[lengths]
+        offset = (index - 0.5) * width
+        axis.bar(
+            positions + offset,
             rows["mean_ttft_s"],
-            marker=POLICY_MARKERS[policy],
-            markersize=4,
-            linewidth=linewidth,
-            color=POLICY_COLORS[policy],
-            label=POLICY_LABELS[policy],
+            width=width,
+            color=color,
+            edgecolor="white",
+            linewidth=0.8,
+            label=label,
+            zorder=3,
         )
-    axis.set_xscale("log", base=2)
-    axis.set_yscale("log")
-    axis.set_xlabel("Prompt length (tokens)")
-    axis.set_ylabel("Mean TTFT (seconds, log scale)")
-    axis.set_title("Who benefits and who pays? Mean TTFT by prompt length")
-    axis.legend(ncol=2, loc="upper left")
+    axis.set_xticks(positions, ["4K", "8K", "16K", "32K", "65K", "100K"])
+    axis.set_xlabel("Prompt length")
+    axis.set_ylabel("Mean wall-clock TTFT (seconds)")
+    axis.set_title("Queueing flattens FCFS TTFT across prompt sizes")
+    axis.grid(axis="y", alpha=0.25, zorder=0)
+    axis.legend(loc="upper left")
     fig.tight_layout()
     save_figure(fig, output, "06_mean_ttft_by_prompt_length")
 
-    lengths = sorted(summary["prompt_tokens"].unique())
     matrix = np.asarray(
         [
             [
@@ -1387,7 +1234,7 @@ def write_report(
 5. `05_benefit_fairness_tradeoff` and `05c_e2e_benefit_fairness_tradeoff`:
    TTFT and E2E benefit versus worst-request harm.
 6. `05b_fcfs_slowdown_tail_behavior`: tapering soft-policy tails versus hard protection endpoints.
-7. `06_mean_ttft_by_prompt_length`: absolute latency by request size.
+7. `06_mean_ttft_by_prompt_length`: FCFS and PREFLOW-50 mean wall-clock TTFT by request size.
 8. `07_prompt_length_fcfs_ratio_heatmap`: who benefits and who is penalized.
 9. `08_hard_constraint_validation`: direct empirical check against each configured bound.
 10. `09_hard_preflow_slack_sensitivity`: benefit/constraint trade-off across slack values.
@@ -1448,17 +1295,15 @@ experiment without explaining these violations.
 ## Recommended preprint figures
 
 1. **Main trade-off:** `05_benefit_fairness_tradeoff`. SRPT minimizes mean
-   latency in the benchmark's known-size preemptive model, so its measured
-   benefit marks a theoretical upper bound: no policy can lie to its right.
-   Smooth bounded Hill fits use the actual tuning variables. PrefillOnly
-   approaches SRPT as λ tends to zero. Hard
-   PREFLOW's unconstrained ranking is weighted by isolated and remaining work,
-   so its dashed continuation is only a ceiling-bounded extrapolation, not a
-   claim that it becomes SRPT. Solid lines cover the measured parameter ranges.
+   flow time in the classical known-size preemptive single-server model and has
+   the highest measured mean-TTFT improvement in this experiment. It is the
+   aggressive efficiency reference, not a formal bound for the real PD system.
+   Lines connect measured parameter settings only; the figure contains no fitted
+   or extrapolated policy paths.
    The figure deliberately uses worst-request slowdown rather than p99 because
    this is the metric governed by the protection claim. EDF is omitted because
    its low-benefit point compresses the informative region without clarifying
-   the frontier.
+   the comparison.
 2. **Core tail distinction:** `05b_fcfs_slowdown_tail_behavior`. This should
    be the main protection figure: SJF, SRPT, and aging have long tapering harm
    tails, while PREFLOW ends sharply near its configured bound.
